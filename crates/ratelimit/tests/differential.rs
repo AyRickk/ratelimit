@@ -239,7 +239,7 @@ impl Redis {
             .collect()
     }
 
-    /// Every key with its value and TTL.
+    /// Every key with its value and absolute expiry time (Unix seconds).
     async fn dump(&self) -> BTreeMap<String, (String, i64)> {
         let keys: Vec<String> = self
             .client
@@ -249,11 +249,16 @@ impl Redis {
             )
             .await
             .unwrap();
-        // One pipeline, so the TTLs are read at about the same moment.
+        // Absolute expiry times (EXPIRETIME), so the result does not depend on when each key is
+        // read.
         let pipeline = self.client.pipeline();
         for key in &keys {
             let () = pipeline.get(key.as_str()).await.unwrap();
-            let () = pipeline.ttl(key.as_str()).await.unwrap();
+            let expiretime = CustomCommand::new_static("EXPIRETIME", ClusterHash::FirstKey, false);
+            let () = pipeline
+                .custom(expiretime, vec![key.as_str()])
+                .await
+                .unwrap();
         }
         let replies: Vec<Value> = if keys.is_empty() {
             Vec::new()
@@ -266,8 +271,8 @@ impl Redis {
             .filter(|(_, reply)| !reply[0].is_null())
             .map(|(key, reply)| {
                 let value: String = reply[0].clone().convert().unwrap();
-                let ttl: i64 = reply[1].clone().convert().unwrap();
-                (key, (value, ttl))
+                let expires: i64 = reply[1].clone().convert().unwrap();
+                (key, (value, expires))
             })
             .collect()
     }
@@ -426,8 +431,8 @@ impl Harness {
         actual
     }
 
-    /// Same keys and values, and TTLs within a second: TTLs run on the servers' real clocks
-    /// and the two dumps are taken one after the other.
+    /// Same keys and values, and expiry times within a second: TTLs run on the servers' real
+    /// clocks, and each side sets them a moment apart.
     async fn assert_same_redis(&self) {
         if std::env::var_os("RATELIMIT_SHOW_COMMANDS").is_some() {
             eprintln!("{:#?}", self.oracle_redis.commands().await);
@@ -448,11 +453,11 @@ impl Harness {
                 .collect::<Vec<_>>()
         };
         assert_eq!(values(&actual), values(&expected), "Redis keys and values");
-        for (key, (_, ttl)) in &expected {
-            let actual_ttl = actual[key].1;
+        for (key, (_, expires)) in &expected {
+            let actual_expires = actual[key].1;
             assert!(
-                (actual_ttl - ttl).abs() <= 1,
-                "TTL of {key}: {actual_ttl}, upstream {ttl}"
+                (actual_expires - expires).abs() <= 1,
+                "expiry of {key}: {actual_expires}, upstream {expires}"
             );
         }
     }
