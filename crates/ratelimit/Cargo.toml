@@ -10,4 +10,9 @@ base64.workspace = true
 prost-types.workspace = true
 ratelimit-proto.workspace = true
 thiserror.workspace = true
+tonic.workspace = true
 yaml-rust2.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
