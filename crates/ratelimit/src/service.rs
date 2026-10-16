@@ -173,19 +173,17 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let mut quota_groups: HashMap<String, bool> = HashMap::new();
         // The descriptor closest to its limit, for the headers: chosen among the backend's
         // statuses (unlimited ones have no limit), the first on a tie, but the last regular
-        // descriptor over its limit wins outright.
+        // descriptor over its limit wins outright, counting as 0 remaining.
         let mut closest: Option<DescriptorStatus> = None;
+        let mut min_remaining = u32::MAX;
         // The descriptors that passed (unlimited ones excepted), for the metadata.
         let mut passed: Vec<Passed> = Vec::new();
         for ((status, check), descriptor) in
             statuses.iter_mut().zip(&checks).zip(&request.descriptors)
         {
-            if status.current_limit.is_some()
-                && closest
-                    .as_ref()
-                    .is_none_or(|c| status.limit_remaining < c.limit_remaining)
-            {
+            if status.current_limit.is_some() && status.limit_remaining < min_remaining {
                 closest = Some(status.clone());
+                min_remaining = status.limit_remaining;
             }
             let limit = match check {
                 Check::Unlimited => {
@@ -214,6 +212,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
             } else if !quota_mode {
                 regular_over = true;
                 closest = Some(status.clone());
+                min_remaining = 0;
             }
         }
         let quota_over = !quota_groups.is_empty() && quota_groups.values().all(|over| *over);
@@ -358,7 +357,7 @@ fn passed_backends(available: &[Passed]) -> Vec<Value> {
     let mut seen = HashSet::new();
     let mut backends = Vec::new();
     for passed in available {
-        let (backend, model) = model(passed.descriptor);
+        let (backend, model) = backend_and_model(passed.descriptor);
         if (backend.is_empty() && model.is_empty())
             || !seen.insert(quota_group_key(passed.descriptor))
         {
@@ -511,7 +510,7 @@ fn descriptor_checks(config: &RateLimitConfig, request: &RateLimitRequest) -> Ve
 /// The quota group of a descriptor: its model, from the `backend_name` and
 /// `model_name_override` entries, or else all of its entries.
 fn quota_group_key(descriptor: &RateLimitDescriptor) -> String {
-    let (backend, model) = model(descriptor);
+    let (backend, model) = backend_and_model(descriptor);
     if backend.is_empty() && model.is_empty() {
         descriptor
             .entries
@@ -524,7 +523,7 @@ fn quota_group_key(descriptor: &RateLimitDescriptor) -> String {
 }
 
 /// The model a descriptor names: its last `backend_name` and `model_name_override` entries.
-fn model(descriptor: &RateLimitDescriptor) -> (&str, &str) {
+fn backend_and_model(descriptor: &RateLimitDescriptor) -> (&str, &str) {
     let mut backend = "";
     let mut model = "";
     for entry in &descriptor.entries {

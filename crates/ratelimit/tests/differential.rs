@@ -1402,11 +1402,14 @@ descriptors:
         quota_mode: true
         rate_limit: {unit: minute, requests_per_unit: 5}
         metadata: {claude: c}
+  - key: seat
+    rate_limit: {unit: hour, requests_per_unit: 1}
 ";
 
 /// In quota mode the metadata lists the models that still have quota (`passedBackends`), once
 /// each; a model whose group is exhausted is left out, along with its limits' metadata, even
 /// for its descriptors that passed. Passed regular descriptors naming a model are listed too.
+/// A quota descriptor over its limit does not take over the headers.
 #[tokio::test]
 async fn dynamic_metadata_lists_the_models_with_quota_like_upstream() {
     if !tools_available() {
@@ -1414,6 +1417,7 @@ async fn dynamic_metadata_lists_the_models_with_quota_like_upstream() {
     }
     let settings = ServiceSettings {
         response_dynamic_metadata: true,
+        response_headers: Some(LimitHeaders::default()),
         ..Default::default()
     };
     let mut h = Harness::with_service_settings(MODELS, settings).await;
@@ -1431,6 +1435,10 @@ async fn dynamic_metadata_lists_the_models_with_quota_like_upstream() {
         .unwrap();
     // Every model exhausted: nothing to list.
     h.call(request("ai", &[gpt])).await.unwrap();
+    // The headers keep the first descriptor with no hits left, not the exhausted model.
+    h.call(request("ai", &[&[("seat", "s")], gpt]))
+        .await
+        .unwrap();
     // Without a quota descriptor there is no list, even for regular ones naming a model.
     h.call(request("ai", &[regular, &[("backend_name", "other")]]))
         .await

@@ -51,6 +51,11 @@ impl RateLimitCache for FakeCache {
     }
 }
 
+/// The service over `cache`, on the system clock.
+fn service<C: RateLimitCache>(cache: C, settings: ServiceSettings) -> RateLimitService<C> {
+    RateLimitService::new(cache, Arc::new(SystemClock), settings)
+}
+
 fn load(yaml: &str) -> config::RateLimitConfig {
     let file = ConfigFile {
         name: "inline.yaml".into(),
@@ -97,11 +102,7 @@ descriptors:
 #[tokio::test]
 async fn unmatched_descriptor_is_passed_to_the_cache_without_a_limit() {
     let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
-    let service = RateLimitService::new(
-        cache.clone(),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let response = service
@@ -126,11 +127,7 @@ async fn any_descriptor_over_limit_makes_the_request_over_limit() {
         status(Code::OverLimit, 0),
         status(Code::Ok, 0),
     ]));
-    let service = RateLimitService::new(
-        cache.clone(),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let response = service
@@ -161,11 +158,7 @@ async fn any_descriptor_over_limit_makes_the_request_over_limit() {
 
 #[tokio::test]
 async fn invalid_requests_and_missing_config_are_service_errors() {
-    let service = RateLimitService::new(
-        Arc::new(FakeCache::default()),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(Arc::new(FakeCache::default()), ServiceSettings::default());
 
     let error = service
         .should_rate_limit(&request("test-domain", &[&[("hello", "world")]]))
@@ -198,11 +191,7 @@ async fn cache_errors_are_reported_as_is() {
         error: Some("cache error".into()),
         ..Default::default()
     };
-    let service = RateLimitService::new(
-        Arc::new(cache),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(Arc::new(cache), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let error = service
@@ -220,11 +209,7 @@ async fn unlimited_descriptors_skip_the_cache_and_report_max_remaining() {
         status(Code::Ok, 0),
         status(Code::Ok, 0),
     ]));
-    let service = RateLimitService::new(
-        cache.clone(),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(
         "
 domain: some-domain
@@ -282,11 +267,7 @@ async fn checked(descriptors: &[&[(&str, &str)]]) -> Vec<Option<u32>> {
         status(Code::Ok, 0);
         descriptors.len()
     ]));
-    let service = RateLimitService::new(
-        cache.clone(),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(REPLACES));
     service
         .should_rate_limit(&request("d", descriptors))
@@ -324,11 +305,7 @@ async fn overall(
 ) -> Code {
     let descriptors: Vec<_> = cases.iter().map(|(d, _)| *d).collect();
     let statuses = cases.iter().map(|(_, code)| status(*code, 0)).collect();
-    let service = RateLimitService::new(
-        Arc::new(FakeCache::returning(statuses)),
-        Arc::new(SystemClock),
-        settings,
-    );
+    let service = service(Arc::new(FakeCache::returning(statuses)), settings);
     service.set_config(load(config));
     service
         .should_rate_limit(&request("d", &descriptors))
@@ -464,9 +441,8 @@ async fn global_quota_mode_puts_every_descriptor_in_a_quota_group() {
 async fn a_cache_answer_of_the_wrong_length_is_an_error() {
     // Upstream asserts and crashes the process; per D1 this becomes a clean error.
     for statuses in [vec![status(Code::Ok, 0)], vec![status(Code::Ok, 0); 3]] {
-        let service = RateLimitService::new(
+        let service = service(
             Arc::new(FakeCache::returning(statuses)),
-            Arc::new(SystemClock),
             ServiceSettings::default(),
         );
         service.set_config(load(CONFIG));
@@ -487,11 +463,7 @@ async fn a_cache_answer_of_the_wrong_length_is_an_error() {
 async fn a_limit_with_an_unknown_unit_is_an_invalid_argument() {
     // Upstream panics and the process dies (D1: becomes INVALID_ARGUMENT, see docs/parity.md).
     let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
-    let service = RateLimitService::new(
-        cache.clone(),
-        Arc::new(SystemClock),
-        ServiceSettings::default(),
-    );
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
     let mut request = request("test-domain", &[&[("foo", "bar")]]);
     request.descriptors[0].limit = Some(
@@ -519,7 +491,7 @@ async fn limit_text(limit: RateLimitOverride) -> String {
         response_dynamic_metadata: true,
         ..Default::default()
     };
-    let service = RateLimitService::new(cache, Arc::new(SystemClock), settings);
+    let service = service(cache, settings);
     service.set_config(load(CONFIG));
     let mut request = request("test-domain", &[&[("foo", "x")]]);
     request.descriptors[0].limit = Some(limit);
@@ -577,7 +549,7 @@ async fn merging_metadata_leaves_the_configuration_unchanged() {
         response_dynamic_metadata: true,
         ..Default::default()
     };
-    let service = RateLimitService::new(cache.clone(), Arc::new(SystemClock), settings);
+    let service = service(cache.clone(), settings);
     service.set_config(load(
         "
 domain: d
