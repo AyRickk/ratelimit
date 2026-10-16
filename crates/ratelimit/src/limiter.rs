@@ -109,15 +109,27 @@ fn status(
     })
 }
 
-/// The status of a descriptor whose counter is `after` once its hits are applied. Without a
-/// limit it is a bare OK. A key over its limit in the local cache is over. A refund is always
-/// OK, with what remains. Otherwise it is over the limit when the counter exceeds it. A rule in
-/// shadow mode answers OK instead of over (keeping the remaining count of 0).
+/// Whether a counter of `count` is over `limit`.
+pub(crate) fn exceeds(limit: &RateLimit, count: u64) -> bool {
+    count > u64::from(limit.limit.requests_per_unit)
+}
+
+/// What the backend found for a descriptor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Count {
+    /// Its counter once its hits are applied.
+    After(u64),
+    /// Over its limit according to the local cache; the backend was not asked.
+    OverInLocalCache,
+}
+
+/// The status of a descriptor. Without a limit it is a bare OK. A refund is always OK, with
+/// what remains. Otherwise it is over the limit when the counter exceeds it (or the local cache
+/// says so); a rule in shadow mode then answers OK, keeping the remaining count of 0.
 pub(crate) fn descriptor_status(
     limit: Option<&RateLimit>,
     hits: Hits,
-    after: u64,
-    over_in_local_cache: bool,
+    count: Count,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
     let Some(limit) = limit else {
@@ -127,81 +139,51 @@ pub(crate) fn descriptor_status(
         });
     };
     let threshold = u64::from(limit.limit.requests_per_unit);
-    if over_in_local_cache {
-        let code = if limit.shadow_mode {
-            Code::Ok
-        } else {
-            Code::OverLimit
-        };
-        status(code, limit, 0, now)
-    } else if hits.refund {
-        status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now)
-    } else if after > threshold {
-        let code = if limit.shadow_mode {
-            Code::Ok
-        } else {
-            Code::OverLimit
-        };
-        status(code, limit, 0, now)
+    match count {
+        Count::After(after) if hits.refund => {
+            return status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now);
+        }
+        Count::After(after) if !exceeds(limit, after) => {
+            return status(Code::Ok, limit, (threshold - after) as u32, now);
+        }
+        Count::After(_) | Count::OverInLocalCache => {}
+    }
+    let code = if limit.shadow_mode {
+        Code::Ok
     } else {
-        status(Code::Ok, limit, (threshold - after) as u32, now)
+        Code::OverLimit
+    };
+    status(code, limit, 0, now)
+}
+
+/// What a request's keys look like before counting, for
+/// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestState {
+    /// A key of the request is over its limit in the local cache.
+    OverInLocalCache,
+    /// The hits will take some keys over their limit.
+    SomeGoingOver,
+    /// Neither.
+    WithinLimits,
+}
+
+/// How much to add to a key's counter: upstream's `getHitsAddendValue`. With
+/// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, nothing is counted once a key of the request is
+/// over in the local cache, and when some keys are about to go over, only those are counted.
+pub(crate) fn hits_to_count(
+    hits: Hits,
+    stop_increment_when_overlimit: bool,
+    request: RequestState,
+    going_over: bool,
+) -> u64 {
+    if !stop_increment_when_overlimit {
+        return hits.value;
     }
-}
-
-/// Keys known to be over their limit, so requests for them skip the backend until they expire
-/// (upstream's `freecache` local cache). Entries expire on the real clock, after the length of
-/// their window, as upstream's do.
-pub struct LocalCache {
-    entries: std::sync::Mutex<LocalCacheEntries>,
-    capacity_bytes: usize,
-}
-
-#[derive(Default)]
-struct LocalCacheEntries {
-    expiry: std::collections::HashMap<String, u64>,
-    /// Insertion order, for evicting the oldest entries when the cache is full.
-    order: std::collections::VecDeque<String>,
-    bytes: usize,
-}
-
-/// Per entry, on top of the key: freecache's 24-byte entry header.
-const LOCAL_CACHE_ENTRY_OVERHEAD: usize = 24;
-/// freecache's smallest cache.
-const LOCAL_CACHE_MIN_BYTES: usize = 512 * 1024;
-
-fn real_unix_now() -> u64 {
-    SystemClock.unix_now().max(0) as u64
-}
-
-impl LocalCache {
-    pub fn new(capacity_bytes: usize) -> Self {
-        Self {
-            entries: std::sync::Mutex::default(),
-            capacity_bytes: capacity_bytes.max(LOCAL_CACHE_MIN_BYTES),
-        }
-    }
-
-    pub fn contains(&self, key: &str) -> bool {
-        let entries = self.entries.lock().unwrap();
-        entries
-            .expiry
-            .get(key)
-            .is_some_and(|expires| real_unix_now() < *expires)
-    }
-
-    pub fn insert(&self, key: &str, ttl_seconds: i64) {
-        let mut entries = self.entries.lock().unwrap();
-        let expires = real_unix_now() + ttl_seconds.max(0) as u64;
-        if entries.expiry.insert(key.to_string(), expires).is_none() {
-            entries.order.push_back(key.to_string());
-            entries.bytes += key.len() + LOCAL_CACHE_ENTRY_OVERHEAD;
-        }
-        while entries.bytes > self.capacity_bytes {
-            let Some(oldest) = entries.order.pop_front() else {
-                break;
-            };
-            entries.expiry.remove(&oldest);
-            entries.bytes -= oldest.len() + LOCAL_CACHE_ENTRY_OVERHEAD;
-        }
+    match request {
+        RequestState::OverInLocalCache => 0,
+        RequestState::WithinLimits => hits.value,
+        RequestState::SomeGoingOver if going_over => hits.value,
+        RequestState::SomeGoingOver => 0,
     }
 }

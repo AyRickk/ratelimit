@@ -63,11 +63,11 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `RUNTIME_IGNOREDOTFILES` | `false` | ⬜ | |
 | `RUNTIME_WATCH_ROOT` | `true` | ⬜ | |
 | `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
-| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | ⬜ | |
+| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not read from the environment yet |
 | `NEAR_LIMIT_RATIO` | `0.8` | ⬜ | |
-| `CACHE_KEY_PREFIX` | — | ⬜ | |
+| `CACHE_KEY_PREFIX` | — | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `BACKEND_TYPE` | `redis` | ⬜ | |
-| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | ⬜ | |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not read from the environment yet |
 | `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ⬜ | |
 | `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | ⬜ | |
 | `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | ⬜ | |
@@ -193,7 +193,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | 🚧 | `tests/differential.rs` (calendar month missing) |
 | Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | 🚧 | `tests/differential.rs` (jitter missing) |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
-| Local cache of over-limit keys (set before the shadow check, TTL = unit) | ✅ | `tests/differential.rs` |
+| Local cache of over-limit keys (set before the shadow check, TTL = unit) | 🚧 | `tests/differential.rs` (eviction order when full differs from freecache) |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ⬜ | |
 | `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
 | Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |
@@ -237,4 +237,3 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
 | `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
-| `freecache` evicts by its own segment accounting when full | oldest entries evicted first, same memory budget | evicted keys only send requests back to Redis; never changes a decision |

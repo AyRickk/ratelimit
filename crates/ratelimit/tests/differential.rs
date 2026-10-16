@@ -870,3 +870,76 @@ async fn local_cache_and_stop_increment_together_like_upstream() {
     h.call(hits_each(&[&[("b", "y")]], &[1])).await.unwrap();
     h.assert_same_redis().await;
 }
+
+#[tokio::test]
+async fn keys_too_long_for_freecache_are_never_cached_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    // At freecache's 512 KiB minimum, entries over 2048 / 4 - 24 = 488 bytes are refused.
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let long = "v".repeat(600);
+    let short = "v".repeat(470);
+    for value in [&long, &short] {
+        h.call(hits_each(&[&[("a", value)]], &[6])).await.unwrap();
+        h.call(hits_each(&[&[("a", value)]], &[1])).await.unwrap();
+    }
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn unreadable_counters_fail_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let window = 1_700_000_000 / 60 * 60;
+    h.set_raw(&format!("d_a_x_{window}"), "abc").await;
+    let error = h.call(hits_each(&[&[("a", "x")]], &[1])).await.unwrap_err();
+    assert!(error.contains("in parseUint"), "{error}");
+
+    // A counter driven below zero cannot be read as an unsigned number either.
+    let mut h = Harness::start(OVERLIMIT).await;
+    h.at(1_700_000_000).await;
+    h.call(hits_each(&[&[("b", "y")]], &[u64::MAX]))
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn stop_increment_branches_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1024 * 1024,
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+
+    // A brand-new key next to one going over gets INCRBY 0: a ghost key at 0.
+    h.call(hits_each(&[&[("a", "x")], &[("b", "new")]], &[6, 1]))
+        .await
+        .unwrap();
+    // A shadow rule going over is counted and cached, but answers OK.
+    h.call(hits_each(&[&[("shadow", "s")], &[("b", "y")]], &[2, 1]))
+        .await
+        .unwrap();
+    // A refund next to a key answered by the local cache.
+    let mut mixed = hits_each(&[&[("a", "x")], &[("b", "y")]], &[1, 3]);
+    mixed.descriptors[1].is_negative_hits = true;
+    h.call(mixed).await.unwrap();
+    h.assert_same_redis().await;
+}
