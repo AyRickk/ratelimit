@@ -151,15 +151,15 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 | Item | Status | Test |
 |---|---|---|
-| Recognised keys: `domain`, `key`, `value`, `descriptors`, `rate_limit`, `unit`, `requests_per_unit`, `unlimited`, `shadow_mode`, `quota_mode`, `name`, `replaces`, `detailed_metric`, `value_to_metric`, `share_threshold`, `metadata` | ⬜ | |
-| Unknown key ⇒ config error (recursive allow-list, `metadata` excluded) | ⬜ | |
-| Units `second` … `year` (case-insensitive), month = 30 d, year = 365 d | ⬜ | |
-| `unlimited` + `unit` ⇒ error; `requests_per_unit: 0` accepted | ⬜ | |
-| `replaces`: empty name or self-replacement ⇒ error; names need not be unique | ⬜ | |
-| Matching: exact `key_value`, then trailing **and middle** wildcards, then key only | ⬜ | |
-| `share_threshold` (pattern in the Redis key and the stats key) | ⬜ | |
-| `detailed_metric`, `value_to_metric` (enriched stats key) | ⬜ | |
-| Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ⬜ | |
+| Recognised keys: `domain`, `key`, `value`, `descriptors`, `rate_limit`, `unit`, `requests_per_unit`, `unlimited`, `shadow_mode`, `quota_mode`, `name`, `replaces`, `detailed_metric`, `value_to_metric`, `share_threshold`, `metadata` | ✅ | `tests/config.rs` |
+| Unknown key ⇒ config error (recursive allow-list, `metadata` excluded) | ✅ | `tests/config.rs` |
+| Units `second` … `year` (case-insensitive), month = 30 d, year = 365 d | ✅ | `tests/config.rs`, `tests/differential.rs` |
+| `unlimited` + `unit` ⇒ error; `requests_per_unit: 0` accepted | ✅ | `tests/config.rs` |
+| `replaces`: empty name or self-replacement ⇒ error; names need not be unique | ✅ | `tests/config.rs` |
+| Matching: exact `key_value`, then trailing **and middle** wildcards, then key only | ✅ | `tests/config.rs` |
+| `share_threshold` (pattern in the Redis key and the stats key) | ✅ | `tests/config.rs`, `tests/differential.rs` |
+| `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
+| Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
 | Reload: error ⇒ `config_load_error` + previous config kept | ⬜ | |
 | Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
 | File provider: goruntime, `SymlinkRefresher` / `DirectoryRefresher`, `runtime.*` scope | ⬜ | |
@@ -169,17 +169,17 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 | Item | Status | Test |
 |---|---|---|
-| `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (no v2) | ⬜ | |
-| Request `hits_addend` (0 ⇒ 1 unless a per-descriptor addend) and per-descriptor (0 = check only) | ⬜ | |
-| `is_negative_hits`: floor 0, always `OK`, TTL reset to the full duration | ⬜ | |
-| Client-sent `limit`: replaces the config, without shadow / `replaces` / `unlimited` | ⬜ | |
-| Response fields: `overall_code`, `statuses[]`, `current_limit` (with `name`), `limit_remaining`, `duration_until_reset` | ⬜ | |
-| Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | ⬜ | |
+| `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (no v2) | ✅ | `tests/grpc.rs`, `tests/differential.rs` |
+| Request `hits_addend` (0 ⇒ 1 unless a per-descriptor addend) and per-descriptor (0 = check only) | ✅ | `tests/differential.rs` |
+| `is_negative_hits`: floor 0, always `OK`, TTL reset to the full duration | ✅ | `tests/differential.rs` |
+| Client-sent `limit`: replaces the config, without shadow / `replaces` / `unlimited` | ✅ | `tests/config.rs`, `tests/differential.rs` |
+| Response fields: `overall_code`, `statuses[]`, `current_limit` (with `name`), `limit_remaining`, `duration_until_reset` | ✅ | `tests/differential.rs` |
+| Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | 🚧 | `tests/service.rs`, `tests/differential.rs` (`domain_not_found` stat missing) |
 | `LIMIT_*` headers: response, per unit, and request | ⬜ | |
 | Dynamic metadata (`RESPONSE_DYNAMIC_METADATA`): `domain`, `descriptors`, `hitsAddend`, merged `metadata` | ⬜ | |
-| `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ⬜ | |
-| `replaces`: two passes, not transitive | ⬜ | |
-| Per-rule and global shadow mode (`global_shadow_mode`) | ⬜ | |
+| `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | 🚧 | `tests/service.rs` (`passedBackends` metadata missing) |
+| `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
+| Per-rule and global shadow mode (`global_shadow_mode`) | 🚧 | `tests/service.rs`, `tests/differential.rs` (`global_shadow_mode` stat missing) |
 | `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
 | `/healthcheck`: 500 with no body when unhealthy; SIGTERM ⇒ unhealthy + graceful shutdown | ⬜ | |
 | `grpc.health.v1`, service `ratelimit` | ⬜ | |
@@ -190,10 +190,10 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 | Item | Status | Test |
 |---|---|---|
-| Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | ⬜ | |
-| Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | ⬜ | |
-| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ⬜ | |
-| Local cache of over-limit keys (set before the shadow check, TTL = unit) | ⬜ | |
+| Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | 🚧 | `tests/differential.rs` (calendar month missing) |
+| Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | 🚧 | `tests/differential.rs` (jitter missing) |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
+| Local cache of over-limit keys (set before the shadow check, TTL = unit) | ✅ | `tests/differential.rs` |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ⬜ | |
 | `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
 | Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |
@@ -237,3 +237,4 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
 | `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
+| `freecache` evicts by its own segment accounting when full | oldest entries evicted first, same memory budget | evicted keys only send requests back to Redis; never changes a decision |

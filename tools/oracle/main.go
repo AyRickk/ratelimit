@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coocood/freecache"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	gostats "github.com/lyft/gostats"
 	"google.golang.org/grpc"
@@ -72,6 +73,8 @@ func main() {
 	controlAddr := flag.String("control", "127.0.0.1:0", "control HTTP listen address")
 	redisURL := flag.String("redis", "127.0.0.1:6379", "Redis address")
 	prefix := flag.String("cache-key-prefix", "", "CACHE_KEY_PREFIX")
+	localCacheSize := flag.Int("local-cache-size", 0, "LOCAL_CACHE_SIZE_IN_BYTES (0 disables the local cache)")
+	stopIncrement := flag.Bool("stop-cache-key-increment", false, "STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -81,8 +84,13 @@ func main() {
 
 	client := redis.NewClientImpl(ctx, store.Scope("redis"), false, "", "tcp", "SINGLE", *redisURL, 10,
 		0, 0, nil, false, nil, 10*time.Second, "", "", time.Second, time.Second, 10*time.Second, false)
+	// As in the upstream runner: no local cache unless a size is configured.
+	var localCache *freecache.Cache
+	if *localCacheSize > 0 {
+		localCache = freecache.NewCache(*localCacheSize)
+	}
 	cache := redis.NewFixedRateLimitCacheImpl(client, nil, clk, rand.New(utils.NewLockedSource(1)), 0,
-		nil, 0.8, *prefix, statsManager, false, false)
+		localCache, 0.8, *prefix, statsManager, *stopIncrement, false)
 
 	events := &configEvents{events: make(chan provider.ConfigUpdateEvent)}
 	health := server.NewHealthChecker(health.NewServer(), "ratelimit", false)

@@ -110,13 +110,14 @@ fn status(
 }
 
 /// The status of a descriptor whose counter is `after` once its hits are applied. Without a
-/// limit it is a bare OK. A refund is always OK, with what remains. Otherwise it is over the
-/// limit when the counter exceeds it, though a rule in shadow mode then still answers OK
-/// (keeping the remaining count of 0).
+/// limit it is a bare OK. A key over its limit in the local cache is over. A refund is always
+/// OK, with what remains. Otherwise it is over the limit when the counter exceeds it. A rule in
+/// shadow mode answers OK instead of over (keeping the remaining count of 0).
 pub(crate) fn descriptor_status(
     limit: Option<&RateLimit>,
     hits: Hits,
     after: u64,
+    over_in_local_cache: bool,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
     let Some(limit) = limit else {
@@ -126,7 +127,14 @@ pub(crate) fn descriptor_status(
         });
     };
     let threshold = u64::from(limit.limit.requests_per_unit);
-    if hits.refund {
+    if over_in_local_cache {
+        let code = if limit.shadow_mode {
+            Code::Ok
+        } else {
+            Code::OverLimit
+        };
+        status(code, limit, 0, now)
+    } else if hits.refund {
         status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now)
     } else if after > threshold {
         let code = if limit.shadow_mode {
@@ -137,5 +145,63 @@ pub(crate) fn descriptor_status(
         status(code, limit, 0, now)
     } else {
         status(Code::Ok, limit, (threshold - after) as u32, now)
+    }
+}
+
+/// Keys known to be over their limit, so requests for them skip the backend until they expire
+/// (upstream's `freecache` local cache). Entries expire on the real clock, after the length of
+/// their window, as upstream's do.
+pub struct LocalCache {
+    entries: std::sync::Mutex<LocalCacheEntries>,
+    capacity_bytes: usize,
+}
+
+#[derive(Default)]
+struct LocalCacheEntries {
+    expiry: std::collections::HashMap<String, u64>,
+    /// Insertion order, for evicting the oldest entries when the cache is full.
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+/// Per entry, on top of the key: freecache's 24-byte entry header.
+const LOCAL_CACHE_ENTRY_OVERHEAD: usize = 24;
+/// freecache's smallest cache.
+const LOCAL_CACHE_MIN_BYTES: usize = 512 * 1024;
+
+fn real_unix_now() -> u64 {
+    SystemClock.unix_now().max(0) as u64
+}
+
+impl LocalCache {
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::default(),
+            capacity_bytes: capacity_bytes.max(LOCAL_CACHE_MIN_BYTES),
+        }
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .expiry
+            .get(key)
+            .is_some_and(|expires| real_unix_now() < *expires)
+    }
+
+    pub fn insert(&self, key: &str, ttl_seconds: i64) {
+        let mut entries = self.entries.lock().unwrap();
+        let expires = real_unix_now() + ttl_seconds.max(0) as u64;
+        if entries.expiry.insert(key.to_string(), expires).is_none() {
+            entries.order.push_back(key.to_string());
+            entries.bytes += key.len() + LOCAL_CACHE_ENTRY_OVERHEAD;
+        }
+        while entries.bytes > self.capacity_bytes {
+            let Some(oldest) = entries.order.pop_front() else {
+                break;
+            };
+            entries.expiry.remove(&oldest);
+            entries.bytes -= oldest.len() + LOCAL_CACHE_ENTRY_OVERHEAD;
+        }
     }
 }
