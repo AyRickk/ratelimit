@@ -12,6 +12,7 @@ prost-types.workspace = true
 ratelimit-proto.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
+xxhash-rust.workspace = true
 yaml-rust2.workspace = true
 
 [dev-dependencies]

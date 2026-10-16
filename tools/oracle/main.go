@@ -42,6 +42,11 @@ type clock struct{ now atomic.Int64 }
 
 func (c *clock) UnixNow() int64 { return c.now.Load() }
 
+// freecacheTimer gives freecache the controlled clock.
+type freecacheTimer struct{ clock *clock }
+
+func (t freecacheTimer) Now() uint32 { return uint32(t.clock.UnixNow()) }
+
 // configEvents delivers configs pushed through the control endpoint to the service.
 type configEvents struct {
 	events chan provider.ConfigUpdateEvent
@@ -87,7 +92,9 @@ func main() {
 	// As in the upstream runner: no local cache unless a size is configured.
 	var localCache *freecache.Cache
 	if *localCacheSize > 0 {
-		localCache = freecache.NewCache(*localCacheSize)
+		// The upstream runner uses freecache's real-time timer; the controlled clock is the
+		// same thing for a test, and keeps eviction (which compares access times) deterministic.
+		localCache = freecache.NewCacheCustomTimer(*localCacheSize, freecacheTimer{clk})
 	}
 	cache := redis.NewFixedRateLimitCacheImpl(client, nil, clk, rand.New(utils.NewLockedSource(1)), 0,
 		localCache, 0.8, *prefix, statsManager, *stopIncrement, false)
