@@ -12,10 +12,11 @@ prost-types.workspace = true
 ratelimit-proto.workspace = true
 regex.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tonic.workspace = true
 xxhash-rust.workspace = true
 yaml-rust2.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream.workspace = true
