@@ -1,8 +1,9 @@
 //! The rate limit decision for a `ShouldRateLimit` request. A port of envoyproxy/ratelimit
 //! `src/service/ratelimit.go`.
 
-use crate::config::{LimitLookup, RateLimit, RateLimitConfig};
+use crate::config::{ConfigError, LimitLookup, RateLimit, RateLimitConfig};
 use crate::limiter::{Clock, unit_seconds};
+use crate::stats::Stats;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use ratelimit_proto::envoy::config::core::v3::HeaderValue;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
@@ -105,15 +106,22 @@ pub struct RateLimitService<C> {
     cache: C,
     /// Re-read for the reset headers, as upstream does.
     clock: Arc<dyn Clock>,
+    stats: Arc<Stats>,
     config: RwLock<Option<Arc<RateLimitConfig>>>,
     settings: ServiceSettings,
 }
 
 impl<C: RateLimitCache> RateLimitService<C> {
-    pub fn new(cache: C, clock: Arc<dyn Clock>, settings: ServiceSettings) -> Self {
+    pub fn new(
+        cache: C,
+        clock: Arc<dyn Clock>,
+        stats: Arc<Stats>,
+        settings: ServiceSettings,
+    ) -> Self {
         Self {
             cache,
             clock,
+            stats,
             config: RwLock::new(None),
             settings,
         }
@@ -121,6 +129,17 @@ impl<C: RateLimitCache> RateLimitService<C> {
 
     /// Replaces the configuration used by subsequent requests.
     pub fn set_config(&self, config: RateLimitConfig) {
+        self.update_config(Ok(config));
+    }
+
+    /// `SetConfig`: uses a configuration that loaded; one that did not leaves the current one
+    /// in place.
+    pub fn update_config(&self, update: Result<RateLimitConfig, ConfigError>) {
+        let Ok(config) = update else {
+            self.stats.config_load_error().inc();
+            return;
+        };
+        self.stats.config_load_success().inc();
         *self.config.write().unwrap() = Some(Arc::new(config));
     }
 
@@ -128,6 +147,17 @@ impl<C: RateLimitCache> RateLimitService<C> {
         &self,
         request: &RateLimitRequest,
     ) -> Result<RateLimitResponse, ServiceError> {
+        let response = self.decide(request).await;
+        match &response {
+            Err(ServiceError::Service(_)) => self.stats.service_error().inc(),
+            Err(ServiceError::Cache(_)) => self.stats.redis_error().inc(),
+            // Upstream panics on these (D1): nothing is counted.
+            Ok(_) | Err(ServiceError::InvalidArgument(_)) => {}
+        }
+        response
+    }
+
+    async fn decide(&self, request: &RateLimitRequest) -> Result<RateLimitResponse, ServiceError> {
         require(
             !request.domain.is_empty(),
             "rate limit domain must not be empty",
@@ -139,7 +169,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let config = self.config.read().unwrap().clone();
         let config = config
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
-        let checks = descriptor_checks(&config, request);
+        let checks = descriptor_checks(&config, request, &self.stats);
         let unknown_unit = checks.iter().any(|check| {
             matches!(check, Check::Limit(Some(limit)) if limit.limit.unit() == Unit::Unknown)
         });
@@ -234,6 +264,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
         }
         if overall_code == Code::OverLimit && self.settings.global_shadow_mode {
             overall_code = Code::Ok;
+            self.stats.global_shadow_mode().inc();
         }
         let dynamic_metadata = self.settings.response_dynamic_metadata.then(|| {
             // A descriptor that passed is not available when its quota group is exhausted.
@@ -476,7 +507,11 @@ enum Check {
 /// `constructLimitsToCheck`: each descriptor's limit, left out when another descriptor's
 /// limit replaces it by name (`replaces`). Replacements are collected from every matched
 /// limit first, unlimited and replaced ones included, so they are not transitive.
-fn descriptor_checks(config: &RateLimitConfig, request: &RateLimitRequest) -> Vec<Check> {
+fn descriptor_checks(
+    config: &RateLimitConfig,
+    request: &RateLimitRequest,
+    stats: &Stats,
+) -> Vec<Check> {
     let mut replaced = HashSet::new();
     let mut checks: Vec<Check> = request
         .descriptors
@@ -491,7 +526,12 @@ fn descriptor_checks(config: &RateLimitConfig, request: &RateLimitRequest) -> Ve
                         Check::Limit(Some(limit))
                     }
                 }
-                LimitLookup::NoLimit | LimitLookup::UnknownDomain => Check::Limit(None),
+                LimitLookup::UnknownDomain => {
+                    // Counted per descriptor, as upstream counts each lookup.
+                    stats.domain_not_found(&request.domain).inc();
+                    Check::Limit(None)
+                }
+                LimitLookup::NoLimit => Check::Limit(None),
             },
         )
         .collect();

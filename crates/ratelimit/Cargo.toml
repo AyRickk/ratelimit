@@ -10,6 +10,7 @@ base64.workspace = true
 fred.workspace = true
 prost-types.workspace = true
 ratelimit-proto.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 xxhash-rust.workspace = true

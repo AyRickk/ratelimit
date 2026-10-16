@@ -6,3 +6,4 @@ pub mod limiter;
 pub mod local_cache;
 pub mod redis;
 pub mod service;
+pub mod stats;

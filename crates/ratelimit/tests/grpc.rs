@@ -43,6 +43,7 @@ async fn client() -> RateLimitServiceClient<tonic::transport::Channel> {
     let service = Arc::new(RateLimitService::new(
         OverWhenLimited,
         Arc::new(SystemClock),
+        Arc::default(),
         ServiceSettings::default(),
     ));
     let file = ConfigFile {

@@ -51,7 +51,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `EXTRA_TAGS` | — | ⬜ | |
 | `STATS_FLUSH_INTERVAL` | `10s` | ⬜ | |
 | `DISABLE_STATS` | `false` | ⬜ | |
-| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | ⬜ | |
+| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `USE_PROMETHEUS` | `false` | ⬜ | |
 | `PROMETHEUS_ADDR` | `:9090` | ⬜ | |
 | `PROMETHEUS_PATH` | `/metrics` | ⬜ | |
@@ -64,7 +64,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `RUNTIME_WATCH_ROOT` | `true` | ⬜ | |
 | `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
 | `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not read from the environment yet |
-| `NEAR_LIMIT_RATIO` | `0.8` | ⬜ | |
+| `NEAR_LIMIT_RATIO` | `0.8` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `CACHE_KEY_PREFIX` | — | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `BACKEND_TYPE` | `redis` | ⬜ | |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not read from the environment yet |
@@ -160,7 +160,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `share_threshold` (pattern in the Redis key and the stats key) | ✅ | `tests/config.rs`, `tests/differential.rs` |
 | `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
 | Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
-| Reload: error ⇒ `config_load_error` + previous config kept | ⬜ | |
+| Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
 | Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
 | File provider: goruntime, `SymlinkRefresher` / `DirectoryRefresher`, `runtime.*` scope | ⬜ | |
 | xDS SotW provider (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
@@ -174,12 +174,12 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `is_negative_hits`: floor 0, always `OK`, TTL reset to the full duration | ✅ | `tests/differential.rs` |
 | Client-sent `limit`: replaces the config, without shadow / `replaces` / `unlimited` | ✅ | `tests/config.rs`, `tests/differential.rs` |
 | Response fields: `overall_code`, `statuses[]`, `current_limit` (with `name`), `limit_remaining`, `duration_until_reset` | ✅ | `tests/differential.rs` |
-| Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | 🚧 | `tests/service.rs`, `tests/differential.rs` (`domain_not_found` stat missing) |
+| Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `LIMIT_*` headers: response, per unit, and request | ✅ | `tests/differential.rs` |
 | Dynamic metadata (`RESPONSE_DYNAMIC_METADATA`): `domain`, `descriptors`, `hitsAddend`, merged `metadata` | ✅ | `tests/differential.rs`, `tests/service.rs` |
 | `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
-| Per-rule and global shadow mode (`global_shadow_mode`) | 🚧 | `tests/service.rs`, `tests/differential.rs` (`global_shadow_mode` stat missing) |
+| Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
 | `/healthcheck`: 500 with no body when unhealthy; SIGTERM ⇒ unhealthy + graceful shutdown | ⬜ | |
 | `grpc.health.v1`, service `ratelimit` | ⬜ | |
@@ -194,7 +194,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | 🚧 | `tests/differential.rs` (jitter missing) |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
 | Local cache of over-limit keys (set before the shadow check, TTL = unit), freecache's size limits and eviction | ✅ | `tests/differential.rs`, `tests/freecache.rs` |
-| `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ⬜ | |
+| `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ✅ | `tests/differential.rs` |
 | `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
 | Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |
 | Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
@@ -203,13 +203,14 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 | Item | Status | Test |
 |---|---|---|
-| Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ⬜ | |
-| `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ⬜ | |
-| `call.should_rate_limit.redis_error` / `service_error` | ⬜ | |
+| Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ✅ | `tests/differential.rs` |
+| `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ✅ | `tests/differential.rs` |
+| `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
 | `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
 | Exclusive sinks: statsd over **TCP** (default), DogStatsD (+ mogrifiers), native Prometheus + statsd_exporter mapper, log | ⬜ | |
-| `SanitizeStatName`, `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ⬜ | |
+| `SanitizeStatName` | ✅ | `tests/differential.rs` |
+| `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ⬜ | |
 | `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
 | OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
@@ -238,3 +239,4 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
 | `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
+| Negative or NaN `NEAR_LIMIT_RATIO`: the near threshold is converted to an integer by the CPU (amd64 wraps a negative value, arm64 gives 0) | 0 | Go leaves out-of-range float conversions to the platform |

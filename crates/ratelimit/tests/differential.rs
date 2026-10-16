@@ -14,6 +14,7 @@ use ratelimit::grpc;
 use ratelimit::limiter::Clock;
 use ratelimit::redis::{RedisCache, RedisCacheSettings};
 use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
+use ratelimit::stats::Stats;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
@@ -288,8 +289,14 @@ struct Oracle {
 /// The environment that configures the oracle's service like `settings`. Upstream reads it on
 /// every config load. Nothing else is inherited, so a variable set on the developer's machine
 /// cannot change the oracle's answers.
-fn oracle_environment(settings: &ServiceSettings) -> Vec<(&'static str, String)> {
+fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
+    let load = &settings.load;
+    let settings = &settings.service;
     let mut environment = vec![
+        (
+            "SANITIZE_DESCRIPTOR_METRIC_DOTS",
+            load.sanitize_descriptor_metric_dots.to_string(),
+        ),
         ("SHADOW_MODE", settings.global_shadow_mode.to_string()),
         ("QUOTA_MODE", settings.global_quota_mode.to_string()),
         (
@@ -327,11 +334,9 @@ fn oracle_environment(settings: &ServiceSettings) -> Vec<(&'static str, String)>
 }
 
 impl Oracle {
-    async fn start(
-        redis: &Redis,
-        settings: &RedisCacheSettings,
-        service_settings: &ServiceSettings,
-    ) -> Self {
+    async fn start(redis: &Redis, all: &Settings) -> Self {
+        let settings = &all.cache;
+        let near_limit_ratio = settings.near_limit_ratio.to_string();
         let local_cache_size = settings.local_cache_size_in_bytes.to_string();
         let stop_increment = format!(
             "-stop-cache-key-increment={}",
@@ -341,8 +346,9 @@ impl Oracle {
             .args(["-redis", &redis.address])
             .args(["-cache-key-prefix", &settings.cache_key_prefix])
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
+            .args(["-near-limit-ratio", &near_limit_ratio])
             .env_clear()
-            .envs(oracle_environment(service_settings))
+            .envs(oracle_environment(all))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -368,9 +374,15 @@ impl Oracle {
     }
 
     async fn put(&self, path: &str, body: String) {
+        let (status, response) = self.send("PUT", path, &body).await;
+        assert_eq!(status, 200, "oracle {path}: {response}");
+    }
+
+    /// Sends an HTTP/1.0 request (so the answer is not chunked); returns the status and body.
+    async fn send(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         let mut stream = tokio::net::TcpStream::connect(&self.control).await.unwrap();
         let request = format!(
-            "PUT {path} HTTP/1.1\r\nHost: oracle\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.0\r\nHost: oracle\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
@@ -380,10 +392,22 @@ impl Oracle {
         tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut response)
             .await
             .unwrap();
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "oracle {path}: {response}"
-        );
+        let status = response[9..12].parse().unwrap();
+        let body = response.split_once("\r\n\r\n").unwrap().1.to_string();
+        (status, body)
+    }
+
+    /// The service's counters above 0 (one that wrapped around to 0 is left out too).
+    async fn stats(&self) -> BTreeMap<String, u64> {
+        let (status, body) = self.send("GET", "/stats", "").await;
+        assert_eq!(status, 200, "oracle /stats: {body}");
+        body.lines()
+            .map(|line| {
+                let (name, value) = line.rsplit_once(' ').unwrap();
+                (name.to_string(), value.parse().unwrap())
+            })
+            .filter(|(_, value)| *value > 0)
+            .collect()
     }
 }
 
@@ -392,20 +416,24 @@ struct Subject {
     client: RateLimitServiceClient<Channel>,
     service: Arc<RateLimitService<RedisCache>>,
     clock: Arc<ManualClock>,
+    stats: Arc<Stats>,
 }
 
 impl Subject {
-    async fn start(
-        redis: &Redis,
-        settings: &RedisCacheSettings,
-        service_settings: &ServiceSettings,
-    ) -> Self {
+    async fn start(redis: &Redis, settings: &Settings) -> Self {
         let clock = Arc::new(ManualClock::default());
-        let cache = RedisCache::new(redis.connect().await, clock.clone(), settings.clone());
+        let stats = Arc::new(Stats::default());
+        let cache = RedisCache::new(
+            redis.connect().await,
+            clock.clone(),
+            stats.clone(),
+            settings.cache.clone(),
+        );
         let service = Arc::new(RateLimitService::new(
             cache,
             clock.clone(),
-            service_settings.clone(),
+            stats.clone(),
+            settings.service.clone(),
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -421,6 +449,7 @@ impl Subject {
             client,
             service,
             clock,
+            stats,
         }
     }
 }
@@ -430,6 +459,15 @@ struct Harness {
     oracle_redis: Redis,
     subject: Subject,
     subject_redis: Redis,
+    load_options: LoadOptions,
+}
+
+/// Everything both sides are configured with.
+#[derive(Default)]
+struct Settings {
+    cache: RedisCacheSettings,
+    service: ServiceSettings,
+    load: LoadOptions,
 }
 
 impl Harness {
@@ -445,39 +483,66 @@ impl Harness {
         Self::with_settings(config, settings).await
     }
 
-    async fn with_settings(config: &str, settings: RedisCacheSettings) -> Self {
-        Self::configured(config, settings, ServiceSettings::default()).await
+    async fn with_settings(config: &str, cache: RedisCacheSettings) -> Self {
+        let settings = Settings {
+            cache,
+            ..Default::default()
+        };
+        Self::configured(config, settings).await
     }
 
-    async fn with_service_settings(config: &str, service_settings: ServiceSettings) -> Self {
-        Self::configured(config, RedisCacheSettings::default(), service_settings).await
+    async fn with_service_settings(config: &str, service: ServiceSettings) -> Self {
+        let settings = Settings {
+            service,
+            ..Default::default()
+        };
+        Self::configured(config, settings).await
     }
 
     /// Both sides configured alike: the settings for this implementation, the matching flags
     /// and environment for the oracle.
-    async fn configured(
-        config: &str,
-        settings: RedisCacheSettings,
-        service_settings: ServiceSettings,
-    ) -> Self {
+    async fn configured(config: &str, settings: Settings) -> Self {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
-        let oracle = Oracle::start(&oracle_redis, &settings, &service_settings).await;
-        let subject = Subject::start(&subject_redis, &settings, &service_settings).await;
-        oracle.put("/config", config.to_string()).await;
-        let file = ConfigFile {
-            name: "config.yaml".into(),
-            content: config.into(),
-        };
-        subject
-            .service
-            .set_config(config::load(&[file], &LoadOptions::default()).unwrap());
-        Self {
+        let oracle = Oracle::start(&oracle_redis, &settings).await;
+        let subject = Subject::start(&subject_redis, &settings).await;
+        let mut h = Self {
             oracle,
             oracle_redis,
             subject,
             subject_redis,
-        }
+            load_options: settings.load,
+        };
+        h.load_config(config).await.unwrap();
+        h
+    }
+
+    /// Loads `config` on both sides, as a reload; returns upstream's error if it does not load,
+    /// after checking ours is the same and both kept the previous config.
+    async fn load_config(&mut self, config: &str) -> Result<(), String> {
+        let (status, error) = self.oracle.send("PUT", "/config", config).await;
+        let file = ConfigFile {
+            name: "config.yaml".into(),
+            content: config.into(),
+        };
+        let loaded = config::load(&[file], &self.load_options);
+        let actual = loaded.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.subject.service.update_config(loaded);
+        let expected = match status {
+            200 => Ok(()),
+            _ => Err(error.trim_end().to_string()),
+        };
+        assert_eq!(actual, expected, "loading {config}");
+        self.assert_same_stats().await;
+        expected
+    }
+
+    async fn assert_same_stats(&self) {
+        assert_eq!(
+            self.subject.stats.snapshot(),
+            self.oracle.stats().await,
+            "counters"
+        );
     }
 
     async fn at(&mut self, now: i64) {
@@ -498,6 +563,7 @@ impl Harness {
             single_space_limit_text(response);
         }
         assert_eq!(actual, expected, "response to {request:?}");
+        self.assert_same_stats().await;
         actual
     }
 
@@ -1443,5 +1509,254 @@ async fn dynamic_metadata_lists_the_models_with_quota_like_upstream() {
     h.call(request("ai", &[regular, &[("backend_name", "other")]]))
         .await
         .unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Every config load is counted; one that fails is counted as an error and the previous config
+/// stays in use.
+#[tokio::test]
+async fn config_reloads_are_counted_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "alice")]]);
+    h.call(user()).await.unwrap();
+    let error = h
+        .load_config("domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: fortnight, requests_per_unit: 1}\n")
+        .await
+        .unwrap_err();
+    assert!(error.contains("fortnight"), "{error}");
+    h.call(user()).await.unwrap();
+    h.load_config("domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: minute, requests_per_unit: 1}\n")
+        .await
+        .unwrap();
+    h.call(user()).await.unwrap();
+    h.call(user()).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Hits are split between `within_limit`, `near_limit`, `over_limit` and `shadow_mode` like
+/// upstream, with the near threshold computed in float32: 0.29 × 100 is 29 there, 28 in
+/// float64.
+#[tokio::test]
+async fn near_and_over_limit_hits_are_split_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: RedisCacheSettings {
+            near_limit_ratio: 0.29,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut h = Harness::configured(
+        "
+domain: d
+descriptors:
+  - key: k
+    rate_limit: {unit: minute, requests_per_unit: 100}
+  - key: shadow
+    shadow_mode: true
+    rate_limit: {unit: minute, requests_per_unit: 100}
+",
+        settings,
+    )
+    .await;
+    h.at(1_700_000_000).await;
+    let both = || request("d", &[&[("k", "x")], &[("shadow", "x")]]);
+    // 28 (under near), 29, 30 (near), 95 (straddles near), 105 (straddles over), 110 (over).
+    for hits in [28, 1, 1, 65, 10, 5] {
+        h.call(with_hits(both(), hits, &[None, None]))
+            .await
+            .unwrap();
+    }
+    // A new window: from 0 straight past the near threshold, then past both.
+    h.at(1_700_000_060).await;
+    h.call(with_hits(both(), 40, &[None, None])).await.unwrap();
+    h.at(1_700_000_120).await;
+    h.call(with_hits(both(), 150, &[None, None])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// With `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, a descriptor left uncounted because another
+/// is going over still has its hits taken from its counter for the stats, wrapping below 0 as
+/// in upstream's unsigned arithmetic.
+#[tokio::test]
+async fn uncounted_hits_wrap_in_the_stats_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: RedisCacheSettings {
+            near_limit_ratio: 0.29,
+            stop_cache_key_increment_when_overlimit: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut h = Harness::configured(
+        "
+domain: d
+descriptors:
+  - key: small
+    rate_limit: {unit: minute, requests_per_unit: 10}
+  - key: big
+    rate_limit: {unit: minute, requests_per_unit: 100}
+",
+        settings,
+    )
+    .await;
+    h.at(1_700_000_000).await;
+    h.call(with_hits(request("d", &[&[("big", "x")]]), 30, &[None]))
+        .await
+        .unwrap();
+    // `small` goes over, so `big` (30 + 40 = 70, within its limit) is not counted.
+    h.call(with_hits(
+        request("d", &[&[("small", "x")], &[("big", "x")]]),
+        40,
+        &[None, None],
+    ))
+    .await
+    .unwrap();
+    h.assert_same_redis().await;
+}
+
+const NAMED: &str = "
+domain: d
+descriptors:
+  - key: detailed
+    detailed_metric: true
+    rate_limit: {unit: minute, requests_per_unit: 10}
+  - key: metric
+    value_to_metric: true
+    rate_limit: {unit: minute, requests_per_unit: 10}
+  - key: plain
+    rate_limit: {unit: minute, requests_per_unit: 10}
+";
+
+/// Counters are named after the limit's stats key, sanitized: `:` and `|` and the dots of IPv4
+/// addresses become `_`; an unknown domain is counted per descriptor.
+#[tokio::test]
+async fn counters_are_named_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(NAMED).await;
+    h.at(1_700_000_000).await;
+    for value in ["a:b|c", "10.0.0.1", "v1.2.3.4.5", "1234.5.6.7.8"] {
+        h.call(request(
+            "d",
+            &[
+                &[("detailed", value)],
+                &[("metric", value)],
+                &[("plain", value)],
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    let mut overridden = request("d", &[&[("client", "192.168.1.1:80")]]);
+    overridden.descriptors[0].limit = Some(
+        ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride {
+            requests_per_unit: 5,
+            unit: 2, // MINUTE
+            unit_multiplier: None,
+        },
+    );
+    h.call(overridden).await.unwrap();
+    h.call(request("unknown:1.2.3.4", &[&[("a", "b")], &[("c", "d")]]))
+        .await
+        .unwrap();
+    h.assert_same_redis().await;
+}
+
+/// `SANITIZE_DESCRIPTOR_METRIC_DOTS` turns dots into `_` in the keys and values of stats keys
+/// built per request.
+#[tokio::test]
+async fn descriptor_dots_are_sanitized_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        load: LoadOptions {
+            sanitize_descriptor_metric_dots: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut h = Harness::configured(NAMED, settings).await;
+    h.at(1_700_000_000).await;
+    for value in ["a.b", "10.0.0.1"] {
+        h.call(request(
+            "d",
+            &[
+                &[("detailed", value)],
+                &[("metric", value)],
+                &[("plain", value)],
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    h.call(request("unknown.domain", &[&[("a.b", "c.d")]]))
+        .await
+        .unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Global shadow mode counts each request it lets through.
+#[tokio::test]
+async fn global_shadow_mode_is_counted_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        global_shadow_mode: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    for hits in [600, 600, 1] {
+        let response = h
+            .call(with_hits(
+                request("llm", &[&[("user", "alice")]]),
+                hits,
+                &[None],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.overall_code, 1); // OK
+    }
+    h.assert_same_redis().await;
+}
+
+/// With `NEAR_LIMIT_RATIO` above 1 the near threshold is past the limit: hits going over then
+/// add the limit minus that threshold to `near_limit`, wrapping below 0 like upstream.
+#[tokio::test]
+async fn a_near_threshold_past_the_limit_wraps_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: RedisCacheSettings {
+            near_limit_ratio: 1.5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    for hits in [900, 200, 50] {
+        h.call(with_hits(
+            request("llm", &[&[("user", "alice")]]),
+            hits,
+            &[None],
+        ))
+        .await
+        .unwrap();
+    }
     h.assert_same_redis().await;
 }
