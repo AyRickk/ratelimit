@@ -137,8 +137,19 @@ impl Monitor {
 
 impl Redis {
     async fn start() -> Self {
-        let port = free_port().await;
-        let process = Command::new(redis_server())
+        // The port is free when chosen but may be taken before the server binds it (by another
+        // test's server, which this one would then share): try again on another port.
+        for _ in 0..5 {
+            if let Some(redis) = Self::start_on(free_port().await).await {
+                return redis;
+            }
+        }
+        panic!("could not start {}", redis_server());
+    }
+
+    /// The server started on `port`, once it answers and is the one started here.
+    async fn start_on(port: u16) -> Option<Self> {
+        let mut process = Command::new(redis_server())
             .args([
                 "--port",
                 &port.to_string(),
@@ -154,11 +165,27 @@ impl Redis {
         let address = format!("127.0.0.1:{port}");
         let config = Config::from_url(&format!("redis://{address}")).unwrap();
         let client = Builder::from_config(config).build().unwrap();
-        for _ in 0..100 {
+        let mut ready = false;
+        for _ in 0..250 {
+            if process.try_wait().unwrap().is_some() {
+                return None;
+            }
             if client.init().await.is_ok() {
+                ready = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let server: String = client
+            .custom(
+                CustomCommand::new_static("INFO", ClusterHash::Random, false),
+                vec!["server"],
+            )
+            .await
+            .ok()?;
+        let ours = format!("process_id:{}", process.id()?);
+        if !ready || !server.lines().any(|line| line.trim() == ours) {
+            return None;
         }
         let info: String = client
             .custom(
@@ -173,13 +200,13 @@ impl Redis {
             .unwrap()
             .to_string();
         let monitor = Monitor::start(&address).await;
-        Self {
+        Some(Self {
             _process: process,
             client,
             client_address,
             address,
             monitor,
-        }
+        })
     }
 
     /// A new connection, for the implementation under test.
@@ -368,8 +395,15 @@ impl Oracle {
                 .expect("oracle address")
                 .to_string()
         };
-        let grpc = address("grpc", lines.next_line().await.unwrap());
-        let control = address("control", lines.next_line().await.unwrap());
+        // The oracle waits for Redis before listening; a timeout turns a hang into a failure.
+        let mut next_line = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+                .await
+                .expect("the oracle did not start within 30 seconds")
+                .unwrap()
+        };
+        let grpc = address("grpc", next_line().await);
+        let control = address("control", next_line().await);
         let client = RateLimitServiceClient::connect(format!("http://{grpc}"))
             .await
             .unwrap();
