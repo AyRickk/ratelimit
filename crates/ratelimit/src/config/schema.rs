@@ -61,13 +61,13 @@ fn dedup_entries(entries: &[(Node, Node)]) -> Vec<(&Node, &Node)> {
             Node::Scalar(s) => Some(s.resolve()),
             _ => None,
         };
-        if let Some(r) = &resolved {
-            if let Some(pos) = out.iter().position(|(ok, _)| match ok {
+        if let Some(r) = &resolved
+            && let Some(pos) = out.iter().position(|(ok, _)| match ok {
                 Node::Scalar(s) => &s.resolve() == r,
                 _ => false,
-            }) {
-                out.remove(pos);
-            }
+            })
+        {
+            out.remove(pos);
         }
         out.push((k, v));
     }
@@ -105,21 +105,14 @@ fn validate_keys(root: Option<&Node>) -> Result<(), String> {
 fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
     for (k, v) in dedup_entries(entries) {
         let key = match k {
-            Node::Scalar(s) => match s.resolve() {
-                Resolved::Str(key) => key,
-                other => {
-                    return Err(format!(
-                        "config error, key is not of type string: {}",
-                        go_format(&other)
-                    ));
-                }
-            },
-            other => {
-                return Err(format!(
-                    "config error, key is not of type string: {}",
-                    go_format_node(other)
-                ));
-            }
+            Node::Scalar(s) => s.resolve(),
+            _ => unreachable!("collection keys are rejected by check_map_keys"),
+        };
+        let Resolved::Str(key) = key else {
+            return Err(format!(
+                "config error, key is not of type string: {}",
+                go_format(&key)
+            ));
         };
         if !VALID_KEYS.contains(&key.as_str()) {
             return Err(format!("config error, unknown key '{key}'"));
@@ -153,8 +146,43 @@ fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
     Ok(())
 }
 
+/// `%#v` of a value decoded into `interface{}`.
+fn go_syntax(node: &Node) -> String {
+    match node {
+        Node::Scalar(s) => match s.resolve() {
+            Resolved::Null => "interface {}(nil)".to_string(),
+            Resolved::Str(s) => format!("{s:?}"),
+            other => go_format(&other),
+        },
+        Node::Seq { items, .. } => {
+            let items: Vec<_> = items.iter().map(go_syntax).collect();
+            format!("[]interface {{}}{{{}}}", items.join(", "))
+        }
+        Node::Map { entries, .. } => {
+            let mut items: Vec<_> = dedup_entries(entries)
+                .into_iter()
+                .map(|(k, v)| format!("{}:{}", go_syntax(k), go_syntax(v)))
+                .collect();
+            items.sort();
+            format!("map[interface {{}}]interface {{}}{{{}}}", items.join(", "))
+        }
+    }
+}
+
+/// yaml.v2 rejects collection keys while decoding into `map[interface{}]interface{}`.
+fn check_map_keys(node: &Node) -> Result<(), String> {
+    match node {
+        Node::Scalar(_) => Ok(()),
+        Node::Seq { items, .. } => items.iter().try_for_each(check_map_keys),
+        Node::Map { entries, .. } => entries.iter().try_for_each(|(k, v)| match k {
+            Node::Scalar(_) => check_map_keys(v),
+            collection => Err(format!("yaml: invalid map key: {}", go_syntax(collection))),
+        }),
+    }
+}
+
 /// A yaml.v2 type error, e.g. "line 3: cannot unmarshal !!str `abc` into uint32".
-fn terror(node: &Node, go_type: &str) -> String {
+fn type_error(node: &Node, go_type: &str) -> String {
     let value = match node {
         Node::Scalar(s) => {
             let text = s.text.as_bytes();
@@ -183,6 +211,11 @@ fn is_null(node: &Node) -> bool {
     matches!(node, Node::Scalar(s) if s.resolve() == Resolved::Null)
 }
 
+/// Null for a pointer field, which yaml.v2 leaves nil only for some null spellings.
+fn is_nil_pointer(node: &Node) -> bool {
+    matches!(node, Node::Scalar(s) if s.is_nil())
+}
+
 struct Decoder {
     errors: Vec<String>,
 }
@@ -193,7 +226,7 @@ impl Decoder {
             Node::Scalar(s) if s.resolve() == Resolved::Null => String::new(),
             Node::Scalar(s) => s.text.clone(),
             other => {
-                self.errors.push(terror(other, "string"));
+                self.errors.push(type_error(other, "string"));
                 String::new()
             }
         }
@@ -211,7 +244,7 @@ impl Decoder {
             _ => None,
         };
         value.unwrap_or_else(|| {
-            self.errors.push(terror(node, "uint32"));
+            self.errors.push(type_error(node, "uint32"));
             0
         })
     }
@@ -222,12 +255,12 @@ impl Decoder {
                 Resolved::Null => false,
                 Resolved::Bool(b) => b,
                 _ => {
-                    self.errors.push(terror(node, "bool"));
+                    self.errors.push(type_error(node, "bool"));
                     false
                 }
             },
             _ => {
-                self.errors.push(terror(node, "bool"));
+                self.errors.push(type_error(node, "bool"));
                 false
             }
         }
@@ -251,7 +284,7 @@ impl Decoder {
             ),
             n if is_null(n) => None,
             other => {
-                self.errors.push(terror(other, go_type));
+                self.errors.push(type_error(other, go_type));
                 None
             }
         }
@@ -262,7 +295,7 @@ impl Decoder {
             Node::Seq { items, .. } => items,
             n if is_null(n) => &[],
             other => {
-                self.errors.push(terror(other, go_type));
+                self.errors.push(type_error(other, go_type));
                 &[]
             }
         }
@@ -296,23 +329,32 @@ impl Decoder {
             match name.as_str() {
                 "key" => d.key = self.string(v),
                 "value" => d.value = self.string(v),
-                "rate_limit" => d.rate_limit = self.rate_limit(v),
+                "rate_limit" => self.rate_limit(v, &mut d.rate_limit),
                 "descriptors" => d.descriptors = self.descriptors(v),
                 "shadow_mode" => d.shadow_mode = self.boolean(v),
                 "quota_mode" => d.quota_mode = self.boolean(v),
                 "detailed_metric" => d.detailed_metric = self.boolean(v),
                 "value_to_metric" => d.value_to_metric = self.boolean(v),
                 "share_threshold" => d.share_threshold = self.boolean(v),
-                "metadata" => d.metadata = self.metadata(v),
+                "metadata" => self.metadata(v, &mut d.metadata),
                 _ => {}
             }
         }
         d
     }
 
-    fn rate_limit(&mut self, node: &Node) -> Option<YamlRateLimit> {
-        let fields = self.fields(node, "config.YamlRateLimit")?;
-        let mut rl = YamlRateLimit::default();
+    /// A `*YamlRateLimit` field: decoding into an existing value overlays it, like yaml.v2.
+    fn rate_limit(&mut self, node: &Node, out: &mut Option<YamlRateLimit>) {
+        if is_nil_pointer(node) {
+            *out = None;
+            return;
+        }
+        let rl = out.get_or_insert_with(Default::default);
+        let Some(fields) = self.fields(node, "config.YamlRateLimit") else {
+            // Any other null spelling allocates the struct and zeroes it.
+            *rl = YamlRateLimit::default();
+            return;
+        };
         for (name, v) in fields {
             match name.as_str() {
                 "requests_per_unit" => rl.requests_per_unit = self.uint32(v),
@@ -339,31 +381,24 @@ impl Decoder {
                 _ => {}
             }
         }
-        Some(rl)
     }
 
-    /// `map[string]interface{}` converted to a protobuf `Struct`, nil when empty.
-    fn metadata(&mut self, node: &Node) -> Option<Struct> {
+    /// A `map[string]interface{}` field as a protobuf `Struct`, nil when empty. Decoding into
+    /// an existing map adds to it, like yaml.v2.
+    fn metadata(&mut self, node: &Node, out: &mut Option<Struct>) {
         match node {
             Node::Map { entries, .. } => {
-                let mut fields = BTreeMap::new();
+                let mut fields: BTreeMap<_, _> = out.take().map(|s| s.fields).unwrap_or_default();
                 for (k, v) in entries {
-                    let key = match k {
-                        Node::Scalar(s) => s.text.clone(),
-                        other => {
-                            self.errors.push(terror(other, "string"));
-                            continue;
-                        }
-                    };
+                    let key = self.string(k);
                     fields.insert(key, to_value(v));
                 }
-                (!fields.is_empty()).then_some(Struct { fields })
+                *out = (!fields.is_empty()).then_some(Struct { fields });
             }
-            n if is_null(n) => None,
-            other => {
-                self.errors.push(terror(other, "map[string]interface {}"));
-                None
-            }
+            n if is_null(n) => *out = None,
+            other => self
+                .errors
+                .push(type_error(other, "map[string]interface {}")),
         }
     }
 }
@@ -394,18 +429,15 @@ fn to_value(node: &Node) -> Value {
 
 /// `ConfigFileContentToYaml` without the file name prefix: parse, validate keys, decode.
 pub(crate) fn parse_config(content: &str) -> Result<YamlRoot, String> {
-    let root =
-        super::yaml::parse(content).map_err(|e| format!("error loading config file: {e}"))?;
+    let loading = |e: String| format!("error loading config file: {e}");
+    let root = super::yaml::parse(content).map_err(loading)?;
     match root.as_ref() {
-        None | Some(Node::Map { .. }) => {}
-        Some(n) if is_null(n) => {}
-        Some(other) => {
-            let error = terror(other, "map[interface {}]interface {}");
-            return Err(format!(
-                "error loading config file: {}",
-                unmarshal_errors(&[error])
-            ));
+        Some(map @ Node::Map { .. }) => check_map_keys(map).map_err(loading)?,
+        Some(n) if !is_null(n) => {
+            let error = type_error(n, "map[interface {}]interface {}");
+            return Err(loading(unmarshal_errors(&[error])));
         }
+        _ => {}
     }
     validate_keys(root.as_ref())?;
     let Some(root) = root else {
@@ -416,9 +448,6 @@ pub(crate) fn parse_config(content: &str) -> Result<YamlRoot, String> {
     if decoder.errors.is_empty() {
         Ok(decoded)
     } else {
-        Err(format!(
-            "error loading config file: {}",
-            unmarshal_errors(&decoder.errors)
-        ))
+        Err(loading(unmarshal_errors(&decoder.errors)))
     }
 }

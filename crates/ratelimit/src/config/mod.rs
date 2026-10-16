@@ -48,10 +48,35 @@ pub struct RateLimit {
     /// `detailed_metric`: stats are named after the request's values, not the config's.
     pub detailed_metric: bool,
     pub shadow_mode: bool,
+    pub quota_mode: bool,
+    /// Names of limits this one replaces in the same request.
+    pub replaces: Vec<String>,
     /// For each descriptor entry, the wildcard value (`files/*`) it matched with
     /// `share_threshold`, or empty; `None` when no entry matched that way.
     pub share_threshold_key_pattern: Option<Vec<String>>,
     pub metadata: Option<prost_types::Struct>,
+}
+
+impl RateLimit {
+    fn new(full_key: String, requests_per_unit: u32, unit: i32, name: String) -> Self {
+        Self {
+            full_key,
+            limit: rate_limit_response::RateLimit {
+                name: name.clone(),
+                requests_per_unit,
+                unit,
+                unit_multiplier: None,
+            },
+            name,
+            unlimited: false,
+            detailed_metric: false,
+            shadow_mode: false,
+            quota_mode: false,
+            replaces: Vec::new(),
+            share_threshold_key_pattern: None,
+            metadata: None,
+        }
+    }
 }
 
 /// The result of looking up a descriptor.
@@ -89,9 +114,14 @@ pub fn load(files: &[ConfigFile], options: &LoadOptions) -> Result<RateLimitConf
         domains: HashMap::new(),
         sanitize_dots: options.sanitize_descriptor_metric_dots,
     };
-    for file in files {
-        let root =
-            schema::parse_config(&file.content).map_err(|e| ConfigError::new(&file.name, e))?;
+    // Like upstream, every file is parsed and key-validated before any domain is loaded.
+    let roots = files
+        .iter()
+        .map(|file| {
+            schema::parse_config(&file.content).map_err(|e| ConfigError::new(&file.name, e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (file, root) in files.iter().zip(roots) {
         if root.domain.is_empty() {
             return Err(ConfigError::new(
                 &file.name,
@@ -152,19 +182,18 @@ fn load_limit(
         }
     }
     Ok(Some(RateLimit {
-        full_key: full_key.to_string(),
-        limit: rate_limit_response::RateLimit {
-            name: rl.name.clone(),
-            requests_per_unit: rl.requests_per_unit,
-            unit: unit.unwrap_or(Unit::Unknown) as i32,
-            unit_multiplier: None,
-        },
-        name: rl.name.clone(),
         unlimited: rl.unlimited,
         detailed_metric: config.detailed_metric,
         shadow_mode: config.shadow_mode,
-        share_threshold_key_pattern: None,
+        quota_mode: config.quota_mode,
+        replaces: rl.replaces.clone(),
         metadata: config.metadata.clone(),
+        ..RateLimit::new(
+            full_key.to_string(),
+            rl.requests_per_unit,
+            unit.unwrap_or(Unit::Unknown) as i32,
+            rl.name.clone(),
+        )
     }))
 }
 
@@ -223,28 +252,19 @@ impl Descriptor {
 
 impl RateLimitConfig {
     /// `GetLimit`: the limit that applies to `descriptor` in `domain`.
-    pub fn get_limit(&self, domain: &str, descriptor: &RateLimitDescriptor) -> LimitLookup {
+    pub fn get_limit<'a>(&'a self, domain: &str, descriptor: &RateLimitDescriptor) -> LimitLookup {
         let Some(mut current) = self.domains.get(domain) else {
             return LimitLookup::UnknownDomain;
         };
         if let Some(limit) = &descriptor.limit {
             // The override replaces the config entirely; shadow mode is deliberately off.
-            return LimitLookup::Limit(RateLimit {
-                full_key: self.descriptor_key(domain, descriptor),
-                limit: rate_limit_response::RateLimit {
-                    name: String::new(),
-                    requests_per_unit: limit.requests_per_unit,
-                    // envoy.type.v3.RateLimitUnit shares its numbering with the response unit.
-                    unit: limit.unit,
-                    unit_multiplier: None,
-                },
-                name: String::new(),
-                unlimited: false,
-                detailed_metric: false,
-                shadow_mode: false,
-                share_threshold_key_pattern: None,
-                metadata: None,
-            });
+            // envoy.type.v3.RateLimitUnit shares its numbering with the response unit.
+            return LimitLookup::Limit(RateLimit::new(
+                self.descriptor_key(domain, descriptor),
+                limit.requests_per_unit,
+                limit.unit,
+                String::new(),
+            ));
         }
         let mut found: Option<RateLimit> = None;
         let mut detailed_key = domain.to_string();
@@ -260,29 +280,31 @@ impl RateLimitConfig {
             let key_value = format!("{}_{}", entry.key, entry.value);
             let mut matched_wildcard = None;
             let mut next = current.descriptors.get(&key_value);
-            if next.is_none() {
-                if let Some((pattern, _)) = current
+            if next.is_none()
+                && let Some((pattern, _)) = current
                     .wildcards
                     .iter()
                     .find(|(_, parts)| wildcard_match(parts, &key_value))
-                {
-                    next = current.descriptors.get(pattern);
-                    matched_wildcard = Some(pattern.as_str());
-                }
+            {
+                next = current.descriptors.get(pattern);
+                matched_wildcard = Some(pattern.as_str());
             }
             let matched_using_value = next.is_some();
             if next.is_none() {
                 next = current.descriptors.get(&entry.key);
             }
 
+            // The value part of a `key_value` wildcard pattern, e.g. `files*` in `key_files*`.
+            let pattern_value = |pattern: &'a str| {
+                pattern
+                    .strip_prefix(&format!("{}_", entry.key))
+                    .unwrap_or(pattern)
+            };
             if let (Some(_), Some(pattern)) = (
                 matched_wildcard,
-                next.and_then(|n| n.share_threshold_pattern.as_ref()),
+                next.and_then(|n| n.share_threshold_pattern.as_deref()),
             ) {
-                let value = pattern
-                    .strip_prefix(&format!("{}_", entry.key))
-                    .unwrap_or(pattern);
-                share_patterns.insert(i, value.to_string());
+                share_patterns.insert(i, pattern_value(pattern).to_string());
             }
 
             value_to_metric_key += ".";
@@ -291,9 +313,7 @@ impl RateLimitConfig {
                 let value = match matched_wildcard {
                     Some(_) if share_patterns.contains_key(&i) => share_patterns[&i].as_str(),
                     Some(_) if next.value_to_metric => entry.value.as_str(),
-                    Some(pattern) => pattern
-                        .strip_prefix(&format!("{}_", entry.key))
-                        .unwrap_or(pattern),
+                    Some(pattern) => pattern_value(pattern),
                     None if matched_using_value || next.value_to_metric => entry.value.as_str(),
                     None => "",
                 };
@@ -307,10 +327,10 @@ impl RateLimitConfig {
                 stopped_at_leaf = true;
                 break;
             };
-            if let Some(limit) = &next.limit {
-                if i == descriptor.entries.len() - 1 {
-                    found = Some(limit.clone());
-                }
+            if let Some(limit) = &next.limit
+                && i == descriptor.entries.len() - 1
+            {
+                found = Some(limit.clone());
             }
             if next.descriptors.is_empty() {
                 stopped_at_leaf = true;

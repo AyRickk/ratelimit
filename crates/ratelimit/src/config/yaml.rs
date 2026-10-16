@@ -56,6 +56,7 @@ impl Node {
                 Resolved::Bool(_) => "!!bool",
                 Resolved::Int(_) | Resolved::Uint(_) => "!!int",
                 Resolved::Float(_) => "!!float",
+                Resolved::Str(_) if s.is_timestamp() => "!!timestamp",
                 Resolved::Str(_) => "!!str",
             },
         }
@@ -72,6 +73,112 @@ impl Scalar {
         }
         resolve_plain(&self.text)
     }
+
+    /// A null that leaves a pointer field nil: yaml.v2 only treats `null`, `~`, an empty
+    /// plain scalar or an explicit `!!null` this way (other null spellings allocate it).
+    pub fn is_nil(&self) -> bool {
+        self.tag.as_deref() == Some("tag:yaml.org,2002:null")
+            || (self.plain && self.tag.is_none() && matches!(self.text.as_str(), "null" | "~" | ""))
+    }
+
+    /// Whether yaml.v2 resolves the scalar as a timestamp (it still decodes as a string).
+    fn is_timestamp(&self) -> bool {
+        match self.tag.as_deref() {
+            Some("tag:yaml.org,2002:timestamp") => true,
+            None if self.plain => is_go_timestamp(&self.text),
+            _ => false,
+        }
+    }
+}
+
+/// yaml.v2 `parseTimestamp`: `2006-1-2`, `2006-1-2 15:4:5.999999999` or
+/// `2006-1-2T15:4:5.999999999Z07:00` (`t` also accepted), with Go's range checks.
+fn is_go_timestamp(s: &str) -> bool {
+    fn number(s: &str, min_digits: usize, max_digits: usize) -> Option<(u32, &str)> {
+        let len = s
+            .bytes()
+            .take(max_digits)
+            .take_while(u8::is_ascii_digit)
+            .count();
+        (len >= min_digits).then(|| (s[..len].parse().unwrap(), &s[len..]))
+    }
+    let Some((year, rest)) = number(s, 4, 4) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some((month, rest)) = number(rest, 1, 2) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some((day, rest)) = number(rest, 1, 2) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&month) || day < 1 || day > days[month as usize - 1] {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    let (zoned, rest) = match rest.as_bytes()[0] {
+        b'T' | b't' => (true, &rest[1..]),
+        b' ' => (false, &rest[1..]),
+        _ => return false,
+    };
+    let Some((hour, rest)) = number(rest, 1, 2) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(':') else {
+        return false;
+    };
+    let Some((minute, rest)) = number(rest, 1, 2) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(':') else {
+        return false;
+    };
+    let Some((second, mut rest)) = number(rest, 1, 2) else {
+        return false;
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    if !zoned {
+        return rest.is_empty();
+    }
+    if rest == "Z" {
+        return true;
+    }
+    let Some(offset) = rest.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let b = offset.as_bytes();
+    b.len() == 5 && b[2] == b':' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit())
 }
 
 fn resolve_plain(s: &str) -> Resolved {
@@ -100,10 +207,10 @@ fn resolve_plain(s: &str) -> Resolved {
     if let Some(v) = go_parse_uint(&plain) {
         return Resolved::Uint(v);
     }
-    if is_yaml_style_float(&plain) {
-        if let Ok(v) = plain.parse::<f64>() {
-            return Resolved::Float(v);
-        }
+    if is_yaml_style_float(&plain)
+        && let Ok(v) = plain.parse::<f64>()
+    {
+        return Resolved::Float(v);
     }
     if let Some(rest) = plain.strip_prefix("0b") {
         if let Ok(v) = i64::from_str_radix(rest, 2) {
@@ -112,10 +219,10 @@ fn resolve_plain(s: &str) -> Resolved {
         if let Ok(v) = u64::from_str_radix(rest, 2) {
             return Resolved::Uint(v);
         }
-    } else if let Some(rest) = plain.strip_prefix("-0b") {
-        if let Ok(v) = i64::from_str_radix(&format!("-{rest}"), 2) {
-            return Resolved::Int(v);
-        }
+    } else if let Some(rest) = plain.strip_prefix("-0b")
+        && let Ok(v) = i64::from_str_radix(&format!("-{rest}"), 2)
+    {
+        return Resolved::Int(v);
     }
     Resolved::Str(s.to_string())
 }
@@ -127,7 +234,7 @@ fn go_parse_int(s: &str) -> Option<i64> {
         b'+' => (false, &s[1..]),
         _ => (false, s),
     };
-    let magnitude = go_parse_unsigned_digits(digits)?;
+    let magnitude = go_parse_uint(digits)?;
     if negative {
         if magnitude <= i64::MAX as u64 + 1 {
             Some((magnitude as i128).wrapping_neg() as i64)
@@ -141,10 +248,6 @@ fn go_parse_int(s: &str) -> Option<i64> {
 
 /// `strconv.ParseUint(s, 0, 64)`: no sign allowed.
 fn go_parse_uint(s: &str) -> Option<u64> {
-    go_parse_unsigned_digits(s)
-}
-
-fn go_parse_unsigned_digits(s: &str) -> Option<u64> {
     let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
     {
         (16, rest)
@@ -231,7 +334,7 @@ fn go_format_float(v: f64) -> String {
     let (mantissa, exp) = sci.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();
     // With the shortest representation, Go switches to %e at exponent 6.
-    if exp < -4 || exp >= 6 {
+    if !(-4..6).contains(&exp) {
         let exp_sign = if exp < 0 { '-' } else { '+' };
         return format!("{mantissa}e{exp_sign}{:02}", exp.abs());
     }
@@ -243,6 +346,7 @@ struct Builder {
     anchors: Vec<Option<Node>>,
     root: Option<Node>,
     documents: usize,
+    error: Option<String>,
 }
 
 enum Frame {
@@ -291,15 +395,30 @@ impl MarkedEventReceiver for Builder {
         let line = mark.line();
         match ev {
             Event::DocumentStart => self.documents += 1,
-            Event::Scalar(text, style, anchor, tag) => {
+            Event::Scalar(mut text, style, anchor, tag) => {
                 let plain = matches!(style, TScalarStyle::Plain);
-                let tag = tag.map(|Tag { handle, suffix }| {
+                let mut tag = tag.map(|Tag { handle, suffix }| {
                     if handle == "!!" || handle == "tag:yaml.org,2002:" {
                         format!("tag:yaml.org,2002:{suffix}")
                     } else {
                         format!("{handle}{suffix}")
                     }
                 });
+                if tag.as_deref() == Some("tag:yaml.org,2002:binary") {
+                    use base64::Engine;
+                    let compact: String = text.split_whitespace().collect();
+                    match base64::engine::general_purpose::STANDARD.decode(compact) {
+                        Ok(bytes) => {
+                            text = String::from_utf8_lossy(&bytes).into_owned();
+                            tag = Some("tag:yaml.org,2002:str".to_string());
+                        }
+                        Err(_) => {
+                            self.error.get_or_insert_with(|| {
+                                "yaml: !!binary value contains invalid base64 data".to_string()
+                            });
+                        }
+                    }
+                }
                 self.push(
                     Node::Scalar(Scalar {
                         text,
@@ -339,7 +458,12 @@ impl MarkedEventReceiver for Builder {
                     ..
                 }) = self.stack.pop()
                 {
-                    self.push(Node::Map { entries, line }, anchor);
+                    match expand_merge_keys(entries) {
+                        Ok(entries) => self.push(Node::Map { entries, line }, anchor),
+                        Err(e) => {
+                            self.error.get_or_insert(e);
+                        }
+                    }
                 }
             }
             Event::Alias(id) => {
@@ -360,9 +484,45 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
         anchors: Vec::new(),
         root: None,
         documents: 0,
+        error: None,
     };
     Parser::new_from_str(content)
         .load(&mut builder, true)
         .map_err(|e| format!("yaml: line {}: {}", e.marker().line(), e.info()))?;
-    Ok(builder.root)
+    match builder.error {
+        Some(e) => Err(e),
+        None => Ok(builder.root),
+    }
+}
+
+/// yaml.v2 merge keys: a plain `<<` entry is replaced, in place, by the entries of the map it
+/// refers to, or of each map of a sequence with earlier maps taking precedence.
+fn expand_merge_keys(entries: Vec<(Node, Node)>) -> Result<Vec<(Node, Node)>, String> {
+    let is_merge =
+        |k: &Node| matches!(k, Node::Scalar(s) if s.plain && s.tag.is_none() && s.text == "<<");
+    if !entries.iter().any(|(k, _)| is_merge(k)) {
+        return Ok(entries);
+    }
+    let want_map = || "yaml: map merge requires map or sequence of maps as the value".to_string();
+    let mut out = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        if !is_merge(&k) {
+            out.push((k, v));
+            continue;
+        }
+        match v {
+            Node::Map { entries, .. } => out.extend(entries),
+            Node::Seq { items, .. } => {
+                // Later entries win, so the first map of the sequence goes last.
+                for item in items.into_iter().rev() {
+                    match item {
+                        Node::Map { entries, .. } => out.extend(entries),
+                        _ => return Err(want_map()),
+                    }
+                }
+            }
+            _ => return Err(want_map()),
+        }
+    }
+    Ok(out)
 }

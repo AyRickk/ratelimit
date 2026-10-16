@@ -15,6 +15,7 @@ protox = "0.10"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+base64 = "0.22"
 thiserror = "2"
 yaml-rust2 = "0.13"
 ratelimit-proto = { path = "crates/ratelimit-proto" }

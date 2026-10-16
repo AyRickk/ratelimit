@@ -344,7 +344,8 @@ fn request_limit_override_replaces_configured_limit() {
 fn shadow_mode_is_per_descriptor() {
     let config = load(&["shadowmode_config.yaml"]);
 
-    let cases: &[(&[(&str, &str)], u32, bool)] = &[
+    type Case<'a> = (&'a [(&'a str, &'a str)], u32, bool);
+    let cases: &[Case] = &[
         (&[("key1", "value1"), ("subkey1", "something")], 5, false),
         (&[("key1", "value1"), ("subkey1", "subvalue1")], 10, true),
         (&[("key2", "something")], 20, true),
@@ -410,12 +411,15 @@ fn wildcard_values_share_one_limit_named_after_the_pattern() {
     }
 }
 
-fn load_yaml(content: &str) -> RateLimitConfig {
-    let file = ConfigFile {
+fn inline_file(content: &str) -> ConfigFile {
+    ConfigFile {
         name: "inline.yaml".to_string(),
         content: content.to_string(),
-    };
-    config::load(&[file], &LoadOptions::default()).unwrap()
+    }
+}
+
+fn load_yaml(content: &str) -> RateLimitConfig {
+    config::load(&[inline_file(content)], &LoadOptions::default()).unwrap()
 }
 
 fn full_key(config: &RateLimitConfig, domain: &str, entries: &[(&str, &str)]) -> String {
@@ -957,10 +961,7 @@ fn metadata_is_attached_to_the_limit() {
 }
 
 fn load_sanitized(content: &str, sanitize: bool) -> RateLimitConfig {
-    let file = ConfigFile {
-        name: "inline".to_string(),
-        content: content.to_string(),
-    };
+    let file = inline_file(content);
     let options = LoadOptions {
         sanitize_descriptor_metric_dots: sanitize,
         ..Default::default()
@@ -1081,11 +1082,7 @@ descriptors:
 }
 
 fn try_load_yaml(content: &str) -> Result<RateLimitConfig, String> {
-    let file = ConfigFile {
-        name: "inline.yaml".to_string(),
-        content: content.to_string(),
-    };
-    config::load(&[file], &LoadOptions::default()).map_err(|e| e.to_string())
+    config::load(&[inline_file(content)], &LoadOptions::default()).map_err(|e| e.to_string())
 }
 
 #[test]
@@ -1140,5 +1137,142 @@ descriptors:
     assert_eq!(
         try_load_yaml("domain: d\non: 1\n").unwrap_err(),
         "inline.yaml: config error, key is not of type string: true"
+    );
+}
+
+#[test]
+fn quota_mode_and_replaces_are_carried() {
+    let config = load_yaml(
+        "
+domain: d
+descriptors:
+  - key: model
+    quota_mode: true
+    rate_limit:
+      name: specific
+      unit: minute
+      requests_per_unit: 5
+      replaces: [{name: generic}, {name: other}]
+",
+    );
+    let rl = limit(&config, "d", &[("model", "x")]).unwrap();
+    assert!(rl.quota_mode);
+    assert_eq!(rl.replaces, ["generic", "other"]);
+}
+
+#[test]
+fn every_file_is_validated_before_any_is_loaded() {
+    // Upstream parses and key-validates all files first, then loads domains in order.
+    let empty_domain = fixture("empty_domain.yaml");
+    let unknown_key = fixture("misspelled_key.yaml");
+    assert_eq!(
+        config::load(&[empty_domain, unknown_key], &LoadOptions::default())
+            .unwrap_err()
+            .to_string(),
+        "misspelled_key.yaml: config error, unknown key 'ratelimit'"
+    );
+}
+
+#[test]
+fn yaml_merge_keys_are_expanded() {
+    let config = try_load_yaml(
+        "
+domain: d
+descriptors:
+  - &base
+    key: a
+    rate_limit: {unit: second, requests_per_unit: 5}
+  - <<: *base
+    key: b
+  - <<: [{key: ignored, value: first}, {key: c, value: second}]
+    rate_limit: {unit: minute, requests_per_unit: 7}
+",
+    )
+    .unwrap();
+    assert_eq!(
+        limit(&config, "d", &[("b", "x")])
+            .unwrap()
+            .limit
+            .requests_per_unit,
+        5
+    );
+    // In a merged sequence, earlier maps take precedence over later ones.
+    assert_eq!(
+        limit(&config, "d", &[("ignored", "first")])
+            .unwrap()
+            .limit
+            .requests_per_unit,
+        7
+    );
+}
+
+#[test]
+fn only_null_tilde_and_empty_leave_a_rate_limit_unset() {
+    // yaml.v2 allocates the struct pointer for any other null spelling, then zeroes it.
+    for spelling in ["NULL", "Null"] {
+        assert_eq!(
+            try_load_yaml(&format!(
+                "domain: d\ndescriptors:\n  - key: k\n    rate_limit: {spelling}\n"
+            ))
+            .unwrap_err(),
+            "inline.yaml: invalid rate limit unit ''",
+            "{spelling}"
+        );
+    }
+    for spelling in ["null", "~", ""] {
+        let config = try_load_yaml(&format!(
+            "domain: d\ndescriptors:\n  - key: k\n    rate_limit: {spelling}\n"
+        ))
+        .unwrap();
+        assert!(limit(&config, "d", &[("k", "v")]).is_none(), "{spelling}");
+    }
+}
+
+#[test]
+fn duplicate_struct_and_metadata_keys_are_merged_like_yaml_v2() {
+    let config = try_load_yaml(
+        "
+domain: d
+descriptors:
+  - key: k
+    rate_limit: {unit: second, requests_per_unit: 5}
+    rate_limit: {name: foo}
+    metadata: {a: 1}
+    metadata: {b: 2}
+",
+    )
+    .unwrap();
+    let rl = limit(&config, "d", &[("k", "v")]).unwrap();
+    assert_eq!((rl.limit.requests_per_unit, rl.name.as_str()), (5, "foo"));
+    let mut keys: Vec<_> = rl.metadata.unwrap().fields.into_keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["a", "b"]);
+}
+
+#[test]
+fn collection_keys_are_invalid_map_keys() {
+    assert_eq!(
+        try_load_yaml("domain: d\n? [a, 1]\n: b\n").unwrap_err(),
+        "inline.yaml: error loading config file: yaml: invalid map key: []interface {}{\"a\", 1}"
+    );
+}
+
+#[test]
+fn timestamps_binary_and_null_keys_follow_yaml_v2() {
+    assert_eq!(
+        try_load_yaml("domain: d\ndescriptors:\n  - key: k\n    shadow_mode: 2001-12-14\n")
+            .unwrap_err(),
+        "inline.yaml: error loading config file: yaml: unmarshal errors:\n  \
+         line 4: cannot unmarshal !!timestamp `2001-12-14` into bool"
+    );
+
+    let config = try_load_yaml(
+        "domain: !!binary ZA==\ndescriptors:\n  - key: k\n    metadata: {~: x}\n    rate_limit: {unit: second, requests_per_unit: 1}\n",
+    )
+    .unwrap();
+    let rl = limit(&config, "d", &[("k", "v")]).expect("domain decoded from base64");
+    assert_eq!(
+        rl.metadata.unwrap().fields.into_keys().collect::<Vec<_>>(),
+        [""]
     );
 }

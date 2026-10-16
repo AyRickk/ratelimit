@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 prost-types.workspace = true
 ratelimit-proto.workspace = true
 thiserror.workspace = true
