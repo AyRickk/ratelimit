@@ -2,6 +2,7 @@
 
 use ratelimit::config::{self, ConfigFile, LoadOptions, RateLimit};
 use ratelimit::grpc;
+use ratelimit::limiter::SystemClock;
 use ratelimit::service::{CacheError, RateLimitCache, RateLimitService, ServiceSettings};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
@@ -41,6 +42,7 @@ impl RateLimitCache for OverWhenLimited {
 async fn client() -> RateLimitServiceClient<tonic::transport::Channel> {
     let service = Arc::new(RateLimitService::new(
         OverWhenLimited,
+        Arc::new(SystemClock),
         ServiceSettings::default(),
     ));
     let file = ConfigFile {

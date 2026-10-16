@@ -13,7 +13,7 @@ use ratelimit::config::{self, ConfigFile, LoadOptions};
 use ratelimit::grpc;
 use ratelimit::limiter::Clock;
 use ratelimit::redis::{RedisCache, RedisCacheSettings};
-use ratelimit::service::{RateLimitService, ServiceSettings};
+use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
@@ -285,8 +285,53 @@ struct Oracle {
     control: String,
 }
 
+/// The environment that configures the oracle's service like `settings`. Upstream reads it on
+/// every config load. Nothing else is inherited, so a variable set on the developer's machine
+/// cannot change the oracle's answers.
+fn oracle_environment(settings: &ServiceSettings) -> Vec<(&'static str, String)> {
+    let mut environment = vec![
+        ("SHADOW_MODE", settings.global_shadow_mode.to_string()),
+        ("QUOTA_MODE", settings.global_quota_mode.to_string()),
+        (
+            "RESPONSE_DYNAMIC_METADATA",
+            settings.response_dynamic_metadata.to_string(),
+        ),
+        (
+            "LIMIT_PER_UNIT_HEADERS_ENABLED",
+            settings.per_unit_headers.to_string(),
+        ),
+        (
+            "LIMIT_RESPONSE_HEADERS_ENABLED",
+            settings.response_headers.is_some().to_string(),
+        ),
+        (
+            "LIMIT_REQUEST_HEADERS_ENABLED",
+            settings.request_headers.is_some().to_string(),
+        ),
+    ];
+    if let Some(names) = &settings.response_headers {
+        environment.extend([
+            ("LIMIT_LIMIT_HEADER", names.limit.clone()),
+            ("LIMIT_REMAINING_HEADER", names.remaining.clone()),
+            ("LIMIT_RESET_HEADER", names.reset.clone()),
+        ]);
+    }
+    if let Some(names) = &settings.request_headers {
+        environment.extend([
+            ("LIMIT_REQUEST_LIMIT_HEADER", names.limit.clone()),
+            ("LIMIT_REQUEST_REMAINING_HEADER", names.remaining.clone()),
+            ("LIMIT_REQUEST_RESET_HEADER", names.reset.clone()),
+        ]);
+    }
+    environment
+}
+
 impl Oracle {
-    async fn start(redis: &Redis, settings: &RedisCacheSettings) -> Self {
+    async fn start(
+        redis: &Redis,
+        settings: &RedisCacheSettings,
+        service_settings: &ServiceSettings,
+    ) -> Self {
         let local_cache_size = settings.local_cache_size_in_bytes.to_string();
         let stop_increment = format!(
             "-stop-cache-key-increment={}",
@@ -296,6 +341,8 @@ impl Oracle {
             .args(["-redis", &redis.address])
             .args(["-cache-key-prefix", &settings.cache_key_prefix])
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
+            .env_clear()
+            .envs(oracle_environment(service_settings))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -348,10 +395,18 @@ struct Subject {
 }
 
 impl Subject {
-    async fn start(redis: &Redis, settings: &RedisCacheSettings) -> Self {
+    async fn start(
+        redis: &Redis,
+        settings: &RedisCacheSettings,
+        service_settings: &ServiceSettings,
+    ) -> Self {
         let clock = Arc::new(ManualClock::default());
         let cache = RedisCache::new(redis.connect().await, clock.clone(), settings.clone());
-        let service = Arc::new(RateLimitService::new(cache, ServiceSettings::default()));
+        let service = Arc::new(RateLimitService::new(
+            cache,
+            clock.clone(),
+            service_settings.clone(),
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(
@@ -390,13 +445,25 @@ impl Harness {
         Self::with_settings(config, settings).await
     }
 
-    /// Both sides configured alike: `settings` for this implementation, the matching flags for
-    /// the oracle.
     async fn with_settings(config: &str, settings: RedisCacheSettings) -> Self {
+        Self::configured(config, settings, ServiceSettings::default()).await
+    }
+
+    async fn with_service_settings(config: &str, service_settings: ServiceSettings) -> Self {
+        Self::configured(config, RedisCacheSettings::default(), service_settings).await
+    }
+
+    /// Both sides configured alike: the settings for this implementation, the matching flags
+    /// and environment for the oracle.
+    async fn configured(
+        config: &str,
+        settings: RedisCacheSettings,
+        service_settings: ServiceSettings,
+    ) -> Self {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
-        let oracle = Oracle::start(&oracle_redis, &settings).await;
-        let subject = Subject::start(&subject_redis, &settings).await;
+        let oracle = Oracle::start(&oracle_redis, &settings, &service_settings).await;
+        let subject = Subject::start(&subject_redis, &settings, &service_settings).await;
         oracle.put("/config", config.to_string()).await;
         let file = ConfigFile {
             name: "config.yaml".into(),
@@ -426,7 +493,10 @@ impl Harness {
             r.map(tonic::Response::into_inner)
                 .map_err(|s| format!("{:?}: {}", s.code(), s.message()))
         };
-        let (expected, actual) = (simplify(expected), simplify(actual));
+        let (mut expected, actual) = (simplify(expected), simplify(actual));
+        if let Ok(response) = &mut expected {
+            single_space_limit_text(response);
+        }
         assert_eq!(actual, expected, "response to {request:?}");
         actual
     }
@@ -470,6 +540,33 @@ impl Harness {
                 .set(key, value, None, None, false)
                 .await
                 .unwrap();
+        }
+    }
+}
+
+/// Go's text format puts one or two spaces between fields, depending on the binary
+/// (protobuf-go's `detrand`); ours always puts one. Applied to the oracle's
+/// `descriptors[].limit` metadata.
+fn single_space_limit_text(response: &mut RateLimitResponse) {
+    use prost_types::value::Kind;
+    let Some(metadata) = &mut response.dynamic_metadata else {
+        return;
+    };
+    let Some(Kind::ListValue(descriptors)) = metadata
+        .fields
+        .get_mut("descriptors")
+        .and_then(|v| v.kind.as_mut())
+    else {
+        return;
+    };
+    for descriptor in &mut descriptors.values {
+        if let Some(Kind::StructValue(descriptor)) = &mut descriptor.kind
+            && let Some(Kind::StringValue(limit)) = descriptor
+                .fields
+                .get_mut("limit")
+                .and_then(|v| v.kind.as_mut())
+        {
+            *limit = limit.split_whitespace().collect::<Vec<_>>().join(" ");
         }
     }
 }
@@ -1006,5 +1103,337 @@ descriptors:
     for chunk in values.chunks(BATCH) {
         h.call(batch(chunk)).await.unwrap();
     }
+    h.assert_same_redis().await;
+}
+
+/// Response headers name the descriptor closest to its limit: fewest remaining, the first on a
+/// tie, unless a regular descriptor is over its limit; the reset re-reads the clock.
+#[tokio::test]
+async fn response_headers_describe_the_closest_descriptor_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        response_headers: Some(LimitHeaders {
+            limit: "X-Limit".into(),
+            remaining: "X-Remaining".into(),
+            reset: "X-Reset".into(),
+        }),
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(
+        "
+domain: d
+descriptors:
+  - key: second
+    rate_limit: {unit: second, requests_per_unit: 3}
+  - key: minute
+    rate_limit: {unit: minute, requests_per_unit: 5}
+  - key: hour
+    rate_limit: {unit: hour, requests_per_unit: 2}
+  - key: minute3
+    rate_limit: {unit: minute, requests_per_unit: 3}
+  - key: free
+    rate_limit: {unlimited: true}
+",
+        settings,
+    )
+    .await;
+    h.at(1_700_000_017).await;
+    let all = [
+        &[("free", "x")][..],
+        &[("none", "x")],
+        &[("minute", "x")],
+        &[("second", "x")],
+        &[("hour", "x")],
+    ];
+    for _ in 0..4 {
+        let response = h.call(request("d", &all)).await.unwrap();
+        assert_eq!(response.response_headers_to_add.len(), 3);
+    }
+    h.at(1_700_000_018).await;
+    // A tie: same limit and remaining hits, different resets.
+    h.call(request("d", &[&[("minute3", "x")], &[("second", "x")]]))
+        .await
+        .unwrap();
+    h.call(request("d", &[&[("free", "x")], &[("none", "x")]]))
+        .await
+        .unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Request headers describe the same descriptor as the response headers, under their own
+/// names, and are independent of them.
+#[tokio::test]
+async fn request_headers_describe_the_closest_descriptor_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        request_headers: Some(LimitHeaders {
+            limit: "X-Request-Limit".into(),
+            remaining: "X-Request-Remaining".into(),
+            reset: "X-Request-Reset".into(),
+        }),
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(
+        "
+domain: d
+descriptors:
+  - key: second
+    rate_limit: {unit: second, requests_per_unit: 1}
+  - key: minute
+    rate_limit: {unit: minute, requests_per_unit: 3}
+",
+        settings,
+    )
+    .await;
+    h.at(1_700_000_017).await;
+    for _ in 0..3 {
+        let response = h
+            .call(request("d", &[&[("minute", "x")], &[("second", "x")]]))
+            .await
+            .unwrap();
+        assert_eq!(response.request_headers_to_add.len(), 3);
+    }
+    h.call(request("d", &[&[("none", "x")]])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Per-unit headers: one pair per unit, in the order units first appear, for the descriptor
+/// of that unit with the fewest remaining hits (the first on a tie), before the response
+/// headers.
+#[tokio::test]
+async fn per_unit_headers_describe_each_unit_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        per_unit_headers: true,
+        response_headers: Some(LimitHeaders::default()),
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(
+        "
+domain: d
+descriptors:
+  - key: minute5
+    rate_limit: {unit: minute, requests_per_unit: 5}
+  - key: second
+    rate_limit: {unit: second, requests_per_unit: 1}
+  - key: minute4
+    rate_limit: {unit: minute, requests_per_unit: 4}
+  - key: day
+    rate_limit: {unit: day, requests_per_unit: 9}
+  - key: free
+    rate_limit: {unlimited: true}
+",
+        settings,
+    )
+    .await;
+    h.at(1_700_000_017).await;
+    h.call(request("d", &[&[("minute5", "x")]])).await.unwrap();
+    // minute5 and minute4 tie at 3 remaining.
+    let all = [
+        &[("free", "x")][..],
+        &[("minute5", "x")],
+        &[("second", "x")],
+        &[("none", "x")],
+        &[("minute4", "x")],
+        &[("day", "x")],
+    ];
+    for _ in 0..3 {
+        let response = h.call(request("d", &all)).await.unwrap();
+        assert_eq!(response.response_headers_to_add.len(), 3 * 2 + 3);
+    }
+    h.assert_same_redis().await;
+}
+
+/// Dynamic metadata describes the request: its domain, each descriptor's entries and hits,
+/// and the request's hits when not 0; set under global shadow mode too.
+#[tokio::test]
+async fn dynamic_metadata_describes_the_request_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        global_shadow_mode: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    let both = || {
+        request(
+            "llm",
+            &[
+                &[("user", "alice"), ("model", "m=1")],
+                &[("shadow", "x")],
+                &[],
+            ],
+        )
+    };
+    for hits in [
+        with_hits(both(), 0, &[None, None, None]),
+        with_hits(both(), 7, &[Some(0), None, Some(3)]),
+        with_hits(both(), 0, &[Some(1 << 60), Some(2), None]),
+    ] {
+        let response = h.call(hits).await.unwrap();
+        assert!(response.dynamic_metadata.is_some());
+    }
+    h.assert_same_redis().await;
+}
+
+/// A client-sent limit appears in the metadata in protobuf's text format.
+#[tokio::test]
+async fn dynamic_metadata_shows_client_limits_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    let mut overridden = request("llm", &[&[("user", "alice")], &[("free", "x")]]);
+    overridden.descriptors[0].limit = Some(RateLimitOverride {
+        requests_per_unit: 10,
+        unit: 2, // MINUTE
+        unit_multiplier: None,
+    });
+    overridden.descriptors[1].limit = Some(RateLimitOverride {
+        requests_per_unit: 0,
+        unit: 4, // DAY
+        unit_multiplier: None,
+    });
+    let response = h.call(overridden).await.unwrap();
+    assert!(response.dynamic_metadata.is_some());
+    h.assert_same_redis().await;
+}
+
+const WITH_METADATA: &str = "
+domain: d
+descriptors:
+  - key: a
+    rate_limit: {unit: minute, requests_per_unit: 10}
+    metadata: {route: a, shared: {x: 1, list: [1, two]}, weight: 1.5}
+  - key: b
+    rate_limit: {unit: minute, requests_per_unit: 10}
+    metadata: {route: b, shared: {y: two, x: 9}, b: {nested: {deep: 1}}}
+  - key: over
+    rate_limit: {unit: minute, requests_per_unit: 0}
+    metadata: {over: o}
+  - key: free
+    rate_limit: {unlimited: true}
+    metadata: {free: f}
+  - key: replaced
+    rate_limit: {unit: minute, requests_per_unit: 10, name: old}
+    metadata: {replaced: r}
+  - key: replacer
+    rate_limit: {unit: minute, requests_per_unit: 10, replaces: [{name: old}]}
+    metadata: {replacer: r}
+";
+
+/// The metadata of the limits that passed is merged into the response's: the first value wins,
+/// structs merge recursively. Over-limit, unlimited and replaced limits add nothing, nor does a
+/// limit replaced by a client-sent one.
+#[tokio::test]
+async fn dynamic_metadata_merges_the_metadata_of_passed_limits_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(WITH_METADATA, settings).await;
+    h.at(1_700_000_000).await;
+    let all = [
+        &[("over", "x")][..],
+        &[("a", "x")],
+        &[("free", "x")],
+        &[("b", "x")],
+        &[("replaced", "x")],
+        &[("replacer", "x")],
+        &[("none", "x")],
+    ];
+    for _ in 0..2 {
+        let response = h.call(request("d", &all)).await.unwrap();
+        assert!(
+            response
+                .dynamic_metadata
+                .unwrap()
+                .fields
+                .contains_key("metadata")
+        );
+    }
+    h.call(request("d", &[&[("b", "x")], &[("a", "x")]]))
+        .await
+        .unwrap();
+    let mut overridden = request("d", &[&[("replacer", "x")]]);
+    overridden.descriptors[0].limit = Some(
+        ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride {
+            requests_per_unit: 5,
+            unit: 2, // MINUTE
+            unit_multiplier: None,
+        },
+    );
+    h.call(overridden).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+const MODELS: &str = "
+domain: ai
+descriptors:
+  - key: backend_name
+    value: gpt
+    descriptors:
+      - key: model_name_override
+        quota_mode: true
+        rate_limit: {unit: minute, requests_per_unit: 1}
+        metadata: {gpt: g}
+  - key: backend_name
+    value: claude
+    descriptors:
+      - key: model_name_override
+        quota_mode: true
+        rate_limit: {unit: minute, requests_per_unit: 5}
+        metadata: {claude: c}
+";
+
+/// In quota mode the metadata lists the models that still have quota (`passedBackends`), once
+/// each; a model whose group is exhausted is left out, along with its limits' metadata, even
+/// for its descriptors that passed. Passed regular descriptors naming a model are listed too.
+#[tokio::test]
+async fn dynamic_metadata_lists_the_models_with_quota_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_service_settings(MODELS, settings).await;
+    h.at(1_700_000_000).await;
+    let gpt = &[("backend_name", "gpt"), ("model_name_override", "m1")][..];
+    let claude = &[("backend_name", "claude"), ("model_name_override", "m2")][..];
+    let regular = &[("model_name_override", "m3")][..];
+    let anonymous = &[("tenant", "t")][..];
+    h.call(request("ai", &[claude, regular, anonymous]))
+        .await
+        .unwrap();
+    // gpt's first descriptor passes, its second exhausts it.
+    h.call(request("ai", &[gpt, claude, claude, gpt, regular]))
+        .await
+        .unwrap();
+    // Every model exhausted: nothing to list.
+    h.call(request("ai", &[gpt])).await.unwrap();
+    // Without a quota descriptor there is no list, even for regular ones naming a model.
+    h.call(request("ai", &[regular, &[("backend_name", "other")]]))
+        .await
+        .unwrap();
     h.assert_same_redis().await;
 }

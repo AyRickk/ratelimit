@@ -28,7 +28,12 @@ impl Clock for SystemClock {
 
 /// The length of a fixed window, in seconds (a month is 30 days, a year 365).
 pub(crate) fn window_seconds(limit: &RateLimit) -> Result<i64, CacheError> {
-    Ok(match limit.limit.unit() {
+    unit_seconds(limit.limit.unit())
+}
+
+/// The length of one `unit`, in seconds (a month is 30 days, a year 365).
+pub(crate) fn unit_seconds(unit: Unit) -> Result<i64, CacheError> {
+    Ok(match unit {
         Unit::Second => 1,
         Unit::Minute => 60,
         Unit::Hour => 60 * 60,

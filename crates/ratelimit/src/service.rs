@@ -2,12 +2,17 @@
 //! `src/service/ratelimit.go`.
 
 use crate::config::{LimitLookup, RateLimit, RateLimitConfig};
-use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
+use crate::limiter::{Clock, unit_seconds};
+use prost_types::{ListValue, Struct, Value, value::Kind};
+use ratelimit_proto::envoy::config::core::v3::HeaderValue;
+use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
+    RateLimitDescriptor, rate_limit_descriptor::RateLimitOverride,
+};
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_response::{Code, DescriptorStatus, rate_limit::Unit},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
@@ -44,6 +49,35 @@ pub struct ServiceSettings {
     pub global_shadow_mode: bool,
     /// `QUOTA_MODE`: treat every descriptor as a quota descriptor.
     pub global_quota_mode: bool,
+    /// `LIMIT_RESPONSE_HEADERS_ENABLED` and the `LIMIT_*_HEADER` names: describe the
+    /// descriptor closest to its limit in headers added to the response.
+    pub response_headers: Option<LimitHeaders>,
+    /// `LIMIT_REQUEST_HEADERS_ENABLED` and the `LIMIT_REQUEST_*_HEADER` names: the same,
+    /// added to the request.
+    pub request_headers: Option<LimitHeaders>,
+    /// `LIMIT_PER_UNIT_HEADERS_ENABLED`: `RateLimit-Limit-<Unit>s` and
+    /// `RateLimit-Remaining-<Unit>s` response headers, one pair per unit.
+    pub per_unit_headers: bool,
+    /// `RESPONSE_DYNAMIC_METADATA`: describe the request in the response's dynamic metadata.
+    pub response_dynamic_metadata: bool,
+}
+
+/// The names of the three headers describing the descriptor closest to its limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitHeaders {
+    pub limit: String,
+    pub remaining: String,
+    pub reset: String,
+}
+
+impl Default for LimitHeaders {
+    fn default() -> Self {
+        Self {
+            limit: "RateLimit-Limit".into(),
+            remaining: "RateLimit-Remaining".into(),
+            reset: "RateLimit-Reset".into(),
+        }
+    }
 }
 
 /// Why a request could not be answered. Messages are upstream's.
@@ -69,14 +103,17 @@ fn require(condition: bool, message: &str) -> Result<(), ServiceError> {
 
 pub struct RateLimitService<C> {
     cache: C,
+    /// Re-read for the reset headers, as upstream does.
+    clock: Arc<dyn Clock>,
     config: RwLock<Option<Arc<RateLimitConfig>>>,
     settings: ServiceSettings,
 }
 
 impl<C: RateLimitCache> RateLimitService<C> {
-    pub fn new(cache: C, settings: ServiceSettings) -> Self {
+    pub fn new(cache: C, clock: Arc<dyn Clock>, settings: ServiceSettings) -> Self {
         Self {
             cache,
+            clock,
             config: RwLock::new(None),
             settings,
         }
@@ -134,9 +171,22 @@ impl<C: RateLimitCache> RateLimitService<C> {
         // only when every group is (so another model can take over).
         let mut regular_over = false;
         let mut quota_groups: HashMap<String, bool> = HashMap::new();
+        // The descriptor closest to its limit, for the headers: chosen among the backend's
+        // statuses (unlimited ones have no limit), the first on a tie, but the last regular
+        // descriptor over its limit wins outright.
+        let mut closest: Option<DescriptorStatus> = None;
+        // The descriptors that passed (unlimited ones excepted), for the metadata.
+        let mut passed: Vec<Passed> = Vec::new();
         for ((status, check), descriptor) in
             statuses.iter_mut().zip(&checks).zip(&request.descriptors)
         {
+            if status.current_limit.is_some()
+                && closest
+                    .as_ref()
+                    .is_none_or(|c| status.limit_remaining < c.limit_remaining)
+            {
+                closest = Some(status.clone());
+            }
             let limit = match check {
                 Check::Unlimited => {
                     *status = DescriptorStatus {
@@ -151,10 +201,19 @@ impl<C: RateLimitCache> RateLimitService<C> {
             let over = status.code() == Code::OverLimit;
             let quota_mode =
                 self.settings.global_quota_mode || limit.as_ref().is_some_and(|l| l.quota_mode);
-            if quota_mode {
-                *quota_groups.entry(quota_group_key(descriptor)).or_default() |= over;
-            } else if over {
+            let quota_group = quota_mode.then(|| quota_group_key(descriptor));
+            if let Some(group) = &quota_group {
+                *quota_groups.entry(group.clone()).or_default() |= over;
+            }
+            if !over {
+                passed.push(Passed {
+                    descriptor,
+                    limit: limit.as_ref(),
+                    quota_group,
+                });
+            } else if !quota_mode {
                 regular_over = true;
+                closest = Some(status.clone());
             }
         }
         let quota_over = !quota_groups.is_empty() && quota_groups.values().all(|over| *over);
@@ -163,14 +222,247 @@ impl<C: RateLimitCache> RateLimitService<C> {
         } else {
             Code::Ok
         };
+        let mut response_headers_to_add = Vec::new();
+        if self.settings.per_unit_headers {
+            response_headers_to_add = per_unit_headers(&statuses);
+        }
+        if let (Some(names), Some(closest)) = (&self.settings.response_headers, &closest) {
+            response_headers_to_add.extend(self.limit_headers(names, closest)?);
+        }
+        let mut request_headers_to_add = Vec::new();
+        if let (Some(names), Some(closest)) = (&self.settings.request_headers, &closest) {
+            request_headers_to_add = self.limit_headers(names, closest)?;
+        }
         if overall_code == Code::OverLimit && self.settings.global_shadow_mode {
             overall_code = Code::Ok;
         }
+        let dynamic_metadata = self.settings.response_dynamic_metadata.then(|| {
+            // A descriptor that passed is not available when its quota group is exhausted.
+            passed.retain(|p| {
+                p.quota_group
+                    .as_ref()
+                    .is_none_or(|group| !quota_groups[group])
+            });
+            dynamic_metadata(request, &passed, !quota_groups.is_empty())
+        });
         Ok(RateLimitResponse {
             overall_code: overall_code as i32,
             statuses,
+            response_headers_to_add,
+            request_headers_to_add,
+            dynamic_metadata,
             ..Default::default()
         })
+    }
+
+    /// The limit, remaining hits and seconds until reset of `status`, under `names`. The reset
+    /// re-reads the clock rather than using the status's `duration_until_reset`, as upstream.
+    fn limit_headers(
+        &self,
+        names: &LimitHeaders,
+        status: &DescriptorStatus,
+    ) -> Result<Vec<HeaderValue>, ServiceError> {
+        let limit = status
+            .current_limit
+            .as_ref()
+            .expect("a status with a limit");
+        let window = unit_seconds(limit.unit())?;
+        let reset = window - self.clock.unix_now() % window;
+        Ok(vec![
+            header(&names.limit, limit.requests_per_unit),
+            header(&names.remaining, status.limit_remaining),
+            header(&names.reset, reset),
+        ])
+    }
+}
+
+/// `RateLimit-Limit-<Unit>s` and `RateLimit-Remaining-<Unit>s` for each unit, in the order
+/// units first appear, describing the descriptor of that unit with the fewest remaining hits
+/// (the first on a tie). Descriptors without a limit (unlimited ones included) are skipped.
+fn per_unit_headers(statuses: &[DescriptorStatus]) -> Vec<HeaderValue> {
+    let mut closest_by_unit: Vec<(Unit, &DescriptorStatus)> = Vec::new();
+    for status in statuses {
+        let Some(limit) = &status.current_limit else {
+            continue;
+        };
+        match closest_by_unit
+            .iter_mut()
+            .find(|(unit, _)| *unit == limit.unit())
+        {
+            None => closest_by_unit.push((limit.unit(), status)),
+            Some((_, closest)) if status.limit_remaining < closest.limit_remaining => {
+                *closest = status;
+            }
+            Some(_) => {}
+        }
+    }
+    closest_by_unit
+        .into_iter()
+        .flat_map(|(unit, status)| {
+            let name = unit.as_str_name();
+            let suffix = format!("{}{}s", &name[..1], name[1..].to_lowercase());
+            let limit = status.current_limit.as_ref().unwrap().requests_per_unit;
+            [
+                header(&format!("RateLimit-Limit-{suffix}"), limit),
+                header(
+                    &format!("RateLimit-Remaining-{suffix}"),
+                    status.limit_remaining,
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// A descriptor that passed.
+struct Passed<'a> {
+    descriptor: &'a RateLimitDescriptor,
+    limit: Option<&'a RateLimit>,
+    /// Its quota group, in quota mode.
+    quota_group: Option<String>,
+}
+
+/// `ratelimitToMetadata`: the request's `domain`, its `descriptors`, its `hitsAddend` when not
+/// 0, the `metadata` of the `available` limits merged and, in `quota_mode`, the models
+/// (`passedBackends`) of the `available` descriptors.
+fn dynamic_metadata(request: &RateLimitRequest, available: &[Passed], quota_mode: bool) -> Struct {
+    let mut fields = BTreeMap::new();
+    fields.insert("domain".into(), string(&request.domain));
+    let descriptors = request
+        .descriptors
+        .iter()
+        .map(descriptor_metadata)
+        .collect();
+    fields.insert("descriptors".into(), list(descriptors));
+    if request.hits_addend != 0 {
+        fields.insert("hitsAddend".into(), number(request.hits_addend as f64));
+    }
+    let mut metadata = Struct::default();
+    for limit_metadata in available.iter().filter_map(|p| p.limit?.metadata.as_ref()) {
+        merge_metadata(&mut metadata, limit_metadata);
+    }
+    if !metadata.fields.is_empty() {
+        fields.insert("metadata".into(), struct_value(metadata));
+    }
+    if quota_mode {
+        let backends = passed_backends(available);
+        if !backends.is_empty() {
+            fields.insert("passedBackends".into(), list(backends));
+        }
+    }
+    Struct { fields }
+}
+
+/// `passedBackendsList`: the `backend_name` and `model_name_override` of each descriptor naming
+/// a model, once per quota group, whether the descriptor is a quota one or not.
+fn passed_backends(available: &[Passed]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut backends = Vec::new();
+    for passed in available {
+        let (backend, model) = model(passed.descriptor);
+        if (backend.is_empty() && model.is_empty())
+            || !seen.insert(quota_group_key(passed.descriptor))
+        {
+            continue;
+        }
+        let fields = BTreeMap::from([
+            ("backend_name".to_string(), string(backend)),
+            ("model_name_override".to_string(), string(model)),
+        ]);
+        backends.push(struct_value(Struct { fields }));
+    }
+    backends
+}
+
+/// `mergeMetadata`: adds the fields of `source` missing from `destination`, merging structs
+/// present in both. Upstream merges into the configuration's own structs, which then keep the
+/// merged fields for later requests; this merges into copies (docs/parity.md section 7).
+fn merge_metadata(destination: &mut Struct, source: &Struct) {
+    for (key, value) in &source.fields {
+        match destination.fields.get_mut(key) {
+            None => {
+                destination.fields.insert(key.clone(), value.clone());
+            }
+            Some(Value {
+                kind: Some(Kind::StructValue(existing)),
+            }) => {
+                if let Some(Kind::StructValue(source)) = &value.kind {
+                    merge_metadata(existing, source);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// `descriptorToStruct`: the `entries` as `key=value`, and the `hitsAddend` when set, even to 0.
+fn descriptor_metadata(descriptor: &RateLimitDescriptor) -> Value {
+    let mut fields = BTreeMap::new();
+    let entries = descriptor
+        .entries
+        .iter()
+        .map(|entry| string(&format!("{}={}", entry.key, entry.value)))
+        .collect();
+    fields.insert("entries".into(), list(entries));
+    if let Some(limit) = &descriptor.limit {
+        fields.insert("limit".into(), string(&limit_text(limit)));
+    }
+    if let Some(hits) = descriptor.hits_addend {
+        fields.insert("hitsAddend".into(), number(hits as f64));
+    }
+    struct_value(Struct { fields })
+}
+
+fn struct_value(value: Struct) -> Value {
+    Value {
+        kind: Some(Kind::StructValue(value)),
+    }
+}
+
+/// A client-sent limit in protobuf's text format, as Go's `String()` writes it but always with
+/// one space between fields (Go's is randomised): `requests_per_unit:10 unit:MINUTE`, zero
+/// fields left out.
+fn limit_text(limit: &RateLimitOverride) -> String {
+    let mut fields = Vec::new();
+    if limit.requests_per_unit != 0 {
+        fields.push(format!("requests_per_unit:{}", limit.requests_per_unit));
+    }
+    if limit.unit != 0 {
+        let unit = Unit::try_from(limit.unit)
+            .map_or_else(|_| limit.unit.to_string(), |u| u.as_str_name().to_string());
+        fields.push(format!("unit:{unit}"));
+    }
+    if let Some(multiplier) = limit.unit_multiplier {
+        fields.push(match multiplier {
+            0 => "unit_multiplier:{}".to_string(),
+            value => format!("unit_multiplier:{{value:{value}}}"),
+        });
+    }
+    fields.join(" ")
+}
+
+fn string(value: &str) -> Value {
+    Value {
+        kind: Some(Kind::StringValue(value.to_string())),
+    }
+}
+
+fn number(value: f64) -> Value {
+    Value {
+        kind: Some(Kind::NumberValue(value)),
+    }
+}
+
+fn list(values: Vec<Value>) -> Value {
+    Value {
+        kind: Some(Kind::ListValue(ListValue { values })),
+    }
+}
+
+fn header(key: &str, value: impl ToString) -> HeaderValue {
+    HeaderValue {
+        key: key.to_string(),
+        value: value.to_string(),
+        ..Default::default()
     }
 }
 
@@ -219,20 +511,28 @@ fn descriptor_checks(config: &RateLimitConfig, request: &RateLimitRequest) -> Ve
 /// The quota group of a descriptor: its model, from the `backend_name` and
 /// `model_name_override` entries, or else all of its entries.
 fn quota_group_key(descriptor: &RateLimitDescriptor) -> String {
+    let (backend, model) = model(descriptor);
+    if backend.is_empty() && model.is_empty() {
+        descriptor
+            .entries
+            .iter()
+            .map(|entry| format!("{}={};", entry.key, entry.value))
+            .collect()
+    } else {
+        format!("{backend}|{model}")
+    }
+}
+
+/// The model a descriptor names: its last `backend_name` and `model_name_override` entries.
+fn model(descriptor: &RateLimitDescriptor) -> (&str, &str) {
     let mut backend = "";
     let mut model = "";
-    let mut all = String::new();
     for entry in &descriptor.entries {
         match entry.key.as_str() {
             "backend_name" => backend = &entry.value,
             "model_name_override" => model = &entry.value,
             _ => {}
         }
-        all += &format!("{}={};", entry.key, entry.value);
     }
-    if backend.is_empty() && model.is_empty() {
-        all
-    } else {
-        format!("{backend}|{model}")
-    }
+    (backend, model)
 }
