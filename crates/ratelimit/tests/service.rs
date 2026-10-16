@@ -2,15 +2,17 @@
 //! `test/service/ratelimit_test.go`. The counting backend is a fake standing in for Redis.
 
 use ratelimit::config::{self, ConfigFile, LoadOptions, RateLimit};
+use ratelimit::limiter::SystemClock;
 use ratelimit::service::{
     CacheError, RateLimitCache, RateLimitService, ServiceError, ServiceSettings,
 };
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
-    RateLimitDescriptor, rate_limit_descriptor::Entry,
+    RateLimitDescriptor,
+    rate_limit_descriptor::{Entry, RateLimitOverride},
 };
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
-    rate_limit_response::{Code, DescriptorStatus},
+    rate_limit_response::{Code, DescriptorStatus, rate_limit::Unit},
 };
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +49,11 @@ impl RateLimitCache for FakeCache {
         }
         Ok(self.statuses.lock().unwrap().clone())
     }
+}
+
+/// The service over `cache`, on the system clock.
+fn service<C: RateLimitCache>(cache: C, settings: ServiceSettings) -> RateLimitService<C> {
+    RateLimitService::new(cache, Arc::new(SystemClock), settings)
 }
 
 fn load(yaml: &str) -> config::RateLimitConfig {
@@ -95,7 +102,7 @@ descriptors:
 #[tokio::test]
 async fn unmatched_descriptor_is_passed_to_the_cache_without_a_limit() {
     let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
-    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let response = service
@@ -120,7 +127,7 @@ async fn any_descriptor_over_limit_makes_the_request_over_limit() {
         status(Code::OverLimit, 0),
         status(Code::Ok, 0),
     ]));
-    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let response = service
@@ -151,7 +158,7 @@ async fn any_descriptor_over_limit_makes_the_request_over_limit() {
 
 #[tokio::test]
 async fn invalid_requests_and_missing_config_are_service_errors() {
-    let service = RateLimitService::new(Arc::new(FakeCache::default()), ServiceSettings::default());
+    let service = service(Arc::new(FakeCache::default()), ServiceSettings::default());
 
     let error = service
         .should_rate_limit(&request("test-domain", &[&[("hello", "world")]]))
@@ -184,7 +191,7 @@ async fn cache_errors_are_reported_as_is() {
         error: Some("cache error".into()),
         ..Default::default()
     };
-    let service = RateLimitService::new(Arc::new(cache), ServiceSettings::default());
+    let service = service(Arc::new(cache), ServiceSettings::default());
     service.set_config(load(CONFIG));
 
     let error = service
@@ -202,7 +209,7 @@ async fn unlimited_descriptors_skip_the_cache_and_report_max_remaining() {
         status(Code::Ok, 0),
         status(Code::Ok, 0),
     ]));
-    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(
         "
 domain: some-domain
@@ -260,7 +267,7 @@ async fn checked(descriptors: &[&[(&str, &str)]]) -> Vec<Option<u32>> {
         status(Code::Ok, 0);
         descriptors.len()
     ]));
-    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(REPLACES));
     service
         .should_rate_limit(&request("d", descriptors))
@@ -298,7 +305,7 @@ async fn overall(
 ) -> Code {
     let descriptors: Vec<_> = cases.iter().map(|(d, _)| *d).collect();
     let statuses = cases.iter().map(|(_, code)| status(*code, 0)).collect();
-    let service = RateLimitService::new(Arc::new(FakeCache::returning(statuses)), settings);
+    let service = service(Arc::new(FakeCache::returning(statuses)), settings);
     service.set_config(load(config));
     service
         .should_rate_limit(&request("d", &descriptors))
@@ -434,7 +441,7 @@ async fn global_quota_mode_puts_every_descriptor_in_a_quota_group() {
 async fn a_cache_answer_of_the_wrong_length_is_an_error() {
     // Upstream asserts and crashes the process; per D1 this becomes a clean error.
     for statuses in [vec![status(Code::Ok, 0)], vec![status(Code::Ok, 0); 3]] {
-        let service = RateLimitService::new(
+        let service = service(
             Arc::new(FakeCache::returning(statuses)),
             ServiceSettings::default(),
         );
@@ -456,7 +463,7 @@ async fn a_cache_answer_of_the_wrong_length_is_an_error() {
 async fn a_limit_with_an_unknown_unit_is_an_invalid_argument() {
     // Upstream panics and the process dies (D1: becomes INVALID_ARGUMENT, see docs/parity.md).
     let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
-    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    let service = service(cache.clone(), ServiceSettings::default());
     service.set_config(load(CONFIG));
     let mut request = request("test-domain", &[&[("foo", "bar")]]);
     request.descriptors[0].limit = Some(
@@ -474,4 +481,108 @@ async fn a_limit_with_an_unknown_unit_is_an_invalid_argument() {
         ServiceError::InvalidArgument("invalid rate limit unit UNKNOWN".into())
     );
     assert!(cache.received().is_empty(), "nothing is counted");
+}
+
+/// The `descriptors[].limit` metadata of a request, as a string.
+async fn limit_text(limit: RateLimitOverride) -> String {
+    use prost_types::value::Kind;
+    let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        ..Default::default()
+    };
+    let service = service(cache, settings);
+    service.set_config(load(CONFIG));
+    let mut request = request("test-domain", &[&[("foo", "x")]]);
+    request.descriptors[0].limit = Some(limit);
+    let metadata = service
+        .should_rate_limit(&request)
+        .await
+        .unwrap()
+        .dynamic_metadata
+        .unwrap();
+    let Some(Kind::ListValue(descriptors)) = &metadata.fields["descriptors"].kind else {
+        panic!("descriptors: {metadata:?}");
+    };
+    let Some(Kind::StructValue(descriptor)) = &descriptors.values[0].kind else {
+        panic!("descriptor: {descriptors:?}");
+    };
+    let Some(Kind::StringValue(limit)) = &descriptor.fields["limit"].kind else {
+        panic!("limit: {descriptor:?}");
+    };
+    limit.clone()
+}
+
+/// `unit_multiplier` is an extension upstream does not know (docs/parity.md section 7); it is
+/// written as protobuf's text format writes a wrapper message.
+#[tokio::test]
+async fn client_limit_metadata_shows_the_unit_multiplier() {
+    let limit = |unit_multiplier| RateLimitOverride {
+        requests_per_unit: 10,
+        unit: Unit::Hour as i32,
+        unit_multiplier,
+    };
+    assert_eq!(
+        limit_text(limit(Some(5))).await,
+        "requests_per_unit:10 unit:HOUR unit_multiplier:{value:5}"
+    );
+    assert_eq!(
+        limit_text(limit(Some(0))).await,
+        "requests_per_unit:10 unit:HOUR unit_multiplier:{}"
+    );
+    assert_eq!(
+        limit_text(limit(None)).await,
+        "requests_per_unit:10 unit:HOUR"
+    );
+}
+
+/// Upstream merges into the configuration's own structs, so `a`'s metadata would keep `z` from
+/// the first request; ours does not (docs/parity.md section 7).
+#[tokio::test]
+async fn merging_metadata_leaves_the_configuration_unchanged() {
+    use prost_types::value::Kind;
+    let cache = Arc::new(FakeCache::returning(vec![
+        status(Code::Ok, 0),
+        status(Code::Ok, 0),
+    ]));
+    let settings = ServiceSettings {
+        response_dynamic_metadata: true,
+        ..Default::default()
+    };
+    let service = service(cache.clone(), settings);
+    service.set_config(load(
+        "
+domain: d
+descriptors:
+  - key: a
+    rate_limit: {unit: minute, requests_per_unit: 10}
+    metadata: {shared: {x: 1}}
+  - key: b
+    rate_limit: {unit: minute, requests_per_unit: 10}
+    metadata: {shared: {z: 2}}
+",
+    ));
+    let shared = |response: RateLimitResponse| {
+        let metadata = response.dynamic_metadata.unwrap();
+        let Some(Kind::StructValue(merged)) = &metadata.fields["metadata"].kind else {
+            panic!("metadata: {metadata:?}");
+        };
+        let Some(Kind::StructValue(shared)) = &merged.fields["shared"].kind else {
+            panic!("shared: {merged:?}");
+        };
+        shared.fields.keys().cloned().collect::<Vec<_>>()
+    };
+
+    let both = service
+        .should_rate_limit(&request("d", &[&[("a", "x")], &[("b", "x")]]))
+        .await
+        .unwrap();
+    assert_eq!(shared(both), ["x", "z"]);
+
+    *cache.statuses.lock().unwrap() = vec![status(Code::Ok, 0)];
+    let alone = service
+        .should_rate_limit(&request("d", &[&[("a", "x")]]))
+        .await
+        .unwrap();
+    assert_eq!(shared(alone), ["x"]);
 }

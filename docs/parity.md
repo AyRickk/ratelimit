@@ -69,15 +69,15 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `BACKEND_TYPE` | `redis` | ⬜ | |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not read from the environment yet |
 | `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ⬜ | |
-| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | ⬜ | |
-| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | ⬜ | |
-| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | ⬜ | |
-| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | ⬜ | |
-| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | ⬜ | |
-| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | ⬜ | |
-| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | ⬜ | |
-| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | ⬜ | |
-| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | ⬜ | |
+| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ⬜ | |
 | `REDIS_SOCKET_TYPE` | `unix` | ⬜ | |
 | `REDIS_TYPE` | `SINGLE` | ⬜ | |
@@ -136,7 +136,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
 | `SHADOW_MODE` | `false` | ⬜ | |
 | `QUOTA_MODE` | `false` | ⬜ | |
-| `RESPONSE_DYNAMIC_METADATA` | `false` | ⬜ | |
+| `RESPONSE_DYNAMIC_METADATA` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `MERGE_DOMAIN_CONFIG` | `false` | ⬜ | |
 | `TRACING_ENABLED` | `false` | ⬜ | |
 | `TRACING_SERVICE_NAME` | `RateLimit` | ⬜ | |
@@ -175,9 +175,9 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | Client-sent `limit`: replaces the config, without shadow / `replaces` / `unlimited` | ✅ | `tests/config.rs`, `tests/differential.rs` |
 | Response fields: `overall_code`, `statuses[]`, `current_limit` (with `name`), `limit_remaining`, `duration_until_reset` | ✅ | `tests/differential.rs` |
 | Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | 🚧 | `tests/service.rs`, `tests/differential.rs` (`domain_not_found` stat missing) |
-| `LIMIT_*` headers: response, per unit, and request | ⬜ | |
-| Dynamic metadata (`RESPONSE_DYNAMIC_METADATA`): `domain`, `descriptors`, `hitsAddend`, merged `metadata` | ⬜ | |
-| `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | 🚧 | `tests/service.rs` (`passedBackends` metadata missing) |
+| `LIMIT_*` headers: response, per unit, and request | ✅ | `tests/differential.rs` |
+| Dynamic metadata (`RESPONSE_DYNAMIC_METADATA`): `domain`, `descriptors`, `hitsAddend`, merged `metadata` | ✅ | `tests/differential.rs`, `tests/service.rs` |
+| `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | 🚧 | `tests/service.rs`, `tests/differential.rs` (`global_shadow_mode` stat missing) |
 | `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
@@ -230,7 +230,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 |---|---|---|
 | Client `limit` with `unit: UNKNOWN` ⇒ the process panics | gRPC error `INVALID_ARGUMENT` | D1: crashes are not reproduced |
 | Invalid environment variable re-read on reload ⇒ panic | config error | D1 |
-| `descriptors[].limit` in metadata as Go prototext (unstable) | documented stable format | not reproducible byte for byte |
+| `descriptors[].limit` in metadata as Go prototext, one or two spaces between fields depending on the build | the same text, always one space; `unit_multiplier:{value:N}` when set | Go randomises the spacing; `unit_multiplier` is an extension |
+| Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
 | `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
 | Go stats (`go.*`), `/stats` expvar, pprof | Rust process stats, documented equivalents | no Rust equivalent |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
