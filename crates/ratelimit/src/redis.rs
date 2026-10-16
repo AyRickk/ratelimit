@@ -6,6 +6,7 @@ use crate::config::RateLimit;
 use crate::limiter::{self, Clock, Count, Hits, RequestState};
 use crate::local_cache::LocalCache;
 use crate::service::{CacheError, RateLimitCache};
+use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use ratelimit_proto::envoy::service::ratelimit::v3::{
@@ -23,7 +24,7 @@ redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))             -- reset TTL
 return new_val                                               -- return count after decrement
 ";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RedisCacheSettings {
     /// `CACHE_KEY_PREFIX`.
     pub cache_key_prefix: String,
@@ -32,22 +33,43 @@ pub struct RedisCacheSettings {
     pub local_cache_size_in_bytes: usize,
     /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`.
     pub stop_cache_key_increment_when_overlimit: bool,
+    /// `NEAR_LIMIT_RATIO`: the share of a limit past which hits count as `near_limit`
+    /// (upstream's default: 0.8).
+    pub near_limit_ratio: f32,
+}
+
+impl Default for RedisCacheSettings {
+    fn default() -> Self {
+        Self {
+            cache_key_prefix: String::new(),
+            local_cache_size_in_bytes: 0,
+            stop_cache_key_increment_when_overlimit: false,
+            near_limit_ratio: 0.8,
+        }
+    }
 }
 
 pub struct RedisCache {
     client: Client,
     clock: Arc<dyn Clock>,
+    stats: Arc<Stats>,
     local_cache: Option<LocalCache>,
     settings: RedisCacheSettings,
 }
 
 impl RedisCache {
-    pub fn new(client: Client, clock: Arc<dyn Clock>, settings: RedisCacheSettings) -> Self {
+    pub fn new(
+        client: Client,
+        clock: Arc<dyn Clock>,
+        stats: Arc<Stats>,
+        settings: RedisCacheSettings,
+    ) -> Self {
         let local_cache = (settings.local_cache_size_in_bytes > 0)
             .then(|| LocalCache::new(settings.local_cache_size_in_bytes));
         Self {
             client,
             clock,
+            stats,
             local_cache,
             settings,
         }
@@ -165,6 +187,7 @@ impl Command {
 struct Check<'a> {
     index: usize,
     limit: &'a RateLimit,
+    stats: RateLimitStats,
     key: String,
     hits: Hits,
     /// Already over its limit according to the local cache: Redis is skipped.
@@ -193,6 +216,8 @@ impl RateLimitCache for RedisCache {
                 now,
             )?;
             let hits = hits[index];
+            let stats = self.stats.rate_limit(&limit.full_key);
+            limiter::count_hits(&stats, hits);
             // Refunds always reach Redis.
             let over_in_local_cache = !hits.refund
                 && self
@@ -202,6 +227,7 @@ impl RateLimitCache for RedisCache {
             checks.push(Check {
                 index,
                 limit,
+                stats,
                 key,
                 hits,
                 over_in_local_cache,
@@ -274,12 +300,17 @@ impl RateLimitCache for RedisCache {
             }
         }
 
-        limits
-            .iter()
+        let mut checked: Vec<Option<(&RateLimit, &RateLimitStats)>> = vec![None; limits.len()];
+        for c in &checks {
+            checked[c.index] = Some((c.limit, &c.stats));
+        }
+        checked
+            .into_iter()
             .zip(&hits)
             .zip(counts)
             .map(|((limit, hits), count)| {
-                limiter::descriptor_status(limit.as_ref(), *hits, count, now)
+                let ratio = self.settings.near_limit_ratio;
+                limiter::descriptor_status(limit, ratio, *hits, count, now)
             })
             .collect()
     }

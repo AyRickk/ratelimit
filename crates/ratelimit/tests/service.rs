@@ -53,7 +53,7 @@ impl RateLimitCache for FakeCache {
 
 /// The service over `cache`, on the system clock.
 fn service<C: RateLimitCache>(cache: C, settings: ServiceSettings) -> RateLimitService<C> {
-    RateLimitService::new(cache, Arc::new(SystemClock), settings)
+    RateLimitService::new(cache, Arc::new(SystemClock), Arc::default(), settings)
 }
 
 fn load(yaml: &str) -> config::RateLimitConfig {

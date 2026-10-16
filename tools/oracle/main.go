@@ -5,7 +5,9 @@
 // HTTP control endpoints (on -control):
 //
 //	PUT /time    body: unix seconds          sets the clock
-//	PUT /config  body: YAML config file      loads a config (as one file named "config.yaml")
+//	PUT /config  body: YAML config file      loads a config (as one file named "config.yaml");
+//	                                         422 with the error when it does not load
+//	GET /stats                               the service's counters, one "name value" per line
 package main
 
 import (
@@ -17,8 +19,10 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -62,6 +66,20 @@ type configEvent struct {
 
 func (e *configEvent) GetConfig() (config.RateLimitConfig, any) { return e.config, e.err }
 
+// countingSink adds up the counter deltas the store flushes into it.
+type countingSink struct {
+	mu       sync.Mutex
+	counters map[string]uint64
+}
+
+func (s *countingSink) FlushCounter(name string, value uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counters[name] += value
+}
+func (s *countingSink) FlushGauge(name string, value uint64)  {}
+func (s *countingSink) FlushTimer(name string, value float64) {}
+
 func loadConfig(content string, statsManager stats.Manager) (cfg config.RateLimitConfig, err any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -80,10 +98,12 @@ func main() {
 	prefix := flag.String("cache-key-prefix", "", "CACHE_KEY_PREFIX")
 	localCacheSize := flag.Int("local-cache-size", 0, "LOCAL_CACHE_SIZE_IN_BYTES (0 disables the local cache)")
 	stopIncrement := flag.Bool("stop-cache-key-increment", false, "STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT")
+	nearLimitRatio := flag.Float64("near-limit-ratio", 0.8, "NEAR_LIMIT_RATIO")
 	flag.Parse()
 
 	ctx := context.Background()
-	store := gostats.NewStore(gostats.NewNullSink(), false)
+	sink := &countingSink{counters: map[string]uint64{}}
+	store := gostats.NewStore(sink, false)
 	statsManager := stats.NewStatManager(store, settings.NewSettings())
 	clk := &clock{}
 
@@ -97,8 +117,9 @@ func main() {
 		localCache = freecache.NewCacheCustomTimer(*localCacheSize, freecacheTimer{clk})
 	}
 	cache := redis.NewFixedRateLimitCacheImpl(client, nil, clk, rand.New(utils.NewLockedSource(1)), 0,
-		localCache, 0.8, *prefix, statsManager, *stopIncrement, false)
+		localCache, float32(*nearLimitRatio), *prefix, statsManager, *stopIncrement, false)
 
+	// Nothing is sent on it: PUT /config calls SetConfig directly. NewService needs a provider.
 	events := &configEvents{events: make(chan provider.ConfigUpdateEvent)}
 	health := server.NewHealthChecker(health.NewServer(), "ratelimit", false)
 	// forceStart: serve before any config is loaded, like FORCE_START_WITHOUT_INITIAL_CONFIG.
@@ -125,9 +146,25 @@ func main() {
 	mux.HandleFunc("PUT /config", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		cfg, loadErr := loadConfig(string(body), statsManager)
-		events.events <- &configEvent{config: cfg, err: loadErr}
+		// Applied before answering, so the stats read next include it.
+		svc.SetConfig(&configEvent{config: cfg, err: loadErr}, false)
 		if loadErr != nil {
 			http.Error(w, fmt.Sprint(loadErr), http.StatusUnprocessableEntity)
+		}
+	})
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
+		store.Flush()
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		names := make([]string, 0, len(sink.counters))
+		for name := range sink.counters {
+			if strings.HasPrefix(name, "ratelimit.service.") {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "%s %d\n", name, sink.counters[name])
 		}
 	})
 	controlListener, err := net.Listen("tcp", *controlAddr)

@@ -4,6 +4,7 @@
 
 use crate::config::RateLimit;
 use crate::service::CacheError;
+use crate::stats::RateLimitStats;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::{
@@ -128,21 +129,83 @@ pub(crate) enum Count {
     OverInLocalCache,
 }
 
-/// The status of a descriptor. Without a limit it is a bare OK. A refund is always OK, with
-/// what remains. Otherwise it is over the limit when the counter exceeds it (or the local cache
-/// says so); a rule in shadow mode then answers OK, keeping the remaining count of 0.
+/// Counts `hits` towards `limit`'s `total_hits`, or `total_negative_hits` for a refund, as
+/// upstream does when it builds the keys, before asking the backend.
+pub(crate) fn count_hits(stats: &RateLimitStats, hits: Hits) {
+    if hits.refund {
+        stats.total_negative_hits.add(hits.value);
+    } else {
+        stats.total_hits.add(hits.value);
+    }
+}
+
+/// Splits a request's `hits` between `limit`'s `within_limit`, `near_limit`, `over_limit`,
+/// `over_limit_with_local_cache` and `shadow_mode` counters, as upstream's
+/// `GetResponseDescriptorStatus`. Usage before the hits is taken as the counter minus the hits,
+/// wrapping like upstream's unsigned arithmetic when fewer were counted (D22).
+fn count_outcome(
+    stats: &RateLimitStats,
+    limit: &RateLimit,
+    hits: u64,
+    count: Count,
+    near_limit_ratio: f32,
+) {
+    let after = match count {
+        Count::OverInLocalCache => {
+            stats.over_limit.add(hits);
+            stats.over_limit_with_local_cache.add(hits);
+            if limit.shadow_mode {
+                stats.shadow_mode.add(hits);
+            }
+            return;
+        }
+        Count::After(after) => after,
+    };
+    let before = after.wrapping_sub(hits);
+    let over = u64::from(limit.limit.requests_per_unit);
+    // In float32, as upstream: `floor(float64(float32(limit) * ratio))`.
+    let near = f64::from(over as f32 * near_limit_ratio).floor() as u64;
+    if after > over {
+        // All the hits were over when the counter already was; otherwise only those past the
+        // limit, the rest being near it.
+        let over_hits = if before >= over { hits } else { after - over };
+        stats.over_limit.add(over_hits);
+        if before < over {
+            stats.near_limit.add(over.wrapping_sub(near.max(before)));
+        }
+        if limit.shadow_mode {
+            stats.shadow_mode.add(over_hits);
+        }
+    } else {
+        if after > near {
+            stats
+                .near_limit
+                .add(if before >= near { hits } else { after - near });
+        }
+        stats.within_limit.add(hits);
+    }
+}
+
+/// The status of a descriptor, its outcome counted in its limit's `stats`. Without a limit it
+/// is a bare OK. A refund is always OK, with what remains. Otherwise it is over the limit when
+/// the counter exceeds it (or the local cache says so); a rule in shadow mode then answers OK,
+/// keeping the remaining count of 0.
 pub(crate) fn descriptor_status(
-    limit: Option<&RateLimit>,
+    limit: Option<(&RateLimit, &RateLimitStats)>,
+    near_limit_ratio: f32,
     hits: Hits,
     count: Count,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
-    let Some(limit) = limit else {
+    let Some((limit, stats)) = limit else {
         return Ok(DescriptorStatus {
             code: Code::Ok as i32,
             ..Default::default()
         });
     };
+    if !hits.refund {
+        count_outcome(stats, limit, hits.value, count, near_limit_ratio);
+    }
     let threshold = u64::from(limit.limit.requests_per_unit);
     match count {
         Count::After(after) if hits.refund => {

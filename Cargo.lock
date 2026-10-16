@@ -1084,6 +1084,7 @@ dependencies = [
  "fred",
  "prost-types",
  "ratelimit-proto",
+ "regex",
  "thiserror",
  "tokio",
  "tokio-stream",
