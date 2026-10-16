@@ -39,7 +39,3 @@ The goal and every design decision are in `docs/design.md`; what is already prov
 
 - `RATELIMIT_REQUIRE_DIFFERENTIAL=1 cargo test --workspace` needs `go` and `redis-server` on the PATH. Without the variable, differential tests are skipped when a tool is missing.
 - `RATELIMIT_REDIS_SERVER=<path to valkey-server>` runs them against Valkey (built from source if it conflicts with Homebrew's `redis`).
-
-### Next
-
-Legacy parity slice B: `LIMIT_*` headers (response, per unit, request) and dynamic metadata (`RESPONSE_DYNAMIC_METADATA`, `quota_mode`'s `passedBackends`). Then stats, then a runnable binary (environment settings, config hot reload, `/healthcheck`, image).
