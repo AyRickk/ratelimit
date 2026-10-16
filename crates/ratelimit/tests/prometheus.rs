@@ -65,3 +65,45 @@ async fn prometheus_is_selected_alone() {
     };
     assert!(matches!(select_sink(&settings), Ok(Sink::Prometheus(_))));
 }
+
+/// Like Go's `net.Listen`: a wildcard host listens on IPv4 and IPv6, a host name on its first
+/// IPv4 address.
+#[tokio::test]
+async fn the_listener_binds_like_go() {
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (wildcard, named) = (free_port(), free_port());
+    let cases = [
+        (
+            format!(":{wildcard}"),
+            vec![format!("127.0.0.1:{wildcard}"), format!("[::1]:{wildcard}")],
+        ),
+        (
+            format!("localhost:{named}"),
+            vec![format!("127.0.0.1:{named}")],
+        ),
+    ];
+    for (addr, reachable) in cases {
+        let settings = PrometheusSettings {
+            addr,
+            ..Default::default()
+        };
+        let _sink = PrometheusSink::start(&settings).unwrap();
+        for target in reachable {
+            let mut connected = false;
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(&target).await.is_ok() {
+                    connected = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(connected, "{target}");
+        }
+    }
+}

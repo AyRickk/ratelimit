@@ -598,19 +598,24 @@ enum MapperFile {
     Missing,
 }
 
+impl MapperFile {
+    /// A temporary file holding `content`.
+    async fn write(content: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "ratelimit-mapper-{}-{}.yaml",
+            std::process::id(),
+            free_port().await
+        ));
+        std::fs::write(&path, content).unwrap();
+        MapperFile::Content(path)
+    }
+}
+
 impl Prometheus {
     async fn new(mapper: Option<&str>) -> Self {
         let mapper = match mapper {
             None => MapperFile::Default,
-            Some(content) => {
-                let path = std::env::temp_dir().join(format!(
-                    "ratelimit-mapper-{}-{}.yaml",
-                    std::process::id(),
-                    free_port().await
-                ));
-                std::fs::write(&path, content).unwrap();
-                MapperFile::Content(path)
-            }
+            Some(content) => MapperFile::write(content.as_bytes()).await,
         };
         Self {
             path: "/metrics",
@@ -2547,6 +2552,10 @@ async fn prometheus_scrapes_are_answered_like_upstream() {
         "/other",
         "/a/../metrics",
         "//metrics?q",
+        "/%6Detrics",
+        "/metric%73?a",
+        "/%2Fmetrics",
+        "/metrics%2F",
     ] {
         h.scrape("GET", target, &[]).await;
     }
@@ -2688,6 +2697,24 @@ mappings:
     "mappings:\n- ~\n",
     "mappings: 3",
     "defaults: {ttl: 5s, match_type: glob}\nmappings:\n- {match: a, name: n, ttl: 0}\n- {match: b, name: m, match_metric_type: observer, quantiles: [{quantile: 0.1}]}",
+    // Repeated keys and merges: scalars replaced, maps and structs added to.
+    "base: &base {name: base_$1, labels: {kind: a, id: x}, histogram_options: {buckets: [1]}}
+mappings:
+- <<: *base
+  match: m.*
+  labels: {id: $1}
+  histogram_options: {native_histogram_max_buckets: 3}
+  observer_type: histogram
+  name: merged_$1
+- match: n.*
+  name: first
+  name: second
+  labels: {aa: x}
+  labels: ~
+  labels: {bb: \"%x-%X-%q-%T-%d-$1\"}
+defaults: {ttl: 1s}
+defaults: {match_type: glob}",
+    "mappings:\n- {match: a, name: n, help: x, help: [1]}",
     "registerer: x",
     "registerer: ~\nmappingscount: ~",
     "mappingscount: 1",
@@ -2718,6 +2745,8 @@ fn mapper_names() -> Vec<String> {
         "a..c",
         "a.*.c",
         "é.b.c",
+        "m.x",
+        "n.x",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -2921,18 +2950,35 @@ async fn invalid_series_fail_prometheus_scrapes_like_upstream() {
     }
 }
 
-/// A mapper file that cannot be read, or does not load, maps nothing: the default mapper is
-/// not used instead.
+/// A mapper file that cannot be read, is not UTF-8 (UTF-16 with a byte order mark is), or does
+/// not load maps nothing: the default mapper is not used instead.
 #[tokio::test]
 async fn an_unusable_prometheus_mapper_file_maps_nothing_like_upstream() {
     if !tools_available() {
         return;
     }
-    for mapper in [None, Some("mappings: [{match: a, name: 1}]")] {
-        let mut prometheus = Prometheus::new(mapper).await;
-        if mapper.is_none() {
-            prometheus.mapper = MapperFile::Missing;
-        }
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(
+            "mappings: [{match: ratelimit.service.config_load_success, name: utf16}]"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        )
+        .collect();
+    let files: [Option<Vec<u8>>; 4] = [
+        None,
+        Some(b"mappings: [{match: a, name: 1}]".to_vec()),
+        Some(
+            b"# \xff\nmappings: [{match: ratelimit.service.config_load_success, name: x}]".to_vec(),
+        ),
+        Some(utf16),
+    ];
+    for file in files {
+        let mut prometheus = Prometheus::new(None).await;
+        prometheus.mapper = match file {
+            None => MapperFile::Missing,
+            Some(bytes) => MapperFile::write(&bytes).await,
+        };
         let settings = Settings {
             prometheus: Some(prometheus),
             ..Default::default()
@@ -2968,6 +3014,8 @@ async fn prometheus_options_like_upstream() {
         "/stats/x?y",
         "/metrics",
         "/stats/../stats/",
+        "/%73tats",
+        "/%73tats/x%20y",
     ] {
         h.scrape("GET", target, &[]).await;
     }

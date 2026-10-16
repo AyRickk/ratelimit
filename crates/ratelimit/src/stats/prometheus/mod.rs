@@ -15,6 +15,8 @@ use bytes::Bytes;
 use exporter::{Event, Exporter};
 use http_body_util::Full;
 use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The mapper upstream uses when `PROMETHEUS_MAPPER_YAML` is not set.
@@ -38,6 +40,9 @@ impl MetricType {
     }
 }
 
+const DEFAULT_ADDR: &str = ":9090";
+const DEFAULT_PATH: &str = "/metrics";
+
 /// The `PROMETHEUS_*` settings.
 #[derive(Debug, Clone)]
 pub struct PrometheusSettings {
@@ -54,8 +59,8 @@ pub struct PrometheusSettings {
 impl Default for PrometheusSettings {
     fn default() -> Self {
         Self {
-            addr: ":9090".into(),
-            path: "/metrics".into(),
+            addr: DEFAULT_ADDR.into(),
+            path: DEFAULT_PATH.into(),
             mapper_yaml: String::new(),
             response_time_as_milliseconds: false,
         }
@@ -67,14 +72,18 @@ impl Default for PrometheusSettings {
 /// not used instead). Only a file that would make upstream panic is an error.
 pub fn load_mapper(settings: &PrometheusSettings) -> Result<Mapper, String> {
     let content = if settings.mapper_yaml.is_empty() {
-        match settings.response_time_as_milliseconds {
-            true => DEFAULT_MAPPER.replacen("    scale: 0.001\n", "", 1),
-            false => DEFAULT_MAPPER.to_string(),
+        if settings.response_time_as_milliseconds {
+            DEFAULT_MAPPER.replacen("    scale: 0.001\n", "", 1)
+        } else {
+            DEFAULT_MAPPER.to_string()
         }
     } else {
-        match std::fs::read(&settings.mapper_yaml) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => return Ok(Mapper::default()),
+        match std::fs::read(&settings.mapper_yaml)
+            .ok()
+            .and_then(yaml_text)
+        {
+            Some(text) => text,
+            None => return Ok(Mapper::default()),
         }
     };
     match Mapper::from_yaml(&content) {
@@ -84,17 +93,31 @@ pub fn load_mapper(settings: &PrometheusSettings) -> Result<Mapper, String> {
     }
 }
 
-/// The clock of the exporter: nanoseconds since the Unix epoch.
+/// A file's text as yaml.v2 reads it: UTF-8 (a byte order mark skipped), or UTF-16 with a
+/// byte order mark; anything else is an error.
+fn yaml_text(bytes: Vec<u8>) -> Option<String> {
+    let utf16 = |bytes: &[u8], read: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| (pair.len() == 2).then(|| read([pair[0], pair[1]])))
+            .collect::<Option<_>>()?;
+        String::from_utf16(&units).ok()
+    };
+    match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec()).ok(),
+        _ => String::from_utf8(bytes).ok(),
+    }
+}
+
+/// The clock of the exporter, in nanoseconds; only differences matter.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// The system clock.
+/// A monotonic clock, as Go's time comparisons are.
 pub fn system_clock() -> Clock {
-    Arc::new(|| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        i64::try_from(now.as_nanos()).unwrap_or(i64::MAX)
-    })
+    let start = std::time::Instant::now();
+    Arc::new(move || i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// The Prometheus sink. Clones share the registry.
@@ -103,6 +126,8 @@ pub struct PrometheusSink {
     exporter: Arc<Mutex<Exporter>>,
     clock: Clock,
     path: MetricsPath,
+    /// The scrapes being served.
+    in_flight: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for PrometheusSink {
@@ -118,25 +143,27 @@ impl PrometheusSink {
             exporter: Arc::new(Mutex::new(Exporter::new(mapper))),
             clock,
             path: MetricsPath::parse(path)?,
+            in_flight: Arc::default(),
         })
     }
 
     /// `NewPrometheusSink`: loads the mapper, then serves on `PROMETHEUS_ADDR` (an address it
     /// cannot listen on is ignored, as upstream) and removes stale series every second.
     pub fn start(settings: &PrometheusSettings) -> Result<Self, String> {
+        // Upstream's sink falls back to its defaults for empty settings too.
         let path = match settings.path.as_str() {
-            "" => "/metrics",
+            "" => DEFAULT_PATH,
             path => path,
         };
         let sink = Self::new(load_mapper(settings)?, path, system_clock())?;
         let addr = match settings.addr.as_str() {
-            "" => ":9090",
+            "" => DEFAULT_ADDR,
             addr => addr,
         };
-        let address = listen_address(addr);
+        let addr = addr.to_string();
         let server = sink.clone();
         tokio::spawn(async move {
-            if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+            if let Some(listener) = listen(&addr).await {
                 server.serve(listener).await;
             }
         });
@@ -219,7 +246,9 @@ impl PrometheusSink {
 
     /// promhttp's handler for the default registry.
     fn metrics(&self, accept: &str, accept_encoding: &str) -> Response {
-        let scraped = self.exporter.lock().unwrap().scrape();
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let scraped = self.exporter.lock().unwrap().scrape(in_flight);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         let text = match scraped {
             Ok(text) => text,
             Err(e) => {
@@ -247,12 +276,45 @@ impl PrometheusSink {
     }
 }
 
-/// Go's listen address: `:port` (or an empty host) listens on every interface.
-fn listen_address(addr: &str) -> String {
-    match addr.strip_prefix(':') {
-        Some(port) => format!("[::]:{port}"),
-        None => addr.to_string(),
+/// Go's `net.Listen("tcp", addr)`: a wildcard host (empty, `0.0.0.0` or `::`) listens on
+/// both IPv4 and IPv6 (IPv4 only when IPv6 is unavailable); a host name on its first IPv4
+/// address, else its first address. `None` when that fails, which upstream ignores.
+async fn listen(addr: &str) -> Option<tokio::net::TcpListener> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let port: u16 = match port {
+        "" => 0,
+        port => port.parse().ok()?,
+    };
+    let bind = |address: SocketAddr| {
+        let domain = socket2::Domain::for_address(address);
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).ok()?;
+        if address.is_ipv6() && address.ip().is_unspecified() {
+            socket.set_only_v6(false).ok()?;
+        }
+        // Like Go on Unix.
+        #[cfg(unix)]
+        socket.set_reuse_address(true).ok()?;
+        socket.bind(&address.into()).ok()?;
+        socket.listen(1024).ok()?;
+        socket.set_nonblocking(true).ok()?;
+        tokio::net::TcpListener::from_std(socket.into()).ok()
+    };
+    let wildcard = matches!(host, "" | "0.0.0.0" | "::");
+    if wildcard {
+        let any6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        let any4 = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        return bind(any6).or_else(|| bind(any4));
     }
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await.ok()?.collect();
+    let address = addresses
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addresses.first())?;
+    bind(*address)
 }
 
 struct Response {
@@ -396,7 +458,11 @@ fn parse_accept(header: &str) -> Vec<AcceptClause> {
 /// `PROMETHEUS_PATH` as a Go `ServeMux` pattern: an exact path, or a subtree when it ends
 /// with `/`. Patterns with a method, a host or wildcards are not supported (§7).
 #[derive(Debug, Clone)]
-struct MetricsPath(String);
+struct MetricsPath {
+    /// The unescaped segments before the trailing slash, if any.
+    segments: Vec<String>,
+    subtree: bool,
+}
 
 enum Route {
     Metrics,
@@ -412,13 +478,21 @@ impl MetricsPath {
         if unsupported {
             return Err(format!("unsupported PROMETHEUS_PATH {path:?}"));
         }
-        Ok(Self(path.to_string()))
+        let subtree = path.ends_with('/');
+        let mut segments = unescaped_segments(path);
+        if subtree {
+            segments.pop();
+        }
+        Ok(Self { segments, subtree })
     }
 
-    fn matches(&self, path: &str) -> bool {
-        match self.0.ends_with('/') {
-            true => path.starts_with(&self.0),
-            false => path == self.0,
+    /// Go's routing, segment by segment once unescaped.
+    fn matches(&self, segments: &[String]) -> bool {
+        if self.subtree {
+            // The path without its trailing slash was redirected.
+            segments.starts_with(&self.segments)
+        } else {
+            segments == self.segments
         }
     }
 
@@ -430,19 +504,47 @@ impl MetricsPath {
             _ => path,
         };
         let path = clean_path(request_path);
-        // Only a subtree pattern matches a path with a trailing slash exactly.
-        if !path.ends_with('/') && self.0 == format!("{path}/") {
+        let segments = unescaped_segments(&path);
+        // Only a subtree pattern matches a path with a trailing slash exactly: redirect there,
+        // keeping the request's escaping.
+        if !path.ends_with('/') && self.subtree && segments == self.segments {
             return Route::Redirect(with_query(format!("{path}/")));
         }
         if path != request_path {
             return Route::Redirect(with_query(path));
         }
-        if self.matches(&path) {
+        if self.matches(&segments) {
             Route::Metrics
         } else {
             Route::NotFound
         }
     }
+}
+
+/// The segments of an absolute path, each percent-decoded (an invalid escape is kept as is).
+fn unescaped_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .skip(1)
+        .map(|segment| {
+            let bytes = segment.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                let hex = |b: u8| (b as char).to_digit(16);
+                match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+                    (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
+                        out.push((hex(h).unwrap() * 16 + hex(l).unwrap()) as u8);
+                        i += 3;
+                    }
+                    (b, _, _) => {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        })
+        .collect()
 }
 
 /// Go's `cleanPath`: `path.Clean` of a rooted path, keeping a trailing slash.

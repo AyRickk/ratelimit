@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 /// client_golang's `DefBuckets`.
-const DEFAULT_BUCKETS: [f64; 11] = [
+pub(super) const DEFAULT_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
@@ -42,24 +42,28 @@ static METRIC_NAME: LazyLock<Regex> = LazyLock::new(|| {
 static LABEL_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]+$").unwrap());
 
+/// How a mapping's `match` is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchType {
     Glob,
     Regex,
 }
 
+/// What happens to a stat a mapping matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Map,
     Drop,
 }
 
+/// What a timer becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserverType {
     Histogram,
     Summary,
 }
 
+/// A summary quantile and its allowed error.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Objective {
     pub quantile: f64,
@@ -493,8 +497,8 @@ impl TemplateFormatter {
 }
 
 /// Go's `fmt.Sprintf` with string arguments, for the directives a template can hold: `%%`,
-/// `%s` and `%v` print the argument, other verbs and missing or extra arguments print Go's
-/// error forms. Flags, widths and precisions are not supported (`docs/parity.md` §7).
+/// `%s`, `%v`, `%q`, `%x`, `%X` and `%T` as Go prints a string, other verbs and missing or
+/// extra arguments in Go's error forms. Flags, widths and precisions are not supported (`docs/parity.md` §7).
 fn go_sprintf(format: &str, args: &[&str]) -> String {
     let mut out = String::new();
     let mut next = 0;
@@ -513,6 +517,10 @@ fn go_sprintf(format: &str, args: &[&str]) -> String {
                     next += 1;
                     match verb {
                         's' | 'v' => out += arg,
+                        'q' => out += &super::exporter::go_quote(arg),
+                        'x' => arg.bytes().for_each(|b| out += &format!("{b:02x}")),
+                        'X' => arg.bytes().for_each(|b| out += &format!("{b:02X}")),
+                        'T' => out += "string",
                         _ => out += &format!("%!{verb}(string={arg})"),
                     }
                 }
@@ -692,18 +700,15 @@ impl Decoder {
         ));
     }
 
-    /// The entries of a mapping decoded into a struct, later keys winning.
+    /// The entries of a mapping decoded into a struct, in order. yaml.v2 decodes a repeated
+    /// key (or one merged with `<<`) again into the same field: a scalar is replaced, but a
+    /// map or a struct gets the new entries added.
     fn fields<'a>(&mut self, node: &'a Node, go_type: &str) -> Vec<(String, &'a Node)> {
         match node {
-            Node::Map { entries, .. } => {
-                let mut fields: Vec<(String, &Node)> = Vec::new();
-                for (key, value) in entries {
-                    let key = self.string(key);
-                    fields.retain(|(k, _)| *k != key);
-                    fields.push((key, value));
-                }
-                fields
-            }
+            Node::Map { entries, .. } => entries
+                .iter()
+                .map(|(key, value)| (self.string(key), value))
+                .collect(),
             n if is_null(n) => Vec::new(),
             other => {
                 self.error(other, go_type);
@@ -834,22 +839,22 @@ impl Decoder {
         }
     }
 
-    fn labels(&mut self, node: &Node) -> BTreeMap<String, String> {
+    /// Labels, added to those already decoded; a null clears them.
+    fn labels(&mut self, node: &Node, labels: &mut BTreeMap<String, String>) {
         match node {
-            Node::Map { entries, .. } => entries
-                .iter()
-                .map(|(k, v)| (self.string(k), self.string(v)))
-                .collect(),
-            n if is_null(n) => BTreeMap::new(),
-            other => {
-                self.error(other, "prometheus.Labels");
-                BTreeMap::new()
+            Node::Map { entries, .. } => {
+                for (k, v) in entries {
+                    let (k, v) = (self.string(k), self.string(v));
+                    labels.insert(k, v);
+                }
             }
+            n if is_null(n) => labels.clear(),
+            other => self.error(other, "prometheus.Labels"),
         }
     }
 
-    fn histogram_options(&mut self, node: &Node) -> HistogramOptions {
-        let mut options = HistogramOptions::default();
+    /// Histogram options, into those already decoded.
+    fn histogram_options(&mut self, node: &Node, options: &mut HistogramOptions) {
         for (key, value) in self.fields(node, "mapper.HistogramOptions") {
             match key.as_str() {
                 "buckets" => options.buckets = self.floats(value),
@@ -862,11 +867,10 @@ impl Decoder {
                 _ => {}
             }
         }
-        options
     }
 
-    fn summary_options(&mut self, node: &Node) -> SummaryOptions {
-        let mut options = SummaryOptions::default();
+    /// Summary options, into those already decoded.
+    fn summary_options(&mut self, node: &Node, options: &mut SummaryOptions) {
         for (key, value) in self.fields(node, "mapper.SummaryOptions") {
             match key.as_str() {
                 "quantiles" => options.quantiles = self.objectives(value),
@@ -876,7 +880,20 @@ impl Decoder {
                 _ => {}
             }
         }
-        options
+    }
+
+    /// A pointer to options: nil for a null, else decoded into the options already there.
+    fn optional<T: Default>(
+        &mut self,
+        node: &Node,
+        options: &mut Option<T>,
+        decode: impl FnOnce(&mut Self, &Node, &mut T),
+    ) {
+        if is_null(node) {
+            *options = None;
+        } else {
+            decode(self, node, options.get_or_insert_default());
+        }
     }
 
     /// A string-based enum's `UnmarshalYAML`: `None` when yaml.v2 skips it for a null.
@@ -945,7 +962,7 @@ impl Decoder {
             match key.as_str() {
                 "match" => config.pattern = self.string(value),
                 "name" => config.name = self.string(value),
-                "labels" => config.labels = self.labels(value),
+                "labels" => self.labels(value, &mut config.labels),
                 "honor_labels" => config.honor_labels = self.boolean(value),
                 "observer_type" => config.observer_type = self.observer_type(value)?,
                 "timer_type" => timer_type = self.observer_type(value)?,
@@ -957,11 +974,14 @@ impl Decoder {
                 "match_metric_type" => config.match_metric_type = self.metric_type(value)?,
                 "ttl" => config.ttl = self.duration(value),
                 "summary_options" => {
-                    config.summary_options = (!is_null(value)).then(|| self.summary_options(value));
+                    self.optional(value, &mut config.summary_options, Self::summary_options);
                 }
                 "histogram_options" => {
-                    config.histogram_options =
-                        (!is_null(value)).then(|| self.histogram_options(value));
+                    self.optional(
+                        value,
+                        &mut config.histogram_options,
+                        Self::histogram_options,
+                    );
                 }
                 "scale" => config.scale = self.scale(value),
                 _ => {}
@@ -989,9 +1009,18 @@ impl Decoder {
                 "match_type" => defaults.match_type = self.match_type(value)?,
                 "glob_disable_ordering" => defaults.glob_disable_ordering = self.boolean(value),
                 "ttl" => defaults.ttl = self.duration(value),
-                "summary_options" => defaults.summary_options = self.summary_options(value),
+                // Struct values: a null resets them.
+                "summary_options" => {
+                    if is_null(value) {
+                        defaults.summary_options = SummaryOptions::default();
+                    }
+                    self.summary_options(value, &mut defaults.summary_options);
+                }
                 "histogram_options" => {
-                    defaults.histogram_options = self.histogram_options(value);
+                    if is_null(value) {
+                        defaults.histogram_options = HistogramOptions::default();
+                    }
+                    self.histogram_options(value, &mut defaults.histogram_options);
                 }
                 _ => {}
             }

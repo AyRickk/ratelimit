@@ -169,7 +169,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 ## F. Code, tests and delivery
 
-**D30. Stack.** tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL.
+**D30. Stack** *(amended)*. tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL. The Prometheus listener is served by `hyper` directly, behind a port of Go's mux rules for its one path, rather than axum's router.
 
 **D31. Code layout** *(amended)*. A workspace of two crates: `ratelimit-proto` (flattened protos, compiled with `protox`, no `protoc`) and `ratelimit`. Seam by operations: `Store::apply(batch of ops {key, algo, limit, hits, now})`. Each algorithm of the new types is a pure function `step(state, op) → (state, result)` in Rust (in-memory backend), rewritten in Lua for Redis. **The legacy path stays an `INCRBY` + `EXPIRE` pipeline with the decision on the service side**, not a script, so the commands seen by Redis are identical. The decision layer (thresholds, shadow, quota, status reduction, response) is shared.
 
