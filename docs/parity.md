@@ -43,8 +43,10 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `XDS_CLIENT_BACKOFF_RANDOM_FACTOR` | `0.5` | ⬜ | |
 | `XDS_CLIENT_BACKOFF_JITTER` | `true` | ⬜ | |
 | `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ⬜ | |
-| `USE_DOG_STATSD` | `false` | ⬜ | |
-| `USE_DOG_STATSD_MOGRIFIERS` | — | ⬜ | |
+| `USE_DOG_STATSD` | `false` | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
+| `USE_DOG_STATSD_MOGRIFIERS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
+| `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
+| `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`, `DD_ORIGIN_DETECTION_ENABLED` | — (read by datadog-go, not by `settings.go`) | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
 | `USE_STATSD` | `true` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
 | `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
@@ -210,7 +212,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
-| DogStatsD (+ mogrifiers), native Prometheus + statsd_exporter mapper | ⬜ | |
+| DogStatsD (+ mogrifiers, global tags, origin detection) | ✅ | lines and tags: `tests/differential.rs`; datagrams, `int64` values, mogrifier rules and errors, origin detection: `tests/dogstatsd.rs` |
+| Native Prometheus + statsd_exporter mapper | ⬜ | |
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
@@ -242,6 +245,13 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
 | `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
 | Negative or NaN `NEAR_LIMIT_RATIO`: the near threshold is converted to an integer by the CPU (amd64 wraps a negative value, arm64 gives 0) | 0 | Go leaves out-of-range float conversions to the platform |
+| datadog-go sends its own telemetry every 10 s (`datadog.dogstatsd.client.*`, tagged `client:go`, `client_version:5.4.0` and the global tags) | not sent | a Rust client reporting as `client:go` would mislead; the agent only uses it for client health |
+| A mogrifier's tags come in Go's random map order | sorted by tag name | deterministic |
+| DogStatsD lines are packed by 32 workers, by name hash | one buffer: the same lines, in other datagrams | datagram boundaries carry no meaning for the agent |
+| Mogrifier `PATTERN`s are Go RE2 | Rust `regex`, with `\d`, `\w`, `\s`, `\b` and their negations made ASCII as in Go; syntax only one of the two accepts (e.g. `\Q…\E`, `\b{start}`) differs | different engine |
+| An invalid mogrifier ⇒ panic at startup | configuration error | D1 |
+| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
+| A `STATSD_HOST` starting with `unix://` sends DogStatsD over a Unix socket | not supported: the address does not resolve | not needed by the targeted deployments; can be added |
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
 | statsd buffers are cut at the same line boundaries as gostats' but are not timed alike (gostats also pushes its buffer every second), so while the server is unreachable which lines are dropped can differ; the queue is bounded alike (about 4 MiB) | buffers pushed only when full or flushed | Not observable while the server is reachable |

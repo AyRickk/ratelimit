@@ -10,7 +10,8 @@
 //	GET /stats                               flushes the stats; returns the service's counters
 //	                                         so far, one "name value" per line. With -statsd,
 //	                                         the flush also reaches the statsd server, followed
-//	                                         by a "harness.flushed:1|c" line.
+//	                                         by a "harness.flushed:1|c" line; with -dogstatsd,
+//	                                         the DogStatsD server, the same way.
 package main
 
 import (
@@ -36,6 +37,7 @@ import (
 	"google.golang.org/grpc/health"
 
 	"github.com/envoyproxy/ratelimit/src/config"
+	"github.com/envoyproxy/ratelimit/src/godogstats"
 	"github.com/envoyproxy/ratelimit/src/provider"
 	"github.com/envoyproxy/ratelimit/src/redis"
 	"github.com/envoyproxy/ratelimit/src/server"
@@ -86,22 +88,39 @@ func (s *countingSink) FlushTimer(name string, value float64) {}
 // teeSink flushes to both sinks.
 type teeSink struct {
 	counting *countingSink
-	statsd   gostats.FlushableSink
+	upstream gostats.Sink
 }
 
 func (s *teeSink) FlushCounter(name string, value uint64) {
 	s.counting.FlushCounter(name, value)
-	s.statsd.FlushCounter(name, value)
+	s.upstream.FlushCounter(name, value)
 }
 func (s *teeSink) FlushGauge(name string, value uint64) {
 	s.counting.FlushGauge(name, value)
-	s.statsd.FlushGauge(name, value)
+	s.upstream.FlushGauge(name, value)
 }
 func (s *teeSink) FlushTimer(name string, value float64) {
 	s.counting.FlushTimer(name, value)
-	s.statsd.FlushTimer(name, value)
+	s.upstream.FlushTimer(name, value)
 }
-func (s *teeSink) Flush() { s.statsd.Flush() }
+func (s *teeSink) Flush() {
+	// Like gostats' store: only a FlushableSink is flushed (the DogStatsD sink is not).
+	if flushable, ok := s.upstream.(gostats.FlushableSink); ok {
+		flushable.Flush()
+	}
+}
+
+func hostAndPort(address string) (string, int) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		log.Fatal(err)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return host, portNumber
+}
 
 func loadConfig(content string, statsManager stats.Manager) (cfg config.RateLimitConfig, err any) {
 	defer func() {
@@ -123,25 +142,30 @@ func main() {
 	stopIncrement := flag.Bool("stop-cache-key-increment", false, "STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT")
 	nearLimitRatio := flag.Float64("near-limit-ratio", 0.8, "NEAR_LIMIT_RATIO")
 	statsdAddr := flag.String("statsd", "", "host:port of a statsd server (TCP) that also receives the stats")
+	dogstatsdAddr := flag.String("dogstatsd", "", "host:port of a DogStatsD server (UDP) that also receives the stats")
 	flag.Parse()
 
 	ctx := context.Background()
 	sink := &countingSink{counters: map[string]uint64{}}
 	var storeSink gostats.Sink = sink
-	var statsd gostats.FlushableSink
+	// The sink upstream's runner builds for USE_STATSD or USE_DOG_STATSD, if any.
+	var upstreamSink gostats.Sink
 	if *statsdAddr != "" {
-		host, port, err := net.SplitHostPort(*statsdAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		portNumber, err := strconv.Atoi(port)
-		if err != nil {
-			log.Fatal(err)
-		}
-		// The sink upstream's runner builds for USE_STATSD.
-		statsd = gostats.NewTCPStatsdSink(gostats.WithStatsdHost(host), gostats.WithStatsdPort(portNumber),
+		host, port := hostAndPort(*statsdAddr)
+		upstreamSink = gostats.NewTCPStatsdSink(gostats.WithStatsdHost(host), gostats.WithStatsdPort(port),
 			gostats.WithStatsdProtocol("tcp"))
-		storeSink = &teeSink{counting: sink, statsd: statsd}
+	}
+	if *dogstatsdAddr != "" {
+		host, port := hostAndPort(*dogstatsdAddr)
+		dog, err := godogstats.NewSink(godogstats.WithStatsdHost(host), godogstats.WithStatsdPort(port),
+			godogstats.WithMogrifierFromEnv(settings.NewSettings().UseDogStatsdMogrifiers))
+		if err != nil {
+			log.Fatal(err)
+		}
+		upstreamSink = dog
+	}
+	if upstreamSink != nil {
+		storeSink = &teeSink{counting: sink, upstream: upstreamSink}
 	}
 	store := gostats.NewStore(storeSink, false)
 	statsManager := stats.NewStatManager(store, settings.NewSettings())
@@ -194,9 +218,11 @@ func main() {
 	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		store.Flush()
-		if statsd != nil {
-			statsd.FlushCounter("harness.flushed", 1)
-			statsd.Flush()
+		if upstreamSink != nil {
+			upstreamSink.FlushCounter("harness.flushed", 1)
+			if flushable, ok := upstreamSink.(gostats.FlushableSink); ok {
+				flushable.Flush()
+			}
 		}
 		sink.mu.Lock()
 		defer sink.mu.Unlock()

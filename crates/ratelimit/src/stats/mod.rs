@@ -3,10 +3,13 @@
 //! config reload or a request keeps its value. Flushing sends each counter's increase since
 //! the previous flush to a [`Sink`].
 
+mod dogstatsd;
 mod logging;
+pub mod origin;
 mod sink;
 mod statsd;
 
+pub use dogstatsd::{DogStatsdSettings, DogStatsdSink, Mogrifier};
 pub use logging::LoggingSink;
 pub use sink::{Sink, SinkSettings, StatsdProtocol, select_sink};
 pub use statsd::StatsdSink;
