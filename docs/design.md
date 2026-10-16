@@ -1,54 +1,54 @@
-# Conception — `ratelimit` (Rust)
+# Design — `ratelimit` (Rust)
 
-Document de référence des décisions de conception, issu du grilling du 2026-10-16. Une décision marquée *(amendée)* a été révisée après sa première validation. Les détails de format sont figés dans les ADR :
+Reference document for the design decisions, from the design grilling of 2026-10-16. A decision marked *(amended)* was revised after it was first agreed. Format details are fixed in the ADRs:
 
-- [ADR 0001 — Format des clés de stockage des limites `rate_limits:`](adr/0001-format-cles-redis-nouveaux-types.md)
-- [ADR 0002 — Origine des fenêtres fixes (`offset`)](adr/0002-origine-fenetres-fixes.md)
+- [ADR 0001 — Storage keys of `rate_limits:` entries](adr/0001-storage-keys-for-rate-limits-entries.md)
+- [ADR 0002 — Origin of fixed windows (`offset`)](adr/0002-origin-of-fixed-windows.md)
 
-L'état d'avancement de la compatibilité est suivi dans [`docs/parity.md`](parity.md).
-
----
-
-## Objectif
-
-Une réécriture en Rust d'[envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit) (référence : commit `f4e7669`), **100 % compatible** et enrichie : durées de fenêtre libres, nouveaux types de fenêtre, plusieurs limites par descripteur, modes de comptage. Remplacer envoy ratelimit derrière Envoy, Envoy Gateway, Istio ou agentgateway ne demande que de changer l'image. La première version n'est publiée qu'à **parité complète**.
+Compatibility progress is tracked in [`docs/parity.md`](parity.md).
 
 ---
 
-## A. Périmètre et compatibilité
+## Goal
 
-**D1. Sur-ensemble strict** *(amendée)*. Tout comportement de la référence est reproduit à l'identique pour toute entrée qu'elle traite **sans paniquer**. Ses paniques (ex. `limit` client avec `unit: UNKNOWN`, `utilities.go:38` ; variable d'environnement invalide relue au rechargement) deviennent des erreurs propres, listées comme divergences volontaires dans `docs/parity.md`. Les ajouts ne changent jamais le comportement d'une config Envoy existante.
-
-**D2. Parité complète avant la v1.** Toutes les fonctionnalités de la référence sont incluses : Memcached, config xDS, `quota_mode`, `share_threshold`, cache local, `REDIS_PERSECOND`, Redis sentinel / cluster / TLS / AWS IAM, DogStatsD, OTLP, en-têtes `LIMIT_*`, métadonnées dynamiques, `/json`, port debug, `grpc.health.v1`, `GRPC_UDS`, rechargement à chaud des certificats, etc. La liste exhaustive est `docs/parity.md`.
-
-**D3. Inventaire de parité** *(amendée)*. `docs/parity.md`, dont la section des variables d'environnement est **générée** depuis `src/settings/settings.go` (134 variables). Il couvre aussi les clés YAML, l'API, les noms de métriques, les logs, les traces et l'image. La v1 sort quand chaque ligne est prouvée par un test ou marquée comme divergence justifiée.
-
-**D4. API gRPC.** Uniquement `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (la v2 a été retirée en amont). À reproduire précisément :
-
-- `hits_addend` au niveau requête : 0 vaut 1, **sauf** si un `hits_addend` par descripteur est présent, même à 0 (`utilities.go:102-118`). agentgateway met toujours 0 au niveau requête : le chemin par descripteur est le chemin critique ;
-- `is_negative_hits` (D21) et `limit` envoyée par le client (D23) ;
-- `current_limit.name` rempli ; `limit_remaining = 0` sur `OVER_LIMIT` ; `quota` et `raw_body` jamais remplis ; erreurs renvoyées en `codes.Unknown` avec le texte de l'erreur ;
-- `overall_code` n'est jamais `UNKNOWN` (agentgateway traite tout code ≠ `OK` comme un refus).
-
-**D5. Config invalide** *(amendée)*.
-
-- Au rechargement : `config_load_error` incrémenté, ancienne config conservée.
-- Au démarrage sans config valide : le service ne s'arrête pas, mais **chaque appel renvoie une erreur gRPC** (« no rate limit configuration loaded »), pas `OK`. Le client décide (Envoy : `failure_mode_deny` ; agentgateway : `failClosed` par défaut, soit des 500).
-- Avec `FORCE_START_WITHOUT_INITIAL_CONFIG=false` et xDS injoignable, les serveurs ne démarrent pas (attente du premier événement), comme en amont.
-- `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` évalue « au moins un domaine », pas « config valide ».
-- Clés YAML inconnues rejetées (liste blanche récursive amont, `metadata` exclu), liste étendue à nos ajouts. Le proto xDS ignore silencieusement les champs inconnus.
-
-**D6. Clés Redis legacy identiques octet pour octet.** `CACHE_KEY_PREFIX + domaine + "_" + (clé "_" valeur "_")* + bucketStart`, aligné epoch, avec trois nuances : substitution du motif `share_threshold` à la valeur, début de mois UTC avec `USE_CALENDAR_MONTH_RATE_LIMIT`, valeur vide (`key__`). TTL = durée de l'unité + jitter, pas le temps restant. Pendant une migration, les deux services doivent utiliser le même `EXPIRATION_JITTER_MAX_SECONDS`.
+A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit) (reference: commit `f4e7669`), **100% compatible** and extended: free window durations, new window types, several limits per descriptor, counting modes. Replacing envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway only takes changing the image. The first version is released only at **full parity**.
 
 ---
 
-## B. Nouveaux types de fenêtre (YAML uniquement)
+## A. Scope and compatibility
 
-**D7. Plusieurs limites par descripteur** *(amendée)*. Nouvelle liste `rate_limits:`, exclusive de `rate_limit:`. Dans la liste, `unit` est remplacé par `window`, et le **`name` est obligatoire** (ADR 0001). `shadow_mode`, `quota_mode` et `detailed_metric` restent au niveau du **descripteur** et s'appliquent à toute la liste. `unlimited` est interdit dans la liste : on garde la forme legacy `rate_limit: {unlimited: true}`.
+**D1. Strict superset** *(amended)*. Every behaviour of the reference is reproduced exactly for any input it handles **without panicking**. Its panics (e.g. a client `limit` with `unit: UNKNOWN`, `utilities.go:38`; an invalid environment variable re-read on reload) become proper errors, listed as deliberate divergences in `docs/parity.md`. Additions never change the behaviour of an existing Envoy config.
+
+**D2. Full parity before v1.** Every feature of the reference is included: Memcached, xDS config, `quota_mode`, `share_threshold`, local cache, `REDIS_PERSECOND`, Redis sentinel / cluster / TLS / AWS IAM, DogStatsD, OTLP, `LIMIT_*` headers, dynamic metadata, `/json`, debug port, `grpc.health.v1`, `GRPC_UDS`, certificate hot reload, etc. The exhaustive list is `docs/parity.md`.
+
+**D3. Parity inventory** *(amended)*. `docs/parity.md`, whose environment variable section is **generated** from `src/settings/settings.go` (134 variables). It also covers YAML keys, the API, metric names, logs, traces and the image. v1 ships when every line is proven by a test or marked as a justified divergence.
+
+**D4. gRPC API.** Only `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (v2 was removed upstream). To reproduce precisely:
+
+- request-level `hits_addend`: 0 means 1, **unless** a per-descriptor `hits_addend` is present, even 0 (`utilities.go:102-118`). agentgateway always sends 0 at request level: the per-descriptor path is the critical one;
+- `is_negative_hits` (D21) and the client-sent `limit` (D23);
+- `current_limit.name` filled in; `limit_remaining = 0` on `OVER_LIMIT`; `quota` and `raw_body` never filled in; errors returned as `codes.Unknown` with the error text;
+- `overall_code` is never `UNKNOWN` (agentgateway treats any code other than `OK` as a denial).
+
+**D5. Invalid config** *(amended)*.
+
+- On reload: `config_load_error` incremented, previous config kept.
+- At startup without a valid config: the service does not exit, but **every call returns a gRPC error** ("no rate limit configuration loaded"), not `OK`. The client decides (Envoy: `failure_mode_deny`; agentgateway: `failClosed` by default, i.e. 500s).
+- With `FORCE_START_WITHOUT_INITIAL_CONFIG=false` and xDS unreachable, the servers do not start (waiting for the first event), as upstream.
+- `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` checks "at least one domain", not "valid config".
+- Unknown YAML keys are rejected (upstream's recursive allow-list, `metadata` excluded), with the list extended to our additions. The xDS proto silently ignores unknown fields.
+
+**D6. Legacy Redis keys identical byte for byte.** `CACHE_KEY_PREFIX + domain + "_" + (key "_" value "_")* + bucketStart`, epoch-aligned, with three nuances: the `share_threshold` pattern replaces the value, start of the UTC month with `USE_CALENDAR_MONTH_RATE_LIMIT`, empty value (`key__`). TTL = unit length + jitter, not the remaining time. During a migration, both services must use the same `EXPIRATION_JITTER_MAX_SECONDS`.
+
+---
+
+## B. New window types (YAML only)
+
+**D7. Several limits per descriptor** *(amended)*. New `rate_limits:` list, exclusive with `rate_limit:`. In the list, `unit` is replaced by `window`, and **`name` is required** (ADR 0001). `shadow_mode`, `quota_mode` and `detailed_metric` stay at **descriptor** level and apply to the whole list. `unlimited` is not allowed in the list: the legacy form `rate_limit: {unlimited: true}` is kept.
 
 ```yaml
 - key: user_id
-  overflow: envoy                  # ou strict (D14)
+  overflow: envoy                  # or strict (D14)
   rate_limits:
     - name: five_hour
       requests_per_unit: 500000
@@ -58,149 +58,149 @@ Une réécriture en Rust d'[envoyproxy/ratelimit](https://github.com/envoyproxy/
       window: { type: fixed, duration: 7d, offset: hashed }
 ```
 
-**D8. `fixed`** *(amendée)*. N'importe quelle durée (`90s`, `5h`, `7d`), alignée sur l'epoch par défaut, avec une origine optionnelle : `offset: <durée>` (UTC) ou `offset: hashed` (phase propre à chaque « compte », sans état). C'est ce qui reproduit la limite hebdomadaire de Claude. Détails, règles et formule : ADR 0002. L'option de mois calendaire amont est conservée ; le fuseau horaire IANA est reporté.
+**D8. `fixed`** *(amended)*. Any duration (`90s`, `5h`, `7d`), aligned on the epoch by default, with an optional origin: `offset: <duration>` (UTC) or `offset: hashed` (a phase per "account", stateless). This is what reproduces Claude's weekly limit. Details, rules and formula: ADR 0002. Upstream's calendar month option is kept; IANA time zones are deferred.
 
-**D9. `anchored`** *(amendée)*. Fenêtre de longueur fixe dont l'origine est la première requête. Mode **session** uniquement : le mode `recurring` est supprimé (remplacé par `fixed` + `offset`, ADR 0002).
+**D9. `anchored`** *(amended)*. A fixed-length window whose origin is the first request. **Session** mode only: the `recurring` mode is removed (replaced by `fixed` + `offset`, ADR 0002).
 
-- **Ouverture** : `open_on: check | first_hit`, défaut `check`.
-  - `check` : l'ancre est posée par la première requête **présentée** alors qu'aucune fenêtre n'est ouverte, quels que soient `hits_addend` (0 inclus) et le verdict, **sauf en `strict`, où une requête refusée ne modifie aucun état, ancre comprise**. C'est ce qui place l'ancre au premier message avec agentgateway, qui envoie un check à 0 hit puis les tokens après la réponse.
-  - `first_hit` : l'ancre est posée par la première requête dont les hits sont **effectivement comptés** selon `overflow` (en `envoy`, une requête refusée de taille > limite ouvre donc la fenêtre ; en `strict`, non).
-- Une ancre posée n'est jamais déplacée ni prolongée. Elle est remplacée par la première requête présentée après `ancre + durée`. Un amendement tardif (stream commencé avant la fin, terminé après) est une requête ordinaire sur fenêtre fermée : il ouvre la fenêtre suivante et y est compté, comme ccusage.
-- **`start_rounding`** : optionnel, sans arrondi par défaut, en UTC. L'arrondi s'applique à l'ancre ; la fenêtre finit à `ancre + durée`.
-- **Réponse d'un check qui ouvre** : `OK`, `limit_remaining = limite − hits comptés`, `duration_until_reset = ceil(ancre + durée − now)`, donc moins que la durée complète avec un arrondi.
-- **Fenêtres sans hit** : avec `open_on: check` en `envoy`, une requête refusée par une autre limite (même liste ou autre descripteur) ouvre quand même la fenêtre, avec un budget plein. Une requête qui échoue en amont (agentgateway amende alors 0 token) aussi. Ces fenêtres sont comptées dans `opened_without_hits`. Si c'est indésirable, utiliser `open_on: first_hit`. Le comportement réel de Claude dans ce cas n'est pas documenté.
-- **Script** : ancre et compteur dans la même clé, lecture-décision-écriture en un seul script ; `elapsed` borné à 0 ; fermeture décidée par `now ≥ ancre + durée` dans le script, pas par l'absence de clé ; TTL = durée + marge.
-- **Matrice de tests de référence** (fenêtre fermée, liste `[5h anchored open_on: check, 7d fixed]` ; verdict de la liste / hits / mode → ouvre ? / compte ?) :
+- **Opening**: `open_on: check | first_hit`, default `check`.
+  - `check`: the anchor is set by the first request **presented** while no window is open, whatever `hits_addend` (0 included) and the verdict, **except in `strict`, where a denied request changes no state, anchor included**. This places the anchor at the first message with agentgateway, which sends a 0-hit check and then the tokens after the response.
+  - `first_hit`: the anchor is set by the first request whose hits are **actually counted** under `overflow` (in `envoy`, a denied request larger than the limit therefore opens the window; in `strict`, it does not).
+- A set anchor is never moved or extended. It is replaced by the first request presented after `anchor + duration`. A late amendment (stream started before the end, finished after) is an ordinary request on a closed window: it opens the next window and is counted in it, like ccusage.
+- **`start_rounding`**: optional, no rounding by default, in UTC. Rounding applies to the anchor; the window ends at `anchor + duration`.
+- **Response to a check that opens**: `OK`, `limit_remaining = limit − counted hits`, `duration_until_reset = ceil(anchor + duration − now)`, so less than the full duration with rounding.
+- **Windows without hits**: with `open_on: check` in `envoy`, a request denied by another limit (same list or another descriptor) still opens the window, with a full budget. So does a request that fails upstream (agentgateway then amends 0 tokens). These windows are counted in `opened_without_hits`. If that is unwanted, use `open_on: first_hit`. Claude's actual behaviour in this case is not documented.
+- **Script**: anchor and counter in the same key, read-decide-write in a single script; `elapsed` clamped at 0; closing decided by `now ≥ anchor + duration` in the script, not by the key's absence; TTL = duration + margin.
+- **Reference test matrix** (closed window, list `[5h anchored open_on: check, 7d fixed]`; list verdict / hits / mode → opens? / counts?):
 
-  | Verdict de la liste | Hits | Mode | Ouvre | Compte |
+  | List verdict | Hits | Mode | Opens | Counts |
   |---|---|---|---|---|
-  | hebdo OK | 0 | tous | oui | 0 |
-  | hebdo OK | > 0 | `envoy` | oui | oui |
-  | 5h auto-refus (hits > limite) | > 0 | `strict` | non | non |
-  | hebdo OVER | 0 | `envoy` | oui | 0 |
-  | hebdo OVER | 0 | `strict` | non | 0 |
-  | hebdo OVER | > 0 | `envoy` | oui | oui |
-  | hebdo OVER | > 0 | `strict` | non | non |
-  | hebdo OVER en shadow | > 0 | `strict` | oui | oui |
-  | hebdo remplacée par `replaces` | — | — | comme hebdo OK | |
-  | org OVER sur un autre descripteur | 0 | tous | oui (`opened_without_hits` +1) | 0 |
-  | fenêtre déjà ouverte | — | — | ancre jamais déplacée | selon `overflow` |
+  | weekly OK | 0 | any | yes | 0 |
+  | weekly OK | > 0 | `envoy` | yes | yes |
+  | 5h self-denial (hits > limit) | > 0 | `strict` | no | no |
+  | weekly OVER | 0 | `envoy` | yes | 0 |
+  | weekly OVER | 0 | `strict` | no | 0 |
+  | weekly OVER | > 0 | `envoy` | yes | yes |
+  | weekly OVER | > 0 | `strict` | no | no |
+  | weekly OVER in shadow | > 0 | `strict` | yes | yes |
+  | weekly replaced by `replaces` | — | — | as weekly OK | |
+  | org OVER on another descriptor | 0 | any | yes (`opened_without_hits` +1) | 0 |
+  | window already open | — | — | anchor never moved | per `overflow` |
 
-**D10. `sliding` et `sliding_approx`** *(amendée)*.
+**D10. `sliding` and `sliding_approx`** *(amended)*.
 
-- `sliding` (défaut) : N sous-tranches **sans interpolation**, dans **un hash Redis par (descripteur, limite)** (un script, une clé, un slot ; coût réseau indépendant de N). Ne dépasse jamais la limite ; la capacité revient au plus D/N en retard. `buckets: 12` par défaut (12 divise 60 et 3600), avec une tranche d'au moins 1 s ; la doc recommande 56 ou 84 pour 7 jours.
-- `sliding_approx` : l'approximation de Cloudflare à deux fenêtres. Son chiffre de 0,003 % d'erreur (400 M de requêtes, 270 000 sources) ne se généralise pas aux tokens LLM en rafales ni aux longues durées.
-- En mode `envoy`, un client qui continue d'envoyer au-dessus de la limite peut rester bloqué ; il récupère au plus 2 × D après s'être arrêté. À documenter.
+- `sliding` (default): N sub-buckets **without interpolation**, in **one Redis hash per (descriptor, limit)** (one script, one key, one slot; network cost independent of N). Never exceeds the limit; capacity comes back at most D/N late. `buckets: 12` by default (12 divides 60 and 3600), with a sub-bucket of at least 1 s; the docs recommend 56 or 84 for 7 days.
+- `sliding_approx`: Cloudflare's two-window approximation. Its 0.003% error figure (400M requests, 270,000 sources) does not generalise to bursty LLM tokens or long durations.
+- In `envoy` mode, a client that keeps sending above the limit can stay blocked; it recovers at most 2 × D after it stops. To document.
 
-**D11. `token_bucket`** *(amendée)*.
+**D11. `token_bucket`** *(amended)*.
 
-- GCRA, une seule échéance (TAT) stockée en microsecondes (exacte en double Lua jusqu'en 2255).
-- Débit = `requests_per_unit / duration` ; capacité = `burst` (défaut `requests_per_unit`).
-- En `envoy` : admis si le seau n'est pas vide, débité entièrement, dette autorisée **jusqu'à `max_debt`**, dont le défaut est **`burst`** (au plus un seau de dette, donc au plus `duration` de blocage). `max_debt` s'exprime en jetons ou en durée (`10m` ⇒ `r × 600` jetons) ; `0` et `unlimited` sont acceptés. Les jetons tronqués sont comptés dans la stat `total_capped_hits`.
-- Avertissement au chargement quand `burst / r ≥ 24 h` : `token_bucket` ne convient pas à un budget journalier ou hebdomadaire ; utiliser `fixed` + `offset`.
-- `limit_remaining` = nombre entier de jetons restants, jamais sous 0. Autorisé : `duration_until_reset` = temps jusqu'au seau plein (comme Anthropic). Refusé : temps jusqu'à assez de jetons, au moins 1 s.
+- GCRA, a single deadline (TAT) stored in microseconds (exact in a Lua double until 2255).
+- Rate = `requests_per_unit / duration`; capacity = `burst` (default `requests_per_unit`).
+- In `envoy`: admitted if the bucket is not empty, charged in full, debt allowed **up to `max_debt`**, whose default is **`burst`** (at most one bucket of debt, so at most `duration` of blocking). `max_debt` is given in tokens or as a duration (`10m` ⇒ `r × 600` tokens); `0` and `unlimited` are accepted. Truncated tokens are counted in the `total_capped_hits` stat.
+- Warning at load when `burst / r ≥ 24 h`: `token_bucket` does not suit a daily or weekly budget; use `fixed` + `offset`.
+- `limit_remaining` = whole number of tokens left, never below 0. Allowed: `duration_until_reset` = time until the bucket is full (as Anthropic does). Denied: time until there are enough tokens, at least 1 s.
 
-**D12. `duration_until_reset`** *(amendée)*. Calculé selon le type et arrondi à la seconde **supérieure**, car agentgateway tronque `x-ratelimit-reset` (`remoteratelimit.rs:606-610`). Jamais 0 lors d'un refus. Legacy : reproduire `sec − now % sec`, y compris le 0 possible à la dernière seconde d'un mois calendaire. `fixed` avec offset : `D − (now − φ).rem_euclid(D)`.
+**D12. `duration_until_reset`** *(amended)*. Computed per type and rounded **up** to the second, because agentgateway truncates `x-ratelimit-reset` (`remoteratelimit.rs:606-610`). Never 0 on a denial. Legacy: reproduce `sec − now % sec`, including the possible 0 at the last second of a calendar month. `fixed` with an offset: `D − (now − φ).rem_euclid(D)`.
 
-**D13. Indiquer la durée de fenêtre** *(amendée)*. On renvoie la plus grande unité standard qui divise la durée, plus `unit_multiplier` (5h → HOUR×5). C'est une **extension** : la référence Go ne connaît pas ce champ, agentgateway non plus (proto aplati, champ ignoré). Les en-têtes par unité sont calculés sur l'expansion **par limite**, pas sur les statuts réduits ; pour une config legacy la sortie reste inchangée (`RateLimit-Limit-Hours`), et le suffixe `5Hours` n'apparaît que si le multiplicateur ≠ 1.
-
----
-
-## C. Sémantique du comptage
-
-**D14. Mode de comptage par descripteur** *(amendée)* : `overflow: envoy | strict`.
-
-- `envoy` (défaut, pour `rate_limit:` et `rate_limits:`) : tout est compté, y compris les requêtes refusées. C'est le seul mode qui ne perd jamais les amendements de tokens d'agentgateway, envoyés après la réponse sans lecture du résultat.
-- `strict` : tout-ou-rien sur la liste. **Un descripteur dont la liste est épuisée n'est pas compté**, et une requête refusée ne modifie aucun état (ancre comprise, D9).
-- Requête à 0 hit : `envoy` utilise `>` comme la référence, `strict` utilise `>=`.
-- À documenter : en `strict`, un amendement agentgateway refusé est perdu sans signal ; avec une expression `cost`, un amendement supérieur aux jetons restants est refusé et le seau n'est pas touché, donc `strict` + `cost` ne limite presque rien.
-- `strict` × shadow : le verdict effectif est `OK`, donc la liste est comptée (la référence compte puis masque).
-
-**D15. Plusieurs descripteurs dans une requête** *(amendée)*. Indépendants, comme dans la référence. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` est reproduit exactement pour le legacy, selon sa table de vérité réelle (`fixed_cache_impl.go:65-93`) : une clé over-limit dans le cache local ⇒ aucune clé incrémentée (mais `INCRBY 0` + `EXPIRE` créent des clés fantômes) ; sinon seules les clés **qui vont dépasser** sont incrémentées et les autres reçoivent 0. Redis uniquement. Avec `REDIS_PERSECOND`, une liste qui contient une limite à la seconde va en entier vers un seul client (divergence documentée).
-
-**D16. `replaces`** *(amendée)*. Placé sur chaque limite d'une liste, avec la sémantique exacte de la référence : deux passes sur toute la requête, non transitif ; les limites remplacées ou `unlimited` remplacent quand même ; un cycle retire les deux côtés ; une limite sans nom est irremplaçable ; une limite `unlimited` « remplacée » reste `OK` avec `limit_remaining = MaxUint32`. Aucune unicité des noms entre descripteurs (groupes de remplacement) ; deux noms identiques dans une liste, ou une limite qui remplace sa voisine de liste, sont des erreurs. Le filtrage se fait **avant** `strict` ; si toutes les limites d'un descripteur sont remplacées, on renvoie `OK` sans `current_limit`.
-
-**D17. Fonctionnalités de la référence sur les nouvelles fenêtres** *(amendée)*.
-
-- **Shadow** : le verdict utilisé pour l'ouverture et le comptage est le verdict **post-shadow**. Le shadow du descripteur et le shadow **global** (`SHADOW_MODE`) sont transmis au script.
-- **`quota_mode`** : reproduit tel quel (`ratelimit.go:233-355`) : groupes par `backend_name` / `model_name_override`, `OVER_LIMIT` seulement si tous les groupes sont épuisés, `passedBackends` **dédupliqué par groupe** et filtré sur les groupes non épuisés. Avec plusieurs limites, un descripteur est épuisé si **au moins une** de ses limites l'est.
-- **Statut représentatif d'un descripteur à plusieurs limites** (ordre total) : s'il existe des statuts `OVER_LIMIT`, celui au **plus grand `duration_until_reset`** ; sinon celui au **plus petit `limit_remaining`** ; à égalité, le premier de la liste. `current_limit`, `limit_remaining` et `duration_until_reset` viennent de ce seul statut ; `statuses[i]` reste 1:1 avec les descripteurs. La réduction se fait dans la couche cache ; le shadow du descripteur s'applique après et ne change que le code.
-- Un descripteur dont toutes les limites sont remplacées sort du groupe quota (sauf `QUOTA_MODE` global) mais figure dans `passedBackends` s'il porte une clé de groupe.
-- **`share_threshold`** : le motif remplace la valeur dans la partie `{…}` des clés (ADR 0001) et dans l'entrée du hachage d'`offset: hashed` (ADR 0002). **`detailed_metric`**, **`value_to_metric`** : statistiques seulement, tous types.
-
-**D18. Cache local.** Legacy et `fixed` : comportement exact de la référence (entrée posée avant le test shadow, TTL = durée complète de l'unité, une limite en shadow n'est plus comptée quand le cache est actif, `over_limit_with_local_cache` compte `hitsAddend`). Nouveaux types : une entrée vit jusqu'au premier moment où la décision peut changer ; mise en cache seulement s'il reste moins d'une unité ; un remboursement efface l'entrée locale (divergence volontaire, nouveaux types uniquement) ; pas de cache pour les limites en shadow.
-
-**D19. `quota_mode` et blocage durable.** Avertissement au chargement (log et gauge) quand `quota_mode` est combiné à `sliding`, ou à `token_bucket` avec `max_debt: unlimited`, en mode `envoy` : un groupe peut rester bloqué tant que le trafic dépasse le débit.
-
-**D20. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` sur les nouveaux types** *(amendée)* : **sans effet**. Pour ne pas compter les requêtes refusées, utiliser `overflow: strict`.
-
-**D21. Remboursements (`is_negative_hits`).** Propriétés de la référence pour tous les types : réponse toujours `OK`, `limit_remaining = max(0, limite − compteur)`, stat `total_negative_hits`, TTL remis à la durée complète, aucun effet sur le cache local en legacy ; Memcached décrémente de façon asynchrone après la réponse. Par type : `fixed` décrémente la fenêtre courante (plancher 0) ; `anchored` décrémente sans jamais ouvrir ni fermer la fenêtre ; `sliding` décrémente de la sous-tranche la plus récente vers la plus ancienne ; `sliding_approx`, fenêtre courante puis précédente ; `token_bucket` recule l'échéance sans remonter avant `now`.
-
-**D22. Stats `near_limit` et `over_limit`.** Arithmétique legacy exacte : `nearLimitThreshold = floor(float64(float32(limit) × float32(ratio)))`, répartition des `hitsAddend` entre `near_limit` et `over_limit`, `within_limit` seulement si `OK`. Usage avant et après la requête, par type : `token_bucket`, capacité − restant (peut dépasser la capacité en dette) ; `sliding`, somme brute des sous-tranches ; `anchored`, 0 avant l'ouverture.
-
-**D23. `limit` envoyée par le client** *(amendée)*. Si le domaine est connu : **une** fenêtre fixe de `unit × unit_multiplier`, qui **remplace toutes** les limites configurées du descripteur ; pas de `shadow_mode`, `unlimited` ni `replaces` hérités, shadow global appliqué ; mode de comptage de la règle correspondante s'il y en a une, sinon `envoy` ; clé legacy si le multiplicateur vaut 1, clé incluant la durée sinon. La lecture, le renvoi et le rejet du multiplicateur 0 sont des **extensions** (la référence ignore le champ), de même que la recherche de règle pour le mode.
+**D13. Reporting the window duration** *(amended)*. The largest standard unit that divides the duration is returned, plus `unit_multiplier` (5h → HOUR×5). This is an **extension**: the Go reference does not know this field, nor does agentgateway (flattened proto, field ignored). Per-unit headers are computed on the **per-limit** expansion, not on the reduced statuses; for a legacy config the output is unchanged (`RateLimit-Limit-Hours`), and the `5Hours` suffix only appears when the multiplier ≠ 1.
 
 ---
 
-## D. Stockage, clés et horloge
+## C. Counting semantics
 
-**D24. Backends.** Redis (scripts Lua pour les nouveaux types), Memcached (legacy et `fixed`, y compris offset ; `anchored`, `sliding`, `token_bucket` et `strict` y sont des erreurs de config) et mémoire. Memcached n'est pas atomique (décision sur `GET`, incrément asynchrone) : les tests le tolèrent. Clé Memcached ≤ 250 octets, sans espace ni caractère de contrôle ; sinon erreur journalisée et réponse `OK`, comme en amont.
+**D14. Counting mode per descriptor** *(amended)*: `overflow: envoy | strict`.
 
-**D25. Clés des nouveaux types** *(amendée)* : ADR 0001.
+- `envoy` (default, for `rate_limit:` and `rate_limits:`): everything is counted, including denied requests. It is the only mode that never loses agentgateway's token amendments, sent after the response without reading the result.
+- `strict`: all-or-nothing over the list. **A descriptor whose list is exhausted is not counted**, and a denied request changes no state (anchor included, D9).
+- 0-hit request: `envoy` uses `>` like the reference, `strict` uses `>=`.
+- To document: in `strict`, a denied agentgateway amendment is lost without a signal; with a `cost` expression, an amendment larger than the remaining tokens is denied and the bucket is not touched, so `strict` + `cost` limits almost nothing.
+- `strict` × shadow: the effective verdict is `OK`, so the list is counted (the reference counts, then masks).
 
-**D26. Identité d'une limite** *(amendée)* : type + durée + arrondi + mode d'ouverture + `buckets` + `offset` + **nom** (ADR 0001). Changer l'un d'eux repart de zéro. Changer `requests_per_unit`, `burst` ou `max_debt` conserve les compteurs ; un plafond abaissé sous le compteur bloque jusqu'à la fin de la fenêtre, les jetons au-dessus d'un `burst` abaissé sont plafonnés à la lecture. Pendant un déploiement progressif, la limite effective peut brièvement doubler (documenté).
+**D15. Several descriptors in one request** *(amended)*. Independent, as in the reference. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` is reproduced exactly for legacy, following its actual truth table (`fixed_cache_impl.go:65-93`): a key over the limit in the local cache ⇒ no key incremented (but `INCRBY 0` + `EXPIRE` create ghost keys); otherwise only the keys **about to go over** are incremented and the others get 0. Redis only. With `REDIS_PERSECOND`, a list that contains a per-second limit goes entirely to a single client (documented divergence).
 
-**D27. Horloge.** Un seul `now` par requête, lu sur une horloge injectable et passé en ARGV aux scripts ; jamais `TIME` de Redis. Les scripts bornent à 0 un temps écoulé négatif. Exception à reproduire pour le legacy : la référence relit l'horloge pour les en-têtes `LIMIT_*` (`ratelimit.go:594, 615`).
+**D16. `replaces`** *(amended)*. Allowed on each entry of a list, with the reference's exact semantics: two passes over the whole request, not transitive; replaced or `unlimited` limits still replace others; a cycle removes both sides; an unnamed limit cannot be replaced; an `unlimited` limit that is "replaced" stays `OK` with `limit_remaining = MaxUint32`. Names need not be unique across descriptors (replacement groups); two identical names in one list, or a limit replacing a sibling in its list, are errors. Filtering happens **before** `strict`; if every limit of a descriptor is replaced, `OK` is returned without `current_limit`.
 
----
+**D17. Reference features on the new windows** *(amended)*.
 
-## E. Configuration et observabilité
+- **Shadow**: the verdict used for opening and counting is the **post-shadow** verdict. The descriptor's shadow and the **global** shadow (`SHADOW_MODE`) are passed to the script.
+- **`quota_mode`**: reproduced as is (`ratelimit.go:233-355`): groups by `backend_name` / `model_name_override`, `OVER_LIMIT` only when every group is exhausted, `passedBackends` **deduplicated per group** and filtered to the groups not exhausted. With several limits, a descriptor is exhausted if **at least one** of its limits is.
+- **Representative status of a descriptor with several limits** (total order): if there are `OVER_LIMIT` statuses, the one with the **largest `duration_until_reset`**; otherwise the one with the **smallest `limit_remaining`**; on a tie, the first in the list. `current_limit`, `limit_remaining` and `duration_until_reset` come from that single status; `statuses[i]` stays 1:1 with the descriptors. The reduction happens in the cache layer; the descriptor's shadow applies afterwards and only changes the code.
+- A descriptor whose limits are all replaced leaves the quota group (except under global `QUOTA_MODE`) but appears in `passedBackends` if it carries a group key.
+- **`share_threshold`**: the pattern replaces the value in the `{…}` part of keys (ADR 0001) and in the input of the `offset: hashed` hash (ADR 0002). **`detailed_metric`**, **`value_to_metric`**: stats only, every type.
 
-**D28. Rechargement et xDS** *(amendée)*. Rechargement depuis `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/RUNTIME_APPDIRECTORY` avec la même logique (`SymlinkRefresher` si `RUNTIME_WATCH_ROOT`, sinon `DirectoryRefresher` ; `RUNTIME_IGNOREDOTFILES` ; scope de stats `runtime`). xDS SotW supporté pour ce que le proto amont porte, ce qui exclut déjà `value_to_metric` et `share_threshold` en amont. Nos ajouts sont réservés au YAML.
+**D18. Local cache.** Legacy and `fixed`: the reference's exact behaviour (entry set before the shadow check, TTL = full unit length, a limit in shadow mode is no longer counted when the cache is enabled, `over_limit_with_local_cache` counts `hitsAddend`). New types: an entry lives until the earliest moment the decision can change; cached only when less than one unit remains; a refund clears the local entry (deliberate divergence, new types only); no caching for limits in shadow mode.
 
-**D29. Métriques** *(amendée)*.
+**D19. `quota_mode` and lasting lockout.** Warning at load (log and gauge) when `quota_mode` is combined with `sliding`, or with `token_bucket` with `max_debt: unlimited`, in `envoy` mode: a group can stay blocked as long as traffic exceeds the rate.
 
-- Mêmes noms que la référence. Sinks exclusifs, erreur fatale si deux sont actifs : statsd **TCP** (`USE_STATSD=true` par défaut, donc `USE_PROMETHEUS=true` seul est fatal), DogStatsD avec mogrifiers, Prometheus natif ; `DISABLE_STATS` prime ; sinon log.
-- Prometheus : réimplémentation du mapper statsd_exporter pour le sous-ensemble utilisé (globs, regex, `$n`, `match_metric_type`, `drop`, types d'observateurs et buckets, `defaults`), en respectant l'ordre réel d'évaluation (tous les globs, puis les regex dans l'ordre) et l'échappement des noms non mappés. Une clé de mapper non supportée est refusée au démarrage (divergence documentée). Fichier de mapper absent : comportement amont reproduit.
-- Plusieurs limites : identifiant `~nom` accolé au **dernier segment** (`user_alice~weekly`), émis **même pour une liste à une seule limite**. Le mapper par défaut livré ajoute un label `limit=` et mappe les nouvelles stats `total_capped_hits` (D11) et `opened_without_hits` (D9).
-- Stats Go (`go.*`, `/stats` expvar, pprof) : remplacées par les stats du processus Rust (divergence documentée).
+**D20. `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` on the new types** *(amended)*: **no effect**. To avoid counting denied requests, use `overflow: strict`.
 
----
+**D21. Refunds (`is_negative_hits`).** Reference properties for every type: always answers `OK`, `limit_remaining = max(0, limit − counter)`, `total_negative_hits` stat, TTL reset to the full duration, no effect on the local cache for legacy; Memcached decrements asynchronously after the response. Per type: `fixed` decrements the current window (floor 0); `anchored` decrements without ever opening or closing the window; `sliding` decrements from the most recent sub-bucket to the oldest; `sliding_approx`, current window then previous; `token_bucket` moves the deadline back, never before `now`.
 
-## F. Code, tests et livraison
+**D22. `near_limit` and `over_limit` stats.** Exact legacy arithmetic: `nearLimitThreshold = floor(float64(float32(limit) × float32(ratio)))`, split of `hitsAddend` between `near_limit` and `over_limit`, `within_limit` only when `OK`. Usage before and after the request, per type: `token_bucket`, capacity − remaining (can exceed capacity while in debt); `sliding`, raw sum of the sub-buckets; `anchored`, 0 before opening.
 
-**D30. Stack.** tokio, tonic + prost, axum, serde, fred. TLS via `rustls`, pour un binaire sans OpenSSL.
-
-**D31. Organisation du code** *(amendée)*. Workspace de deux crates : `ratelimit-proto` (protos aplatis, compilés avec `protox`, sans `protoc`) et `ratelimit`. Couture par opérations : `Store::apply(lot d'ops {clé, algo, limite, hits, now})`. Chaque algorithme des nouveaux types est une fonction pure `step(état, op) → (état, résultat)` en Rust (backend mémoire), réécrite en Lua pour Redis. **Le chemin legacy reste un pipeline `INCRBY` + `EXPIRE` avec décision côté service**, pas un script, pour que les commandes observées dans Redis soient identiques. La couche de décision (seuils, shadow, quota, réduction des statuts, réponse) est partagée.
-
-**D32. Tests** *(amendée)*.
-
-1. **Comparaison exacte en CI à chaque PR** avec un programme Go qui importe la référence à un commit épinglé, avec une `TimeSource` injectable et un jitter seedé ou nul ; réponses, en-têtes, clés, valeurs, TTL et séquence de commandes Redis (`MONITOR`) comparés.
-2. **Test nocturne** contre l'image officielle épinglée par digest, avec `EXPIRATION_JITTER_MAX_SECONDS=0` et une tolérance d'environ 1 s.
-3. Scripts `integration-test/*.sh` amont rejoués contre notre image : test de fumée, pas de parité.
-4. **Tests de propriétés Rust ↔ Lua** sur un vrai Redis **en mode cluster**, avec un fuzz des séquences concurrentes `check(0)` / `amend(n)` / `refund(n)`.
-5. Test différentiel du mapper contre un vrai `statsd_exporter`, et du flux statsd brut contre la référence.
-6. TDD avec l'horloge injectable pour les nouveaux types, incluant la matrice d'ouverture de D9.
-
-**D33. Image** *(amendée)*. Binaire exactement à `/bin/ratelimit`, distroless sans shell, amd64 + arm64 (`cargo-zigbuild`). UID quelconque (Envoy Gateway force 65534), système de fichiers en lecture seule, aucune capability. Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current`. Écoute dual-stack explicite (`[::]` avec `IPV6_V6ONLY=0`) et `SO_REUSEPORT` sur les trois ports. `/healthcheck` servi seulement après la connexion Redis initiale, comme en amont. Toutes les variables injectées par Envoy Gateway sont supportées, sauf `GRPC_SERVER_TLS_CA_CERT`, **ignorée comme en amont** (aucun code ne la lit). Image signée avec cosign, avec SBOM et provenance ; test CI sur `kind` avec un Envoy Gateway réel dont on ne change que l'image. Pas de chart Helm en v1.
-
-**D34. Licence.** Apache-2.0, fichier NOTICE qui crédite envoy ratelimit et l'API d'Envoy, en-têtes des protos vendorisés conservés, licences des dépendances générées avec `cargo-about`.
+**D23. Client-sent `limit`** *(amended)*. If the domain is known: **one** fixed window of `unit × unit_multiplier`, which **replaces all** configured limits of the descriptor; no inherited `shadow_mode`, `unlimited` or `replaces`, global shadow applied; counting mode of the matching rule if there is one, otherwise `envoy`; legacy key if the multiplier is 1, a key including the duration otherwise. Reading, echoing and rejecting a multiplier of 0 are **extensions** (the reference ignores the field), as is looking up the rule for the mode.
 
 ---
 
-## Ordre de construction
+## D. Storage, keys and clock
 
-1. Protos, serveur gRPC, chargeur YAML, Redis legacy, **harnais de comparaison Go** (D32.1).
-2. Cache local, `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, en-têtes, métadonnées dynamiques, groupes `quota_mode`.
-3. Sinks de statistiques et mapper Prometheus.
-4. Client xDS, image, test Envoy Gateway.
+**D24. Backends.** Redis (Lua scripts for the new types), Memcached (legacy and `fixed`, offset included; `anchored`, `sliding`, `token_bucket` and `strict` are config errors there) and in-memory. Memcached is not atomic (decision on `GET`, asynchronous increment): tests tolerate it. Memcached keys ≤ 250 bytes, without spaces or control characters; otherwise the error is logged and `OK` returned, as upstream.
+
+**D25. Keys of the new types** *(amended)*: ADR 0001.
+
+**D26. Identity of a limit** *(amended)*: type + duration + rounding + opening mode + `buckets` + `offset` + **name** (ADR 0001). Changing any of them starts from zero. Changing `requests_per_unit`, `burst` or `max_debt` keeps the counters; a cap lowered below the counter blocks until the end of the window, tokens above a lowered `burst` are capped on read. During a rolling deployment, the effective limit can briefly double (documented).
+
+**D27. Clock.** A single `now` per request, read from an injectable clock and passed as ARGV to scripts; never Redis `TIME`. Scripts clamp a negative elapsed time at 0. Exception to reproduce for legacy: the reference re-reads the clock for the `LIMIT_*` headers (`ratelimit.go:594, 615`).
+
+---
+
+## E. Configuration and observability
+
+**D28. Reload and xDS** *(amended)*. Reload from `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/RUNTIME_APPDIRECTORY` with the same logic (`SymlinkRefresher` if `RUNTIME_WATCH_ROOT`, otherwise `DirectoryRefresher`; `RUNTIME_IGNOREDOTFILES`; `runtime` stats scope). xDS SotW is supported for what the upstream proto carries, which already excludes `value_to_metric` and `share_threshold` upstream. Our additions are YAML only.
+
+**D29. Metrics** *(amended)*.
+
+- Same names as the reference. Exclusive sinks, fatal error if two are enabled: statsd over **TCP** (`USE_STATSD=true` by default, so `USE_PROMETHEUS=true` alone is fatal), DogStatsD with mogrifiers, native Prometheus; `DISABLE_STATS` wins; otherwise log.
+- Prometheus: reimplementation of the statsd_exporter mapper for the subset in use (globs, regexes, `$n`, `match_metric_type`, `drop`, observer types and buckets, `defaults`), following the actual evaluation order (all globs, then regexes in order) and the escaping of unmapped names. An unsupported mapper key is rejected at startup (documented divergence). Missing mapper file: upstream behaviour reproduced.
+- Several limits: a `~name` identifier appended to the **last segment** (`user_alice~weekly`), emitted **even for a single-limit list**. The shipped default mapper adds a `limit=` label and maps the new `total_capped_hits` (D11) and `opened_without_hits` (D9) stats.
+- Go stats (`go.*`, `/stats` expvar, pprof): replaced by the Rust process's stats (documented divergence).
+
+---
+
+## F. Code, tests and delivery
+
+**D30. Stack.** tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL.
+
+**D31. Code layout** *(amended)*. A workspace of two crates: `ratelimit-proto` (flattened protos, compiled with `protox`, no `protoc`) and `ratelimit`. Seam by operations: `Store::apply(batch of ops {key, algo, limit, hits, now})`. Each algorithm of the new types is a pure function `step(state, op) → (state, result)` in Rust (in-memory backend), rewritten in Lua for Redis. **The legacy path stays an `INCRBY` + `EXPIRE` pipeline with the decision on the service side**, not a script, so the commands seen by Redis are identical. The decision layer (thresholds, shadow, quota, status reduction, response) is shared.
+
+**D32. Tests** *(amended)*.
+
+1. **Exact comparison in CI on every PR** with a Go program that imports the reference at a pinned commit, with an injectable `TimeSource` and a seeded or zero jitter; responses, headers, keys, values, TTLs and the sequence of Redis commands (`MONITOR`) compared.
+2. **Nightly test** against the official image pinned by digest, with `EXPIRATION_JITTER_MAX_SECONDS=0` and a tolerance of about 1 s.
+3. Upstream `integration-test/*.sh` scripts replayed against our image: a smoke test, not parity.
+4. **Rust ↔ Lua property tests** on a real Redis **in cluster mode**, fuzzing concurrent `check(0)` / `amend(n)` / `refund(n)` sequences.
+5. Differential test of the mapper against a real `statsd_exporter`, and of the raw statsd stream against the reference.
+6. TDD with the injectable clock for the new types, including the D9 opening matrix.
+
+**D33. Image** *(amended)*. Binary exactly at `/bin/ratelimit`, distroless without a shell, amd64 + arm64 (`cargo-zigbuild`). Any UID (Envoy Gateway forces 65534), read-only file system, no capabilities. Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current`. Explicit dual-stack listening (`[::]` with `IPV6_V6ONLY=0`) and `SO_REUSEPORT` on all three ports. `/healthcheck` served only after the initial Redis connection, as upstream. Every variable injected by Envoy Gateway is supported, except `GRPC_SERVER_TLS_CA_CERT`, **ignored as upstream** (no code reads it). Image signed with cosign, with SBOM and provenance; CI test on `kind` with a real Envoy Gateway where only the image is changed. No Helm chart in v1.
+
+**D34. License.** Apache-2.0, a NOTICE file crediting envoy ratelimit and the Envoy API, vendored proto headers kept, dependency licenses generated with `cargo-about`.
+
+---
+
+## Build order
+
+1. Protos, gRPC server, YAML loader, legacy Redis, **Go comparison harness** (D32.1).
+2. Local cache, `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, headers, dynamic metadata, `quota_mode` groups.
+3. Stats sinks and Prometheus mapper.
+4. xDS client, image, Envoy Gateway test.
 5. Memcached.
-6. Nouveaux types, uniquement via `rate_limits:` : `fixed` avec `offset`, `anchored`, `token_bucket`, `sliding`.
+6. New types, only through `rate_limits:`: `fixed` with `offset`, `anchored`, `token_bucket`, `sliding`.
 
-## Risques principaux
+## Main risks
 
-1. Parité octet pour octet du chemin legacy Redis (séquence de commandes, clés fantômes, `float32`, horloge relue pour les en-têtes).
-2. Groupes `quota_mode` et métadonnées dynamiques (sémantique récente, prototext Go non reproductible).
-3. Scripts Lua des nouveaux types sous Redis Cluster.
-4. Mapper statsd_exporter et format gostats.
-5. Client xDS SotW et déploiement Envoy Gateway.
+1. Byte-for-byte parity of the legacy Redis path (command sequence, ghost keys, `float32`, clock re-read for headers).
+2. `quota_mode` groups and dynamic metadata (recent semantics, Go prototext not reproducible).
+3. Lua scripts of the new types under Redis Cluster.
+4. statsd_exporter mapper and gostats format.
+5. xDS SotW client and Envoy Gateway deployment.

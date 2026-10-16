@@ -1,14 +1,14 @@
-# Inventaire de parité avec envoy ratelimit
+# Parity inventory with envoy ratelimit
 
-Référence : `envoyproxy/ratelimit` au commit `f4e7669` (2026-10-06). Règle (D3) : la première version ne sort que lorsque **chaque ligne** est `✅` avec un test qui la prouve, ou `≠` (divergence volontaire, justifiée). Les divergences volontaires sont listées en fin de document.
+Reference: `envoyproxy/ratelimit` at commit `f4e7669` (2026-10-06). Rule (D3): the first version ships only when **every line** is `✅` with a test proving it, or `≠` (deliberate, justified divergence). Deliberate divergences are listed at the end.
 
-Légende des états : `⬜` à faire · `🚧` en cours · `✅` fait et prouvé · `≠` divergence volontaire · `—` ignoré comme en amont.
+Status legend: `⬜` to do · `🚧` in progress · `✅` done and proven · `≠` deliberate divergence · `—` ignored, as upstream.
 
-La section 1 est **générée** depuis `src/settings/settings.go` (134 variables) ; la régénérer à chaque montée de version de la référence.
+Section 1 is **generated** from `src/settings/settings.go` (134 variables); regenerate it whenever the reference is upgraded.
 
-## 1. Variables d'environnement
+## 1. Environment variables
 
-| Variable | Défaut amont | État | Test |
+| Variable | Upstream default | Status | Test |
 |---|---|---|---|
 | `HOST` | `0.0.0.0` | ⬜ | |
 | `PORT` | `8080` | ⬜ | |
@@ -144,93 +144,96 @@ La section 1 est **générée** depuis `src/settings/settings.go` (134 variables
 | `TRACING_SERVICE_INSTANCE_ID` | — | ⬜ | |
 | `TRACING_EXPORTER_PROTOCOL` | `http` | ⬜ | |
 | `TRACING_SAMPLING_RATE` | `1` | ⬜ | |
-| `GRPC_SERVER_TLS_CA_CERT` | (injectée par Envoy Gateway, lue par aucun code amont) | — ignorée, comme en amont | |
-| `OTEL_EXPORTER_OTLP_*` | (lues par le SDK OpenTelemetry) | ⬜ | |
+| `GRPC_SERVER_TLS_CA_CERT` | (injected by Envoy Gateway, read by no upstream code) | — ignored, as upstream | |
+| `OTEL_EXPORTER_OTLP_*` | (read by the OpenTelemetry SDK) | ⬜ | |
 
-## 2. Configuration YAML
+## 2. YAML configuration
 
-| Élément | État | Test |
+| Item | Status | Test |
 |---|---|---|
-| Clés reconnues : `domain`, `key`, `value`, `descriptors`, `rate_limit`, `unit`, `requests_per_unit`, `unlimited`, `shadow_mode`, `quota_mode`, `name`, `replaces`, `detailed_metric`, `value_to_metric`, `share_threshold`, `metadata` | ⬜ | |
-| Clé inconnue ⇒ erreur de config (liste blanche récursive, `metadata` exclu) | ⬜ | |
-| Unités `second` … `year` (insensibles à la casse), mois = 30 j, année = 365 j | ⬜ | |
-| `unlimited` + `unit` ⇒ erreur ; `requests_per_unit: 0` accepté | ⬜ | |
-| `replaces` : nom vide ou auto-remplacement ⇒ erreur ; aucune unicité des noms | ⬜ | |
-| Matching : `clé_valeur` exacte, puis wildcard final **et médian**, puis clé seule | ⬜ | |
-| `share_threshold` (motif dans la clé Redis et la clé de stats) | ⬜ | |
-| `detailed_metric`, `value_to_metric` (clé de stats enrichie) | ⬜ | |
-| Domaine dupliqué ⇒ erreur, sauf `MERGE_DOMAIN_CONFIG` ; clé composée dupliquée ⇒ erreur | ⬜ | |
-| Rechargement : erreur ⇒ `config_load_error` + ancienne config conservée | ⬜ | |
-| Démarrage sans config valide ⇒ erreur gRPC à chaque appel (pas d'arrêt) | ⬜ | |
-| Fournisseur fichier : goruntime, `SymlinkRefresher` / `DirectoryRefresher`, scope `runtime.*` | ⬜ | |
-| Fournisseur xDS SotW (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
+| Recognised keys: `domain`, `key`, `value`, `descriptors`, `rate_limit`, `unit`, `requests_per_unit`, `unlimited`, `shadow_mode`, `quota_mode`, `name`, `replaces`, `detailed_metric`, `value_to_metric`, `share_threshold`, `metadata` | ⬜ | |
+| Unknown key ⇒ config error (recursive allow-list, `metadata` excluded) | ⬜ | |
+| Units `second` … `year` (case-insensitive), month = 30 d, year = 365 d | ⬜ | |
+| `unlimited` + `unit` ⇒ error; `requests_per_unit: 0` accepted | ⬜ | |
+| `replaces`: empty name or self-replacement ⇒ error; names need not be unique | ⬜ | |
+| Matching: exact `key_value`, then trailing **and middle** wildcards, then key only | ⬜ | |
+| `share_threshold` (pattern in the Redis key and the stats key) | ⬜ | |
+| `detailed_metric`, `value_to_metric` (enriched stats key) | ⬜ | |
+| Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ⬜ | |
+| Reload: error ⇒ `config_load_error` + previous config kept | ⬜ | |
+| Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
+| File provider: goruntime, `SymlinkRefresher` / `DirectoryRefresher`, `runtime.*` scope | ⬜ | |
+| xDS SotW provider (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
 
-## 3. API gRPC et HTTP
+## 3. gRPC and HTTP API
 
-| Élément | État | Test |
+| Item | Status | Test |
 |---|---|---|
-| `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (v2 absente) | ⬜ | |
-| `hits_addend` requête (0 ⇒ 1 sauf addend par descripteur) et par descripteur (0 = vérifier) | ⬜ | |
-| `is_negative_hits` : plancher 0, toujours `OK`, TTL remis à la durée complète | ⬜ | |
-| `limit` envoyée par le client : remplace la config, sans shadow / `replaces` / `unlimited` | ⬜ | |
-| Champs de réponse : `overall_code`, `statuses[]`, `current_limit` (avec `name`), `limit_remaining`, `duration_until_reset` | ⬜ | |
-| Domaine vide ou liste vide ⇒ erreur ; domaine inconnu ⇒ `OK` + `domain_not_found` | ⬜ | |
-| En-têtes `LIMIT_*` réponse, par unité, et requête | ⬜ | |
-| Métadonnées dynamiques (`RESPONSE_DYNAMIC_METADATA`) : `domain`, `descriptors`, `hitsAddend`, `metadata` fusionné | ⬜ | |
-| `quota_mode` : groupes `backend_name` / `model_name_override`, `OVER_LIMIT` si tous épuisés, `passedBackends` par groupe | ⬜ | |
-| `replaces` : deux passes, non transitif | ⬜ | |
-| Shadow mode par règle et global (`global_shadow_mode`) | ⬜ | |
-| `POST /json` : protojson, 200 / 429 / 400 / 500 | ⬜ | |
-| `/healthcheck` : 500 sans corps si KO ; SIGTERM ⇒ unhealthy + arrêt gracieux | ⬜ | |
+| `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (no v2) | ⬜ | |
+| Request `hits_addend` (0 ⇒ 1 unless a per-descriptor addend) and per-descriptor (0 = check only) | ⬜ | |
+| `is_negative_hits`: floor 0, always `OK`, TTL reset to the full duration | ⬜ | |
+| Client-sent `limit`: replaces the config, without shadow / `replaces` / `unlimited` | ⬜ | |
+| Response fields: `overall_code`, `statuses[]`, `current_limit` (with `name`), `limit_remaining`, `duration_until_reset` | ⬜ | |
+| Empty domain or empty list ⇒ error; unknown domain ⇒ `OK` + `domain_not_found` | ⬜ | |
+| `LIMIT_*` headers: response, per unit, and request | ⬜ | |
+| Dynamic metadata (`RESPONSE_DYNAMIC_METADATA`): `domain`, `descriptors`, `hitsAddend`, merged `metadata` | ⬜ | |
+| `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ⬜ | |
+| `replaces`: two passes, not transitive | ⬜ | |
+| Per-rule and global shadow mode (`global_shadow_mode`) | ⬜ | |
+| `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
+| `/healthcheck`: 500 with no body when unhealthy; SIGTERM ⇒ unhealthy + graceful shutdown | ⬜ | |
 | `grpc.health.v1`, service `ratelimit` | ⬜ | |
-| Port debug : `/`, `/rlconfig` (format `Dump()`), `/stats`, `/debug/pprof/*` | ⬜ | |
-| `GRPC_UDS`, âge max des connexions, mTLS client + SAN, rechargement à chaud du certificat serveur | ⬜ | |
+| Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
+| `GRPC_UDS`, max connection age, client mTLS + SAN, server certificate hot reload | ⬜ | |
 
-## 4. Algorithme et stockage
+## 4. Algorithm and storage
 
-| Élément | État | Test |
+| Item | Status | Test |
 |---|---|---|
-| Clé `prefix + domaine_clé_valeur_…_bucketStart`, alignée epoch ; mois calendaire UTC | ⬜ | |
-| Redis : pipeline `INCRBY` + `EXPIRE (unité + jitter)` | ⬜ | |
-| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` : pipeline `GET` puis `INCRBY`, voisines à 0, clés fantômes | ⬜ | |
-| Cache local des clés over-limit (posé avant le test shadow, TTL = unité) | ⬜ | |
-| Seuil `near_limit` en `float32` ; répartition near / over des `hitsAddend` | ⬜ | |
-| `REDIS_PERSECOND` (routage des clés `second`) | ⬜ | |
-| Redis single / sentinel / cluster, TLS, AUTH (fichier), AWS IAM, retry de démarrage | ⬜ | |
-| Memcached : `GET` puis incréments asynchrones, `add` sur absence, SRV, TLS, expiration absolue > 30 j, clé ≤ 250 o | ⬜ | |
+| Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | ⬜ | |
+| Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | ⬜ | |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ⬜ | |
+| Local cache of over-limit keys (set before the shadow check, TTL = unit) | ⬜ | |
+| `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ⬜ | |
+| `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
+| Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |
+| Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
 
-## 5. Métriques, logs, traces
+## 5. Metrics, logs, traces
 
-| Élément | État | Test |
+| Item | Status | Test |
 |---|---|---|
-| Par clé : `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ⬜ | |
+| Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ⬜ | |
 | `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ⬜ | |
 | `call.should_rate_limit.redis_error` / `service_error` | ⬜ | |
-| `ratelimit_server.<méthode>.total_requests` / `response_time` | ⬜ | |
+| `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
-| Sinks exclusifs : statsd **TCP** (défaut), DogStatsD (+ mogrifiers), Prometheus natif + mapper statsd_exporter, log | ⬜ | |
+| Exclusive sinks: statsd over **TCP** (default), DogStatsD (+ mogrifiers), native Prometheus + statsd_exporter mapper, log | ⬜ | |
 | `SanitizeStatName`, `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ⬜ | |
 | `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
-| Traces OTLP : spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` et leurs attributs | ⬜ | |
+| OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
-## 6. Image et déploiement
+## 6. Image and deployment
 
-| Élément | État | Test |
+| Item | Status | Test |
 |---|---|---|
-| Binaire `/bin/ratelimit`, distroless sans shell, amd64 + arm64 | ⬜ | |
-| UID quelconque (65534), FS en lecture seule, aucune capability | ⬜ | |
+| Binary `/bin/ratelimit`, distroless without a shell, amd64 + arm64 | ⬜ | |
+| Any UID (65534), read-only FS, no capabilities | ⬜ | |
 | Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current` | ⬜ | |
-| Écoute dual-stack (`HOST="::"`), `SO_REUSEPORT` | ⬜ | |
-| `/healthcheck` servi après la connexion Redis initiale | ⬜ | |
-| Deployment généré par Envoy Gateway (xDS TLS) fonctionne en ne changeant que l'image | ⬜ | |
+| Dual-stack listening (`HOST="::"`), `SO_REUSEPORT` | ⬜ | |
+| `/healthcheck` served after the initial Redis connection | ⬜ | |
+| Deployment generated by Envoy Gateway (xDS TLS) works by changing only the image | ⬜ | |
 
-## 7. Divergences volontaires
+## 7. Deliberate divergences
 
-| Comportement amont | Notre comportement | Raison |
+| Upstream behaviour | Our behaviour | Reason |
 |---|---|---|
-| `limit` client avec `unit: UNKNOWN` ⇒ panique du processus | erreur gRPC `INVALID_ARGUMENT` | D1 : on ne reproduit pas les crashs |
-| Variable d'environnement invalide relue au rechargement ⇒ panique | erreur de config | D1 |
-| `descriptors[].limit` des métadonnées en prototext Go (instable) | format stable documenté | non reproductible octet pour octet |
-| `unit_multiplier` ignoré dans les overrides et absent des réponses | lu, appliqué, renvoyé ; 0 rejeté | extension (proto Envoy à jour) |
-| Stats Go (`go.*`), `/stats` expvar, pprof | stats du processus Rust, équivalents documentés | pas d'équivalent en Rust |
-| Remboursement sans effet sur le cache local | efface l'entrée locale (nouveaux types uniquement) | D18 |
+| Client `limit` with `unit: UNKNOWN` ⇒ the process panics | gRPC error `INVALID_ARGUMENT` | D1: crashes are not reproduced |
+| Invalid environment variable re-read on reload ⇒ panic | config error | D1 |
+| `descriptors[].limit` in metadata as Go prototext (unstable) | documented stable format | not reproducible byte for byte |
+| `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
+| Go stats (`go.*`), `/stats` expvar, pprof | Rust process stats, documented equivalents | no Rust equivalent |
+| A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
+| YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
+| `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
+| `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
