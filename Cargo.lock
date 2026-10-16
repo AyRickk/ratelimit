@@ -706,6 +706,9 @@ dependencies = [
  "prost-types",
  "ratelimit-proto",
  "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "yaml-rust2",
 ]
 
