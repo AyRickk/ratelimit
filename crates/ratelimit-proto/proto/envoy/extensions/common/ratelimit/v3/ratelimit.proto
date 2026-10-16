@@ -1,0 +1,28 @@
+// Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/extensions/common/ratelimit/v3/ratelimit.proto:
+// only RateLimitDescriptor is kept; validation and udpa annotations and comments removed;
+// packages, names and field numbers unchanged.
+
+syntax = "proto3";
+
+package envoy.extensions.common.ratelimit.v3;
+
+import "envoy/type/v3/ratelimit_unit.proto";
+import "google/protobuf/wrappers.proto";
+
+message RateLimitDescriptor {
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+
+  message RateLimitOverride {
+    uint32 requests_per_unit = 1;
+    type.v3.RateLimitUnit unit = 2;
+    google.protobuf.UInt32Value unit_multiplier = 3;
+  }
+
+  repeated Entry entries = 1;
+  RateLimitOverride limit = 2;
+  google.protobuf.UInt64Value hits_addend = 3;
+  bool is_negative_hits = 4;
+}

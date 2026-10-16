@@ -1,0 +1,12 @@
+[package]
+name = "ratelimit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost-types.workspace = true
+ratelimit-proto.workspace = true
+thiserror.workspace = true
+yaml-rust2.workspace = true
