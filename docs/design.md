@@ -1,8 +1,6 @@
 # Conception — `ratelimit` (Rust)
 
-Document de référence des décisions de conception, consolidé le 2026-10-16. Il remplace `docs/design-review-prompt.md`, qui garde l'historique des propositions initiales. Il intègre la revue `docs/design-review.md` (sections 1 à 7) et ses arbitrages (section 8, R1 à R8).
-
-Les identifiants D1 à D34 sont ceux de la revue. Une décision marquée *(amendée)* diffère de la proposition initiale. Les détails de format sont figés dans les ADR :
+Document de référence des décisions de conception, issu du grilling du 2026-10-16. Une décision marquée *(amendée)* a été révisée après sa première validation. Les détails de format sont figés dans les ADR :
 
 - [ADR 0001 — Format des clés de stockage des limites `rate_limits:`](adr/0001-format-cles-redis-nouveaux-types.md)
 - [ADR 0002 — Origine des fenêtres fixes (`offset`)](adr/0002-origine-fenetres-fixes.md)
@@ -72,7 +70,21 @@ Une réécriture en Rust d'[envoyproxy/ratelimit](https://github.com/envoyproxy/
 - **Réponse d'un check qui ouvre** : `OK`, `limit_remaining = limite − hits comptés`, `duration_until_reset = ceil(ancre + durée − now)`, donc moins que la durée complète avec un arrondi.
 - **Fenêtres sans hit** : avec `open_on: check` en `envoy`, une requête refusée par une autre limite (même liste ou autre descripteur) ouvre quand même la fenêtre, avec un budget plein. Une requête qui échoue en amont (agentgateway amende alors 0 token) aussi. Ces fenêtres sont comptées dans `opened_without_hits`. Si c'est indésirable, utiliser `open_on: first_hit`. Le comportement réel de Claude dans ce cas n'est pas documenté.
 - **Script** : ancre et compteur dans la même clé, lecture-décision-écriture en un seul script ; `elapsed` borné à 0 ; fermeture décidée par `now ≥ ancre + durée` dans le script, pas par l'absence de clé ; TTL = durée + marge.
-- La matrice de tests de référence est dans `docs/design-review.md`, R7 (corrigée par R8).
+- **Matrice de tests de référence** (fenêtre fermée, liste `[5h anchored open_on: check, 7d fixed]` ; verdict de la liste / hits / mode → ouvre ? / compte ?) :
+
+  | Verdict de la liste | Hits | Mode | Ouvre | Compte |
+  |---|---|---|---|---|
+  | hebdo OK | 0 | tous | oui | 0 |
+  | hebdo OK | > 0 | `envoy` | oui | oui |
+  | 5h auto-refus (hits > limite) | > 0 | `strict` | non | non |
+  | hebdo OVER | 0 | `envoy` | oui | 0 |
+  | hebdo OVER | 0 | `strict` | non | 0 |
+  | hebdo OVER | > 0 | `envoy` | oui | oui |
+  | hebdo OVER | > 0 | `strict` | non | non |
+  | hebdo OVER en shadow | > 0 | `strict` | oui | oui |
+  | hebdo remplacée par `replaces` | — | — | comme hebdo OK | |
+  | org OVER sur un autre descripteur | 0 | tous | oui (`opened_without_hits` +1) | 0 |
+  | fenêtre déjà ouverte | — | — | ancre jamais déplacée | selon `overflow` |
 
 **D10. `sliding` et `sliding_approx`** *(amendée)*.
 
@@ -111,7 +123,7 @@ Une réécriture en Rust d'[envoyproxy/ratelimit](https://github.com/envoyproxy/
 **D17. Fonctionnalités de la référence sur les nouvelles fenêtres** *(amendée)*.
 
 - **Shadow** : le verdict utilisé pour l'ouverture et le comptage est le verdict **post-shadow**. Le shadow du descripteur et le shadow **global** (`SHADOW_MODE`) sont transmis au script.
-- **`quota_mode`** (R1) : reproduit tel quel (`ratelimit.go:233-355`) : groupes par `backend_name` / `model_name_override`, `OVER_LIMIT` seulement si tous les groupes sont épuisés, `passedBackends` **dédupliqué par groupe** et filtré sur les groupes non épuisés. Avec plusieurs limites, un descripteur est épuisé si **au moins une** de ses limites l'est.
+- **`quota_mode`** : reproduit tel quel (`ratelimit.go:233-355`) : groupes par `backend_name` / `model_name_override`, `OVER_LIMIT` seulement si tous les groupes sont épuisés, `passedBackends` **dédupliqué par groupe** et filtré sur les groupes non épuisés. Avec plusieurs limites, un descripteur est épuisé si **au moins une** de ses limites l'est.
 - **Statut représentatif d'un descripteur à plusieurs limites** (ordre total) : s'il existe des statuts `OVER_LIMIT`, celui au **plus grand `duration_until_reset`** ; sinon celui au **plus petit `limit_remaining`** ; à égalité, le premier de la liste. `current_limit`, `limit_remaining` et `duration_until_reset` viennent de ce seul statut ; `statuses[i]` reste 1:1 avec les descripteurs. La réduction se fait dans la couche cache ; le shadow du descripteur s'applique après et ne change que le code.
 - Un descripteur dont toutes les limites sont remplacées sort du groupe quota (sauf `QUOTA_MODE` global) mais figure dans `passedBackends` s'il porte une clé de groupe.
 - **`share_threshold`** : le motif remplace la valeur dans la partie `{…}` des clés (ADR 0001) et dans l'entrée du hachage d'`offset: hashed` (ADR 0002). **`detailed_metric`**, **`value_to_metric`** : statistiques seulement, tous types.
@@ -168,7 +180,7 @@ Une réécriture en Rust d'[envoyproxy/ratelimit](https://github.com/envoyproxy/
 3. Scripts `integration-test/*.sh` amont rejoués contre notre image : test de fumée, pas de parité.
 4. **Tests de propriétés Rust ↔ Lua** sur un vrai Redis **en mode cluster**, avec un fuzz des séquences concurrentes `check(0)` / `amend(n)` / `refund(n)`.
 5. Test différentiel du mapper contre un vrai `statsd_exporter`, et du flux statsd brut contre la référence.
-6. TDD avec l'horloge injectable pour les nouveaux types, incluant la matrice R7/R8.
+6. TDD avec l'horloge injectable pour les nouveaux types, incluant la matrice d'ouverture de D9.
 
 **D33. Image** *(amendée)*. Binaire exactement à `/bin/ratelimit`, distroless sans shell, amd64 + arm64 (`cargo-zigbuild`). UID quelconque (Envoy Gateway force 65534), système de fichiers en lecture seule, aucune capability. Ports 8080 / 8081 / 6070, `RUNTIME_ROOT=/srv/runtime_data/current`. Écoute dual-stack explicite (`[::]` avec `IPV6_V6ONLY=0`) et `SO_REUSEPORT` sur les trois ports. `/healthcheck` servi seulement après la connexion Redis initiale, comme en amont. Toutes les variables injectées par Envoy Gateway sont supportées, sauf `GRPC_SERVER_TLS_CA_CERT`, **ignorée comme en amont** (aucun code ne la lit). Image signée avec cosign, avec SBOM et provenance ; test CI sur `kind` avec un Envoy Gateway réel dont on ne change que l'image. Pas de chart Helm en v1.
 

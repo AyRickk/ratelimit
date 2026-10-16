@@ -1,7 +1,7 @@
 # ADR 0002 — Origine des fenêtres fixes (`offset`)
 
 - **Statut :** accepté (2026-10-16)
-- **Sources :** `docs/design-review.md` D8, D9, Q6, R4, R6 ; [What is the Max plan](https://support.claude.com/en/articles/11049741-what-is-the-max-plan) ; ccusage `rust/crates/ccusage/src/blocks.rs`
+- **Sources :** `docs/design.md` D8, D9 ; [What is the Max plan](https://support.claude.com/en/articles/11049741-what-is-the-max-plan) ; ccusage `rust/crates/ccusage/src/blocks.rs`
 
 ## Contexte
 

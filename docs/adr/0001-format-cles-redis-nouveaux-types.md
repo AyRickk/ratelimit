@@ -1,7 +1,7 @@
 # ADR 0001 — Format des clés de stockage des limites `rate_limits:`
 
 - **Statut :** accepté (2026-10-16)
-- **Sources :** `docs/design-review.md` D6, D25, D26, R5, Q4 ; référence `envoyproxy/ratelimit@f4e7669` `src/limiter/cache_key.go:66-94`
+- **Sources :** `docs/design.md` D6, D25, D26 ; référence `envoyproxy/ratelimit@f4e7669` `src/limiter/cache_key.go:66-94`
 
 ## Contexte
 
