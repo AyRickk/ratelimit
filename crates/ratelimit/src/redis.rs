@@ -3,7 +3,8 @@
 //! script for refunds.
 
 use crate::config::RateLimit;
-use crate::limiter::{self, Clock};
+use crate::limiter::{self, Clock, Count, Hits, RequestState};
+use crate::local_cache::LocalCache;
 use crate::service::{CacheError, RateLimitCache};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
@@ -26,19 +27,28 @@ return new_val                                               -- return count aft
 pub struct RedisCacheSettings {
     /// `CACHE_KEY_PREFIX`.
     pub cache_key_prefix: String,
+    /// `LOCAL_CACHE_SIZE_IN_BYTES`: memory for remembering keys over their limit, so later
+    /// requests skip Redis. 0 disables it.
+    pub local_cache_size_in_bytes: usize,
+    /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`.
+    pub stop_cache_key_increment_when_overlimit: bool,
 }
 
 pub struct RedisCache {
     client: Client,
     clock: Arc<dyn Clock>,
+    local_cache: Option<LocalCache>,
     settings: RedisCacheSettings,
 }
 
 impl RedisCache {
     pub fn new(client: Client, clock: Arc<dyn Clock>, settings: RedisCacheSettings) -> Self {
+        let local_cache = (settings.local_cache_size_in_bytes > 0)
+            .then(|| LocalCache::new(settings.local_cache_size_in_bytes));
         Self {
             client,
             clock,
+            local_cache,
             settings,
         }
     }
@@ -90,11 +100,77 @@ fn go_quote_ascii(s: &str) -> String {
     out
 }
 
-/// A descriptor counted in Redis.
-struct Counted {
+/// Sends `commands` in one pipeline and returns their replies, or upstream's error for the
+/// first command that failed.
+async fn send(client: &Client, commands: &[Command]) -> Result<Vec<Value>, CacheError> {
+    let pipeline = client.pipeline();
+    for command in commands {
+        // EVAL is routed by its key, the third argument, in a cluster.
+        let hash = if command.name == "EVAL" {
+            ClusterHash::Offset(2)
+        } else {
+            ClusterHash::FirstKey
+        };
+        let custom = CustomCommand::new_static(command.name, hash, false);
+        let () = pipeline
+            .custom(custom, command.args.clone())
+            .await
+            .map_err(cache_error)?;
+    }
+    let replies: Vec<Result<Value, fred::error::Error>> = pipeline.try_all().await;
+    commands
+        .iter()
+        .zip(replies)
+        .map(|(command, reply)| reply.map_err(|e| command.failed(e.details())))
+        .collect()
+}
+
+impl Command {
+    /// Upstream's error for this command: radix wraps the first failure of a pipeline.
+    fn failed(&self, error: impl std::fmt::Display) -> CacheError {
+        CacheError(format!(
+            "command {} in pipeline returned error: {error}",
+            self.describe()
+        ))
+    }
+
+    /// A reply read as a counter, like radix unmarshals it into a `uint64`: a missing value is 0,
+    /// anything else must be an unsigned decimal.
+    fn counter(&self, reply: Value) -> Result<u64, CacheError> {
+        let text = match reply {
+            Value::Null => return Ok(0),
+            Value::Integer(i) => i.to_string(),
+            Value::String(s) => s.to_string(),
+            Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => return Err(self.failed(format!("cannot read {other:?} as a counter"))),
+        };
+        if text.is_empty() {
+            return Err(self.failed("empty slice given to parseUint"));
+        }
+        let mut n: u64 = 0;
+        for (i, c) in text.bytes().enumerate() {
+            if !c.is_ascii_digit() {
+                return Err(self.failed(format!(
+                    "invalid character {} at position {i} in parseUint",
+                    c as char
+                )));
+            }
+            n = n.wrapping_mul(10).wrapping_add(u64::from(c - b'0'));
+        }
+        Ok(n)
+    }
+}
+
+/// A descriptor with a limit, to be checked against Redis or the local cache.
+struct Check<'a> {
     index: usize,
-    /// Index of the command whose reply is the counter after this descriptor's hits.
-    command: usize,
+    limit: &'a RateLimit,
+    key: String,
+    hits: Hits,
+    /// Already over its limit according to the local cache: Redis is skipped.
+    over_in_local_cache: bool,
+    /// With `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: these hits will take it over the limit.
+    going_over: bool,
 }
 
 impl RateLimitCache for RedisCache {
@@ -106,10 +182,7 @@ impl RateLimitCache for RedisCache {
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
 
-        // Per descriptor with a limit, in order: INCRBY + EXPIRE, or the refund script.
-        // Hits go over the wire as signed 64-bit integers, as upstream sends them.
-        let mut commands = Vec::new();
-        let mut counted = Vec::new();
+        let mut checks = Vec::new();
         for (index, limit) in limits.iter().enumerate() {
             let Some(limit) = limit else { continue };
             let key = limiter::cache_key(
@@ -119,73 +192,119 @@ impl RateLimitCache for RedisCache {
                 limit,
                 now,
             )?;
-            let expiration = limiter::window_seconds(limit)?.to_string();
-            let amount = (hits[index].value as i64).to_string();
-            counted.push(Counted {
+            let hits = hits[index];
+            // Refunds always reach Redis.
+            let over_in_local_cache = !hits.refund
+                && self
+                    .local_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.contains(&key, now));
+            checks.push(Check {
                 index,
-                command: commands.len(),
+                limit,
+                key,
+                hits,
+                over_in_local_cache,
+                going_over: false,
             });
-            if hits[index].refund {
+        }
+
+        let mut state = if checks.iter().any(|c| c.over_in_local_cache) {
+            RequestState::OverInLocalCache
+        } else {
+            RequestState::WithinLimits
+        };
+        let stop_increment = self.settings.stop_cache_key_increment_when_overlimit;
+        if stop_increment && state == RequestState::WithinLimits {
+            self.find_keys_going_over(&mut checks).await?;
+            if checks.iter().any(|c| c.going_over) {
+                state = RequestState::SomeGoingOver;
+            }
+        }
+
+        // Per descriptor not answered by the local cache: INCRBY + EXPIRE, or the refund
+        // script. Hits go over the wire as signed 64-bit integers, as upstream sends them.
+        let mut commands = Vec::new();
+        let mut reply_of = Vec::new();
+        for c in &checks {
+            if c.over_in_local_cache {
+                continue;
+            }
+            let expiration = limiter::window_seconds(c.limit)?.to_string();
+            reply_of.push((c.index, commands.len()));
+            if c.hits.refund {
+                let amount = (c.hits.value as i64).to_string();
                 let args = vec![
                     DECREMENT_SCRIPT.to_string(),
                     "1".to_string(),
-                    key,
+                    c.key.clone(),
                     amount,
                     expiration,
                 ];
                 commands.push(Command { name: "EVAL", args });
             } else {
+                let counted = limiter::hits_to_count(c.hits, stop_increment, state, c.going_over);
+                let args = vec![c.key.clone(), (counted as i64).to_string()];
                 commands.push(Command {
                     name: "INCRBY",
-                    args: vec![key.clone(), amount],
+                    args,
                 });
                 commands.push(Command {
                     name: "EXPIRE",
-                    args: vec![key, expiration],
+                    args: vec![c.key.clone(), expiration],
                 });
             }
         }
-
-        let mut after = vec![0u64; limits.len()];
+        let mut counts = vec![Count::After(0); limits.len()];
         if !commands.is_empty() {
-            let pipeline = self.client.pipeline();
-            for command in &commands {
-                // EVAL is routed by its key, the third argument, in a cluster.
-                let hash = if command.name == "EVAL" {
-                    ClusterHash::Offset(2)
-                } else {
-                    ClusterHash::FirstKey
-                };
-                let custom = CustomCommand::new_static(command.name, hash, false);
-                let () = pipeline
-                    .custom(custom, command.args.clone())
-                    .await
-                    .map_err(cache_error)?;
+            let replies = send(&self.client, &commands).await?;
+            for (index, at) in reply_of {
+                counts[index] = Count::After(commands[at].counter(replies[at].clone())?);
             }
-            let replies: Vec<Result<Value, fred::error::Error>> = pipeline.try_all().await;
-            // Like upstream, report the first command that failed.
-            for (command, reply) in commands.iter().zip(&replies) {
-                if let Err(e) = reply {
-                    return Err(CacheError(format!(
-                        "command {} in pipeline returned error: {}",
-                        command.describe(),
-                        e.details()
-                    )));
-                }
-            }
-            for Counted { index, command } in counted {
-                let reply = replies[command].clone().map_err(cache_error)?;
-                after[index] = reply.convert::<u64>().map_err(cache_error)?;
+        }
+        for c in &checks {
+            if c.over_in_local_cache {
+                counts[c.index] = Count::OverInLocalCache;
+            } else if let (false, Count::After(after), Some(cache)) =
+                (c.hits.refund, counts[c.index], &self.local_cache)
+                && limiter::exceeds(c.limit, after)
+            {
+                // Cached for a whole window, shadow rules included, as upstream.
+                cache.insert(&c.key, limiter::window_seconds(c.limit)?, now);
             }
         }
 
         limits
             .iter()
             .zip(&hits)
-            .zip(after)
-            .map(|((limit, hits), after)| {
-                limiter::descriptor_status(limit.as_ref(), *hits, after, now)
+            .zip(counts)
+            .map(|((limit, hits), count)| {
+                limiter::descriptor_status(limit.as_ref(), *hits, count, now)
             })
             .collect()
+    }
+}
+
+impl RedisCache {
+    /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: reads the counters first to mark the keys
+    /// these hits will take over the limit.
+    async fn find_keys_going_over(&self, checks: &mut [Check<'_>]) -> Result<(), CacheError> {
+        let mut reads: Vec<&mut Check> = checks.iter_mut().filter(|c| !c.hits.refund).collect();
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let commands: Vec<Command> = reads
+            .iter()
+            .map(|c| Command {
+                name: "GET",
+                args: vec![c.key.clone()],
+            })
+            .collect();
+        let replies = send(&self.client, &commands).await?;
+        for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
+            let before = command.counter(reply)?;
+            c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));
+        }
+        Ok(())
     }
 }

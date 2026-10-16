@@ -109,14 +109,27 @@ fn status(
     })
 }
 
-/// The status of a descriptor whose counter is `after` once its hits are applied. Without a
-/// limit it is a bare OK. A refund is always OK, with what remains. Otherwise it is over the
-/// limit when the counter exceeds it, though a rule in shadow mode then still answers OK
-/// (keeping the remaining count of 0).
+/// Whether a counter of `count` is over `limit`.
+pub(crate) fn exceeds(limit: &RateLimit, count: u64) -> bool {
+    count > u64::from(limit.limit.requests_per_unit)
+}
+
+/// What the backend found for a descriptor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Count {
+    /// Its counter once its hits are applied.
+    After(u64),
+    /// Over its limit according to the local cache; the backend was not asked.
+    OverInLocalCache,
+}
+
+/// The status of a descriptor. Without a limit it is a bare OK. A refund is always OK, with
+/// what remains. Otherwise it is over the limit when the counter exceeds it (or the local cache
+/// says so); a rule in shadow mode then answers OK, keeping the remaining count of 0.
 pub(crate) fn descriptor_status(
     limit: Option<&RateLimit>,
     hits: Hits,
-    after: u64,
+    count: Count,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
     let Some(limit) = limit else {
@@ -126,16 +139,51 @@ pub(crate) fn descriptor_status(
         });
     };
     let threshold = u64::from(limit.limit.requests_per_unit);
-    if hits.refund {
-        status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now)
-    } else if after > threshold {
-        let code = if limit.shadow_mode {
-            Code::Ok
-        } else {
-            Code::OverLimit
-        };
-        status(code, limit, 0, now)
+    match count {
+        Count::After(after) if hits.refund => {
+            return status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now);
+        }
+        Count::After(after) if !exceeds(limit, after) => {
+            return status(Code::Ok, limit, (threshold - after) as u32, now);
+        }
+        Count::After(_) | Count::OverInLocalCache => {}
+    }
+    let code = if limit.shadow_mode {
+        Code::Ok
     } else {
-        status(Code::Ok, limit, (threshold - after) as u32, now)
+        Code::OverLimit
+    };
+    status(code, limit, 0, now)
+}
+
+/// What a request's keys look like before counting, for
+/// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestState {
+    /// A key of the request is over its limit in the local cache.
+    OverInLocalCache,
+    /// The hits will take some keys over their limit.
+    SomeGoingOver,
+    /// Neither.
+    WithinLimits,
+}
+
+/// How much to add to a key's counter: upstream's `getHitsAddendValue`. With
+/// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`, nothing is counted once a key of the request is
+/// over in the local cache, and when some keys are about to go over, only those are counted.
+pub(crate) fn hits_to_count(
+    hits: Hits,
+    stop_increment_when_overlimit: bool,
+    request: RequestState,
+    going_over: bool,
+) -> u64 {
+    if !stop_increment_when_overlimit {
+        return hits.value;
+    }
+    match request {
+        RequestState::OverInLocalCache => 0,
+        RequestState::WithinLimits => hits.value,
+        RequestState::SomeGoingOver if going_over => hits.value,
+        RequestState::SomeGoingOver => 0,
     }
 }

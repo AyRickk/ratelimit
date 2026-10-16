@@ -3,6 +3,7 @@ module github.com/AyRickk/ratelimit/tools/oracle
 go 1.27.2
 
 require (
+	github.com/coocood/freecache v1.2.4
 	github.com/envoyproxy/go-control-plane/envoy v1.37.1-0.20260409083702-98966259b99a
 	github.com/envoyproxy/ratelimit v1.4.1-0.20261006073346-f4e76690d9ce
 	github.com/lyft/gostats v0.4.14
@@ -27,7 +28,6 @@ require (
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
-	github.com/coocood/freecache v1.2.4 // indirect
 	github.com/envoyproxy/go-control-plane v0.14.0 // indirect
 	github.com/envoyproxy/go-control-plane/ratelimit v0.1.1-0.20260629194254-5581fade6089 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect

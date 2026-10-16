@@ -3,5 +3,6 @@
 pub mod config;
 pub mod grpc;
 pub mod limiter;
+pub mod local_cache;
 pub mod redis;
 pub mod service;

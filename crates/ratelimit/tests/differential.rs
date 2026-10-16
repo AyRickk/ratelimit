@@ -101,8 +101,37 @@ async fn free_port() -> u16 {
 /// A throwaway Redis server, stopped when dropped.
 struct Redis {
     _process: Child,
+    /// The harness's own connection, for dumps and setup; its commands are not compared.
     client: fred::clients::Client,
+    client_address: String,
     address: String,
+    monitor: Monitor,
+}
+
+/// Every command the server receives, as `MONITOR` reports it.
+struct Monitor {
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Monitor {
+    async fn start(address: &str) -> Self {
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        tokio::io::AsyncWriteExt::write_all(&mut write, b"*1\r\n$7\r\nMONITOR\r\n")
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(read).lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("+OK"));
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = collected.clone();
+        tokio::spawn(async move {
+            let _write = write; // keep the connection open
+            while let Ok(Some(line)) = lines.next_line().await {
+                sink.lock().unwrap().push(line);
+            }
+        });
+        Self { lines: collected }
+    }
 }
 
 impl Redis {
@@ -130,11 +159,84 @@ impl Redis {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let info: String = client
+            .custom(
+                CustomCommand::new_static("CLIENT", ClusterHash::Random, false),
+                vec!["INFO"],
+            )
+            .await
+            .unwrap();
+        let client_address = info
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("addr="))
+            .unwrap()
+            .to_string();
+        let monitor = Monitor::start(&address).await;
         Self {
             _process: process,
             client,
+            client_address,
             address,
+            monitor,
         }
+    }
+
+    /// A new connection, for the implementation under test.
+    async fn connect(&self) -> fred::clients::Client {
+        let config = Config::from_url(&format!("redis://{}", self.address)).unwrap();
+        let client = Builder::from_config(config).build().unwrap();
+        client.init().await.unwrap();
+        client
+    }
+
+    /// The data commands received so far from anyone but the harness, in order, as `MONITOR`
+    /// renders them (commands run by Lua scripts included).
+    async fn commands(&self) -> Vec<String> {
+        // Wait until the monitor has seen everything sent before this point.
+        let marker = format!("sync-{}", self.monitor.lines.lock().unwrap().len());
+        let _: String = self
+            .client
+            .custom(
+                CustomCommand::new_static("ECHO", ClusterHash::Random, false),
+                vec![marker.clone()],
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self
+            .monitor
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(&marker))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MONITOR did not report {marker}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        const CONNECTION: &[&str] = &[
+            "\"CLIENT\"",
+            "\"HELLO\"",
+            "\"PING\"",
+            "\"COMMAND\"",
+            "\"INFO\"",
+            "\"SELECT\"",
+        ];
+        self.monitor
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|line| {
+                let (source, command) = line.split_once("] ")?;
+                let from_harness = source.ends_with(&format!(" {}", self.client_address));
+                let connection = CONNECTION.iter().any(|c| command.starts_with(c));
+                (!from_harness && !connection).then(|| command.to_string())
+            })
+            .collect()
     }
 
     /// Every key with its value and TTL.
@@ -165,9 +267,16 @@ struct Oracle {
 }
 
 impl Oracle {
-    async fn start(redis: &Redis, prefix: &str) -> Self {
+    async fn start(redis: &Redis, settings: &RedisCacheSettings) -> Self {
+        let local_cache_size = settings.local_cache_size_in_bytes.to_string();
+        let stop_increment = format!(
+            "-stop-cache-key-increment={}",
+            settings.stop_cache_key_increment_when_overlimit
+        );
         let mut process = Command::new(oracle_binary())
-            .args(["-redis", &redis.address, "-cache-key-prefix", prefix])
+            .args(["-redis", &redis.address])
+            .args(["-cache-key-prefix", &settings.cache_key_prefix])
+            .args(["-local-cache-size", &local_cache_size, &stop_increment])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -220,12 +329,9 @@ struct Subject {
 }
 
 impl Subject {
-    async fn start(redis: &Redis, prefix: &str) -> Self {
+    async fn start(redis: &Redis, settings: &RedisCacheSettings) -> Self {
         let clock = Arc::new(ManualClock::default());
-        let settings = RedisCacheSettings {
-            cache_key_prefix: prefix.to_string(),
-        };
-        let cache = RedisCache::new(redis.client.clone(), clock.clone(), settings);
+        let cache = RedisCache::new(redis.connect().await, clock.clone(), settings.clone());
         let service = Arc::new(RateLimitService::new(cache, ServiceSettings::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -254,14 +360,24 @@ struct Harness {
 
 impl Harness {
     async fn start(config: &str) -> Self {
-        Self::with_prefix(config, "").await
+        Self::with_settings(config, RedisCacheSettings::default()).await
     }
 
     async fn with_prefix(config: &str, prefix: &str) -> Self {
+        let settings = RedisCacheSettings {
+            cache_key_prefix: prefix.to_string(),
+            ..Default::default()
+        };
+        Self::with_settings(config, settings).await
+    }
+
+    /// Both sides configured alike: `settings` for this implementation, the matching flags for
+    /// the oracle.
+    async fn with_settings(config: &str, settings: RedisCacheSettings) -> Self {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
-        let oracle = Oracle::start(&oracle_redis, prefix).await;
-        let subject = Subject::start(&subject_redis, prefix).await;
+        let oracle = Oracle::start(&oracle_redis, &settings).await;
+        let subject = Subject::start(&subject_redis, &settings).await;
         oracle.put("/config", config.to_string()).await;
         let file = ConfigFile {
             name: "config.yaml".into(),
@@ -299,6 +415,14 @@ impl Harness {
     /// Same keys and values, and TTLs within a second: TTLs run on the servers' real clocks
     /// and the two dumps are taken one after the other.
     async fn assert_same_redis(&self) {
+        if std::env::var_os("RATELIMIT_SHOW_COMMANDS").is_some() {
+            eprintln!("{:#?}", self.oracle_redis.commands().await);
+        }
+        assert_eq!(
+            self.subject_redis.commands().await,
+            self.oracle_redis.commands().await,
+            "commands received by Redis"
+        );
         let expected = self.oracle_redis.dump().await;
         let actual = self.subject_redis.dump().await;
         assert!(
@@ -651,5 +775,171 @@ descriptors:
     ))
     .await
     .unwrap();
+    h.assert_same_redis().await;
+}
+
+const OVERLIMIT: &str = "
+domain: d
+descriptors:
+  - key: a
+    rate_limit: {unit: minute, requests_per_unit: 5}
+  - key: b
+    rate_limit: {unit: minute, requests_per_unit: 10}
+  - key: shadow
+    shadow_mode: true
+    rate_limit: {unit: minute, requests_per_unit: 1}
+";
+
+fn hits_each(descriptors: &[&[(&str, &str)]], hits: &[u64]) -> RateLimitRequest {
+    let hits: Vec<_> = hits.iter().map(|h| Some(*h)).collect();
+    with_hits(request("d", descriptors), 0, &hits)
+}
+
+#[tokio::test]
+async fn stop_cache_key_increment_when_overlimit_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let ab: &[&[(&str, &str)]] = &[&[("a", "x")], &[("b", "y")]];
+
+    h.call(hits_each(ab, &[4, 1])).await.unwrap(); // nobody near: both counted
+    h.call(hits_each(ab, &[2, 1])).await.unwrap(); // a goes over: only a counted, b gets 0
+    h.call(hits_each(ab, &[1, 1])).await.unwrap();
+    h.call(hits_each(&[&[("b", "y")], &[("none", "z")]], &[3, 1]))
+        .await
+        .unwrap();
+    h.call(refund(request("d", &[&[("a", "x")]]), 3))
+        .await
+        .unwrap();
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn local_cache_skips_redis_for_keys_over_the_limit_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1024 * 1024,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let ab: &[&[(&str, &str)]] = &[&[("a", "x")], &[("b", "y")]];
+
+    h.call(hits_each(ab, &[6, 1])).await.unwrap(); // a over: cached
+    h.call(hits_each(ab, &[1, 1])).await.unwrap(); // a answered from the cache
+    h.call(hits_each(&[&[("shadow", "s")]], &[2]))
+        .await
+        .unwrap(); // shadow rules are cached too
+    h.call(hits_each(&[&[("shadow", "s")]], &[1]))
+        .await
+        .unwrap();
+    h.call(refund(request("d", &[&[("a", "x")]]), 6))
+        .await
+        .unwrap(); // refunds ignore the cache
+    h.call(hits_each(ab, &[1, 1])).await.unwrap(); // still cached
+    h.at(1_700_000_060).await; // next window: a new key
+    h.call(hits_each(ab, &[1, 1])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn local_cache_and_stop_increment_together_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1024 * 1024,
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let ab: &[&[(&str, &str)]] = &[&[("a", "x")], &[("b", "y")]];
+
+    h.call(hits_each(ab, &[6, 1])).await.unwrap();
+    // a is over in the local cache: nothing is incremented, b gets INCRBY 0.
+    h.call(hits_each(ab, &[1, 2])).await.unwrap();
+    h.call(hits_each(&[&[("b", "y")]], &[1])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn keys_too_long_for_freecache_are_never_cached_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    // At freecache's 512 KiB minimum, entries over 2048 / 4 - 24 = 488 bytes are refused.
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let long = "v".repeat(600);
+    let short = "v".repeat(470);
+    for value in [&long, &short] {
+        h.call(hits_each(&[&[("a", value)]], &[6])).await.unwrap();
+        h.call(hits_each(&[&[("a", value)]], &[1])).await.unwrap();
+    }
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn unreadable_counters_fail_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+    let window = 1_700_000_000 / 60 * 60;
+    h.set_raw(&format!("d_a_x_{window}"), "abc").await;
+    let error = h.call(hits_each(&[&[("a", "x")]], &[1])).await.unwrap_err();
+    assert!(error.contains("in parseUint"), "{error}");
+
+    // A counter driven below zero cannot be read as an unsigned number either.
+    let mut h = Harness::start(OVERLIMIT).await;
+    h.at(1_700_000_000).await;
+    h.call(hits_each(&[&[("b", "y")]], &[u64::MAX]))
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn stop_increment_branches_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1024 * 1024,
+        stop_cache_key_increment_when_overlimit: true,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(OVERLIMIT, settings).await;
+    h.at(1_700_000_000).await;
+
+    // A brand-new key next to one going over gets INCRBY 0: a ghost key at 0.
+    h.call(hits_each(&[&[("a", "x")], &[("b", "new")]], &[6, 1]))
+        .await
+        .unwrap();
+    // A shadow rule going over is counted and cached, but answers OK.
+    h.call(hits_each(&[&[("shadow", "s")], &[("b", "y")]], &[2, 1]))
+        .await
+        .unwrap();
+    // A refund next to a key answered by the local cache.
+    let mut mixed = hits_each(&[&[("a", "x")], &[("b", "y")]], &[1, 3]);
+    mixed.descriptors[1].is_negative_hits = true;
+    h.call(mixed).await.unwrap();
     h.assert_same_redis().await;
 }
