@@ -14,7 +14,7 @@ use ratelimit::grpc;
 use ratelimit::limiter::Clock;
 use ratelimit::redis::{RedisCache, RedisCacheSettings};
 use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
-use ratelimit::stats::Stats;
+use ratelimit::stats::{Sink, Stats, StatsdProtocol, StatsdSink};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
@@ -137,8 +137,19 @@ impl Monitor {
 
 impl Redis {
     async fn start() -> Self {
-        let port = free_port().await;
-        let process = Command::new(redis_server())
+        // The port is free when chosen but may be taken before the server binds it (by another
+        // test's server, which this one would then share): try again on another port.
+        for _ in 0..5 {
+            if let Some(redis) = Self::start_on(free_port().await).await {
+                return redis;
+            }
+        }
+        panic!("could not start {}", redis_server());
+    }
+
+    /// The server started on `port`, once it answers and is the one started here.
+    async fn start_on(port: u16) -> Option<Self> {
+        let mut process = Command::new(redis_server())
             .args([
                 "--port",
                 &port.to_string(),
@@ -154,11 +165,27 @@ impl Redis {
         let address = format!("127.0.0.1:{port}");
         let config = Config::from_url(&format!("redis://{address}")).unwrap();
         let client = Builder::from_config(config).build().unwrap();
-        for _ in 0..100 {
+        let mut ready = false;
+        for _ in 0..250 {
+            if process.try_wait().unwrap().is_some() {
+                return None;
+            }
             if client.init().await.is_ok() {
+                ready = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let server: String = client
+            .custom(
+                CustomCommand::new_static("INFO", ClusterHash::Random, false),
+                vec!["server"],
+            )
+            .await
+            .ok()?;
+        let ours = format!("process_id:{}", process.id()?);
+        if !ready || !server.lines().any(|line| line.trim() == ours) {
+            return None;
         }
         let info: String = client
             .custom(
@@ -173,13 +200,13 @@ impl Redis {
             .unwrap()
             .to_string();
         let monitor = Monitor::start(&address).await;
-        Self {
+        Some(Self {
             _process: process,
             client,
             client_address,
             address,
             monitor,
-        }
+        })
     }
 
     /// A new connection, for the implementation under test.
@@ -291,8 +318,14 @@ struct Oracle {
 /// cannot change the oracle's answers.
 fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
     let load = &settings.load;
+    let extra_tags: Vec<String> = settings
+        .extra_tags
+        .iter()
+        .map(|(key, value)| format!("{key}:{value}"))
+        .collect();
     let settings = &settings.service;
     let mut environment = vec![
+        ("EXTRA_TAGS", extra_tags.join(",")),
         (
             "SANITIZE_DESCRIPTOR_METRIC_DOTS",
             load.sanitize_descriptor_metric_dots.to_string(),
@@ -334,7 +367,7 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
 }
 
 impl Oracle {
-    async fn start(redis: &Redis, all: &Settings) -> Self {
+    async fn start(redis: &Redis, all: &Settings, statsd: Option<&StatsdServer>) -> Self {
         let settings = &all.cache;
         let near_limit_ratio = settings.near_limit_ratio.to_string();
         let local_cache_size = settings.local_cache_size_in_bytes.to_string();
@@ -347,6 +380,7 @@ impl Oracle {
             .args(["-cache-key-prefix", &settings.cache_key_prefix])
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
             .args(["-near-limit-ratio", &near_limit_ratio])
+            .args(statsd.map(|server| format!("-statsd={}", server.address)))
             .env_clear()
             .envs(oracle_environment(all))
             .stdout(Stdio::piped())
@@ -361,8 +395,15 @@ impl Oracle {
                 .expect("oracle address")
                 .to_string()
         };
-        let grpc = address("grpc", lines.next_line().await.unwrap());
-        let control = address("control", lines.next_line().await.unwrap());
+        // The oracle waits for Redis before listening; a timeout turns a hang into a failure.
+        let mut next_line = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+                .await
+                .expect("the oracle did not start within 30 seconds")
+                .unwrap()
+        };
+        let grpc = address("grpc", next_line().await);
+        let control = address("control", next_line().await);
         let client = RateLimitServiceClient::connect(format!("http://{grpc}"))
             .await
             .unwrap();
@@ -417,12 +458,17 @@ struct Subject {
     service: Arc<RateLimitService<RedisCache>>,
     clock: Arc<ManualClock>,
     stats: Arc<Stats>,
+    sink: Option<Sink>,
 }
 
 impl Subject {
-    async fn start(redis: &Redis, settings: &Settings) -> Self {
+    async fn start(redis: &Redis, settings: &Settings, statsd: Option<&StatsdServer>) -> Self {
         let clock = Arc::new(ManualClock::default());
-        let stats = Arc::new(Stats::default());
+        let stats = Arc::new(Stats::new(&settings.extra_tags));
+        let sink = statsd.map(|server| {
+            let port = server.address.port();
+            Sink::Statsd(StatsdSink::new("127.0.0.1", port, StatsdProtocol::Tcp))
+        });
         let cache = RedisCache::new(
             redis.connect().await,
             clock.clone(),
@@ -450,6 +496,7 @@ impl Subject {
             service,
             clock,
             stats,
+            sink,
         }
     }
 }
@@ -460,6 +507,9 @@ struct Harness {
     subject: Subject,
     subject_redis: Redis,
     load_options: LoadOptions,
+    /// With `Settings::statsd`, what the oracle and this implementation sent to statsd.
+    statsd: Option<StatsdServers>,
+    flushes: std::sync::atomic::AtomicUsize,
 }
 
 /// Everything both sides are configured with.
@@ -468,6 +518,77 @@ struct Settings {
     cache: RedisCacheSettings,
     service: ServiceSettings,
     load: LoadOptions,
+    /// `EXTRA_TAGS`.
+    extra_tags: BTreeMap<String, String>,
+    /// Also send the stats to a statsd server for each side, and compare what they receive.
+    statsd: bool,
+}
+
+/// The flush that marks the end of each flush in a statsd stream.
+const FLUSHED: &str = "harness.flushed:1|c";
+
+/// The statsd servers each side sends its stats to.
+struct StatsdServers {
+    oracle: StatsdServer,
+    subject: StatsdServer,
+}
+
+/// A statsd server over TCP, keeping every line it receives.
+struct StatsdServer {
+    address: std::net::SocketAddr,
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl StatsdServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream).lines();
+                    while let Ok(Some(line)) = stream.next_line().await {
+                        sink.lock().unwrap().push(line);
+                    }
+                });
+            }
+        });
+        Self { address, lines }
+    }
+
+    /// The lines of the first `count` flushes, each sorted (a flush's order is not defined).
+    /// The stats of the oracle's own Redis client are left out.
+    async fn flushes(&self, count: usize) -> Vec<Vec<String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let lines = self.lines.lock().unwrap().clone();
+            let mut flushes = lines
+                .split(|line| line == FLUSHED)
+                .map(|flush| {
+                    let mut flush: Vec<String> = flush
+                        .iter()
+                        .filter(|line| !line.starts_with("redis."))
+                        .cloned()
+                        .collect();
+                    flush.sort();
+                    flush
+                })
+                .collect::<Vec<_>>();
+            flushes.pop(); // after the last marker
+            if flushes.len() >= count {
+                flushes.truncate(count);
+                return flushes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "statsd received {lines:?}, expected {count} flushes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 }
 
 impl Harness {
@@ -504,14 +625,29 @@ impl Harness {
     async fn configured(config: &str, settings: Settings) -> Self {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
-        let oracle = Oracle::start(&oracle_redis, &settings).await;
-        let subject = Subject::start(&subject_redis, &settings).await;
+        let statsd = match settings.statsd {
+            true => Some(StatsdServers {
+                oracle: StatsdServer::start().await,
+                subject: StatsdServer::start().await,
+            }),
+            false => None,
+        };
+        let oracle =
+            Oracle::start(&oracle_redis, &settings, statsd.as_ref().map(|s| &s.oracle)).await;
+        let subject = Subject::start(
+            &subject_redis,
+            &settings,
+            statsd.as_ref().map(|s| &s.subject),
+        )
+        .await;
         let mut h = Self {
             oracle,
             oracle_redis,
             subject,
             subject_redis,
             load_options: settings.load,
+            statsd,
+            flushes: Default::default(),
         };
         h.load_config(config).await.unwrap();
         h
@@ -537,12 +673,23 @@ impl Harness {
         expected
     }
 
+    /// Flushes the stats on both sides and compares the counters, and what statsd received.
     async fn assert_same_stats(&self) {
-        assert_eq!(
-            self.subject.stats.snapshot(),
-            self.oracle.stats().await,
-            "counters"
-        );
+        let expected = self.oracle.stats().await;
+        if let Some(sink) = &self.subject.sink {
+            self.subject.stats.flush(sink).await;
+            sink.flush_counter("harness.flushed", 1);
+            sink.flush().await;
+        }
+        assert_eq!(self.subject.stats.snapshot(), expected, "counters");
+        if let Some(statsd) = &self.statsd {
+            let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_eq!(
+                statsd.subject.flushes(count).await,
+                statsd.oracle.flushes(count).await,
+                "statsd lines, per flush"
+            );
+        }
     }
 
     async fn at(&mut self, now: i64) {
@@ -1758,5 +1905,56 @@ async fn a_near_threshold_past_the_limit_wraps_like_upstream() {
         .await
         .unwrap();
     }
+    h.assert_same_redis().await;
+}
+
+/// The counters reach statsd over TCP as upstream's sink sends them: each flush, every counter's
+/// increase since the previous one, when not 0.
+#[tokio::test]
+async fn counters_are_flushed_to_statsd_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        statsd: true,
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "alice")]]);
+    h.call(with_hits(user(), 600, &[None])).await.unwrap();
+    h.call(user()).await.unwrap();
+    h.call(with_hits(user(), 600, &[None])).await.unwrap();
+    h.call(request("unknown", &[&[("a", "b")]])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// `EXTRA_TAGS` are appended to every name, sorted by key, values sanitized, empty values left
+/// out; each reserved key counts in `reserved_tag`.
+#[tokio::test]
+async fn extra_tags_are_appended_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let tags = [
+        ("zone", "eu.west|1"),
+        ("app", "rl|x"),
+        ("host", "h1"),
+        ("region", ""),
+    ];
+    let settings = Settings {
+        statsd: true,
+        extra_tags: tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    h.call(request("llm", &[&[("user", "alice")], &[("x", "y")]]))
+        .await
+        .unwrap();
+    h.call(request("unknown", &[&[("a", "b")]])).await.unwrap();
     h.assert_same_redis().await;
 }

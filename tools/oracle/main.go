@@ -7,7 +7,10 @@
 //	PUT /time    body: unix seconds          sets the clock
 //	PUT /config  body: YAML config file      loads a config (as one file named "config.yaml");
 //	                                         422 with the error when it does not load
-//	GET /stats                               the service's counters, one "name value" per line
+//	GET /stats                               flushes the stats; returns the service's counters
+//	                                         so far, one "name value" per line. With -statsd,
+//	                                         the flush also reaches the statsd server, followed
+//	                                         by a "harness.flushed:1|c" line.
 package main
 
 import (
@@ -80,6 +83,26 @@ func (s *countingSink) FlushCounter(name string, value uint64) {
 func (s *countingSink) FlushGauge(name string, value uint64)  {}
 func (s *countingSink) FlushTimer(name string, value float64) {}
 
+// teeSink flushes to both sinks.
+type teeSink struct {
+	counting *countingSink
+	statsd   gostats.FlushableSink
+}
+
+func (s *teeSink) FlushCounter(name string, value uint64) {
+	s.counting.FlushCounter(name, value)
+	s.statsd.FlushCounter(name, value)
+}
+func (s *teeSink) FlushGauge(name string, value uint64) {
+	s.counting.FlushGauge(name, value)
+	s.statsd.FlushGauge(name, value)
+}
+func (s *teeSink) FlushTimer(name string, value float64) {
+	s.counting.FlushTimer(name, value)
+	s.statsd.FlushTimer(name, value)
+}
+func (s *teeSink) Flush() { s.statsd.Flush() }
+
 func loadConfig(content string, statsManager stats.Manager) (cfg config.RateLimitConfig, err any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -99,11 +122,28 @@ func main() {
 	localCacheSize := flag.Int("local-cache-size", 0, "LOCAL_CACHE_SIZE_IN_BYTES (0 disables the local cache)")
 	stopIncrement := flag.Bool("stop-cache-key-increment", false, "STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT")
 	nearLimitRatio := flag.Float64("near-limit-ratio", 0.8, "NEAR_LIMIT_RATIO")
+	statsdAddr := flag.String("statsd", "", "host:port of a statsd server (TCP) that also receives the stats")
 	flag.Parse()
 
 	ctx := context.Background()
 	sink := &countingSink{counters: map[string]uint64{}}
-	store := gostats.NewStore(sink, false)
+	var storeSink gostats.Sink = sink
+	var statsd gostats.FlushableSink
+	if *statsdAddr != "" {
+		host, port, err := net.SplitHostPort(*statsdAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// The sink upstream's runner builds for USE_STATSD.
+		statsd = gostats.NewTCPStatsdSink(gostats.WithStatsdHost(host), gostats.WithStatsdPort(portNumber),
+			gostats.WithStatsdProtocol("tcp"))
+		storeSink = &teeSink{counting: sink, statsd: statsd}
+	}
+	store := gostats.NewStore(storeSink, false)
 	statsManager := stats.NewStatManager(store, settings.NewSettings())
 	clk := &clock{}
 
@@ -154,11 +194,15 @@ func main() {
 	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		store.Flush()
+		if statsd != nil {
+			statsd.FlushCounter("harness.flushed", 1)
+			statsd.Flush()
+		}
 		sink.mu.Lock()
 		defer sink.mu.Unlock()
 		names := make([]string, 0, len(sink.counters))
 		for name := range sink.counters {
-			if strings.HasPrefix(name, "ratelimit.service.") {
+			if strings.HasPrefix(name, "ratelimit.service.") || name == "reserved_tag" {
 				names = append(names, name)
 			}
 		}
