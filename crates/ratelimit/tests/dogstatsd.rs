@@ -282,3 +282,20 @@ mod tempdir {
         }
     }
 }
+
+/// The address is `host:port` as Go reads it: a name resolves to IPv4 first (the agent usually
+/// listens on 127.0.0.1), a bare IPv6 host is refused, a bracketed one is accepted.
+#[tokio::test]
+async fn the_address_is_resolved_like_go() {
+    let (socket, port) = server().await;
+    let settings = DogStatsdSettings::default;
+    let sink = DogStatsdSink::with_container_id("localhost", port, settings(), None).unwrap();
+    sink.flush_counter("a", 1);
+    assert_eq!(datagrams(&socket).await.concat(), "a:1|c\n");
+
+    let error = DogStatsdSink::with_container_id("::1", port, settings(), None)
+        .err()
+        .unwrap();
+    assert!(error.contains("too many colons"), "{error}");
+    assert!(DogStatsdSink::with_container_id("[::1]", port, settings(), None).is_ok());
+}

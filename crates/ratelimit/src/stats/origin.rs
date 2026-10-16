@@ -25,10 +25,8 @@ static CONTAINER_ID: LazyLock<Regex> = LazyLock::new(|| {
 /// A container's `hostname` mount in `/proc/self/mountinfo` (Go's `\s` and `\S` are ASCII).
 static MOUNTINFO_ID: LazyLock<Regex> = LazyLock::new(|| {
     let id = "([0-9a-f]{64})|([0-9a-f]{32}-[0-9]{10})|([0-9a-f]{8}(-[0-9a-f]{4}){4}$)";
-    Regex::new(&format!(
-        r".*/([^\t\n\x0C\r /]+)/({id})/[^\t\n\x0C\r ]*hostname"
-    ))
-    .unwrap()
+    let space = super::dogstatsd::ASCII_SPACE;
+    Regex::new(&format!(".*/([^{space}/]+)/({id})/[^{space}]*hostname")).unwrap()
 });
 
 /// Where origin detection reads from.
@@ -63,17 +61,19 @@ pub fn container_id() -> Option<String> {
 /// The container ID from `sources`: from the cgroup file in the host cgroup namespace, else the
 /// cgroup's inode when `mountinfo` names a container.
 pub fn detect(host_cgroup_namespace: bool, sources: &Sources) -> Option<String> {
-    let id = if host_cgroup_namespace {
-        parse_container_id(&std::fs::read_to_string(&sources.cgroup).ok()?)
+    if host_cgroup_namespace {
+        parse_container_id(&read(&sources.cgroup)?)
     } else {
-        let found = parse_mountinfo(&std::fs::read_to_string(&sources.mountinfo).ok()?);
-        if found.is_empty() {
-            String::new()
-        } else {
-            cgroup_inode(&sources.cgroup_mount, &sources.cgroup)
-        }
-    };
-    (!id.is_empty()).then_some(id)
+        parse_mountinfo(&read(&sources.mountinfo)?)?;
+        cgroup_inode(&sources.cgroup_mount, &read(&sources.cgroup)?)
+    }
+}
+
+/// A file's lines, read like Go's scanner does: bytes that are not UTF-8 do not stop it.
+fn read(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(unix)]
@@ -88,34 +88,25 @@ fn host_cgroup_namespace() -> bool {
 }
 
 /// `parseContainerID`: the container ID of the first cgroup line ending with one.
-fn parse_container_id(cgroup: &str) -> String {
+fn parse_container_id(cgroup: &str) -> Option<String> {
     cgroup
         .lines()
         .filter_map(|line| CGROUP_LINE.captures(line))
         .find_map(|path| CONTAINER_ID.captures(&path[1]).map(|id| id[1].to_string()))
-        .unwrap_or_default()
 }
 
 /// `parseMountinfo`: from the first line naming a container, the rightmost match, unless it is
 /// a containerd sandbox.
-fn parse_mountinfo(mountinfo: &str) -> String {
-    for line in mountinfo.lines() {
-        let Some(last) = MOUNTINFO_ID.captures_iter(line).last() else {
-            continue;
-        };
-        if &last[1] != "sandboxes" {
-            return last[2].to_string();
-        }
-    }
-    String::new()
+fn parse_mountinfo(mountinfo: &str) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        let last = MOUNTINFO_ID.captures_iter(line).last()?;
+        (&last[1] != "sandboxes").then(|| last[2].to_string())
+    })
 }
 
 /// `getCgroupInode`: `in-<inode>` of the cgroup v1 memory controller's node, else of the
 /// cgroup v2 node, under `mount`.
-fn cgroup_inode(mount: &Path, cgroup: &Path) -> String {
-    let Ok(cgroup) = std::fs::read_to_string(cgroup) else {
-        return String::new();
-    };
+fn cgroup_inode(mount: &Path, cgroup: &str) -> Option<String> {
     let mut paths = HashMap::new();
     for line in cgroup.lines() {
         let tokens: Vec<&str> = line.split(':').collect();
@@ -123,16 +114,11 @@ fn cgroup_inode(mount: &Path, cgroup: &Path) -> String {
             paths.insert(controller, path);
         }
     }
-    for controller in ["memory", ""] {
-        let Some(node) = paths.get(controller) else {
-            continue;
-        };
+    ["memory", ""].into_iter().find_map(|controller| {
+        let node = paths.get(controller)?;
         let path = go_path_join(&[&mount.to_string_lossy(), controller, node]);
-        if let Some(inode) = inode(Path::new(&path)) {
-            return format!("in-{inode}");
-        }
-    }
-    String::new()
+        inode(Path::new(&path)).map(|inode| format!("in-{inode}"))
+    })
 }
 
 #[cfg(unix)]

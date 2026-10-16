@@ -132,6 +132,9 @@ fn substitute(template: &str, groups: &[&str]) -> String {
     out + rest
 }
 
+/// Go's `\\s`: ASCII white space, without the vertical tab.
+pub(crate) const ASCII_SPACE: &str = "\\t\\n\\x0C\\r ";
+
 /// Go's RE2 classes `\d`, `\s`, `\w` and `\b` are ASCII-only; Rust's are Unicode. Rewrites them
 /// (and their negations) into ASCII forms, outside and inside brackets.
 fn ascii_perl_classes(pattern: &str) -> String {
@@ -147,23 +150,16 @@ fn ascii_perl_classes(pattern: &str) -> String {
                     out.push(c);
                     break;
                 };
-                let ascii = match next {
+                let set = match next.to_ascii_lowercase() {
                     'd' => Some("0-9"),
                     'w' => Some("0-9A-Za-z_"),
-                    's' => Some("\\t\\n\\x0C\\r "),
+                    's' => Some(ASCII_SPACE),
                     _ => None,
                 };
-                match (next, ascii) {
-                    (_, Some(set)) if in_class => out += set,
-                    (_, Some(set)) => out += &format!("[{set}]"),
-                    ('D' | 'W' | 'S', _) => {
-                        let set = match next {
-                            'D' => "0-9",
-                            'W' => "0-9A-Za-z_",
-                            _ => "\\t\\n\\x0C\\r ",
-                        };
-                        out += &format!("[^{set}]");
-                    }
+                match (next, set) {
+                    ('d' | 'w' | 's', Some(set)) if in_class => out += set,
+                    ('d' | 'w' | 's', Some(set)) => out += &format!("[{set}]"),
+                    (_, Some(set)) => out += &format!("[^{set}]"),
                     ('b' | 'B', _) if !in_class => out += &format!("(?-u:\\{next})"),
                     _ => {
                         out.push('\\');
@@ -189,6 +185,41 @@ fn ascii_perl_classes(pattern: &str) -> String {
     out
 }
 
+/// The address datadog-go dials for `host:port` (Go's `net.ResolveUDPAddr`): the host and port
+/// split as `net.SplitHostPort` does, and a name resolved to its first IPv4 address unless the
+/// host was bracketed.
+fn resolve_udp(address: &str) -> Result<std::net::SocketAddr, String> {
+    let (host, port, bracketed) = match address.strip_prefix('[') {
+        Some(rest) => {
+            let (host, port) = rest
+                .split_once("]:")
+                .ok_or_else(|| format!("address {address}: missing port in address"))?;
+            (host, port, true)
+        }
+        None => {
+            let (host, port) = address
+                .rsplit_once(':')
+                .ok_or_else(|| format!("address {address}: missing port in address"))?;
+            if host.contains(':') {
+                return Err(format!("address {address}: too many colons"));
+            }
+            (host, port, false)
+        }
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("address {address}: invalid port"))?;
+    let addresses: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| e.to_string())?
+            .collect();
+    let preferred = addresses.iter().find(|a| a.is_ipv6() == bracketed);
+    preferred
+        .or(addresses.first())
+        .copied()
+        .ok_or_else(|| format!("no address for {host}"))
+}
+
 pub struct DogStatsdSink {
     pending: Arc<Mutex<Vec<u8>>>,
     queue: mpsc::Sender<Vec<u8>>,
@@ -208,16 +239,14 @@ impl DogStatsdSink {
         Self::with_container_id(host, port, settings, container_id)
     }
 
+    /// The same, with `container_id` instead of origin detection.
     pub fn with_container_id(
         host: &str,
         port: u16,
         settings: DogStatsdSettings,
         container_id: Option<String>,
     ) -> Result<Self, String> {
-        let address = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-            .map_err(|e| e.to_string())?
-            .next()
-            .ok_or_else(|| format!("no address for {host}"))?;
+        let address = resolve_udp(&format!("{host}:{port}"))?;
         let local = if address.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -239,7 +268,8 @@ impl DogStatsdSink {
         let ticking = Arc::downgrade(&pending);
         let ticker_queue = queue.clone();
         tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(FLUSH_INTERVAL);
+            let start = tokio::time::Instant::now() + FLUSH_INTERVAL;
+            let mut ticks = tokio::time::interval_at(start, FLUSH_INTERVAL);
             loop {
                 ticks.tick().await;
                 let Some(pending) = ticking.upgrade() else {
@@ -298,16 +328,17 @@ impl DogStatsdSink {
     /// Adds `line` to the datagram being filled, sending that one first when the line does not
     /// fit. A line longer than a datagram is dropped.
     fn write_line(&self, line: &[u8]) {
-        if line.len() > MAX_DATAGRAM {
-            return;
-        }
         let mut pending = self.pending.lock().unwrap();
         if pending.len() + line.len() > MAX_DATAGRAM {
             // Picked up by the next tick otherwise; queued now, like datadog-go's worker.
             let datagram = std::mem::take(&mut *pending);
-            let _ = self.queue.try_send(datagram);
+            if !datagram.is_empty() {
+                let _ = self.queue.try_send(datagram);
+            }
         }
-        pending.extend_from_slice(line);
+        if line.len() <= MAX_DATAGRAM {
+            pending.extend_from_slice(line);
+        }
     }
 
     /// `separateTags` then the first matching mogrifier: the name without its `EXTRA_TAGS`,

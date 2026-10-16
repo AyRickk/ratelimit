@@ -550,13 +550,14 @@ struct Settings {
     dogstatsd: Option<DogStatsd>,
 }
 
-/// A mogrifier for both sides: key, pattern, name, tags.
-type MogrifierSpec = (
-    &'static str,
-    &'static str,
-    &'static str,
-    Vec<(&'static str, &'static str)>,
-);
+/// A mogrifier, for both sides.
+#[derive(Clone)]
+struct MogrifierSpec {
+    key: &'static str,
+    pattern: &'static str,
+    name: &'static str,
+    tags: Vec<(&'static str, &'static str)>,
+}
 
 /// The DogStatsD sink's configuration, for both sides.
 #[derive(Default, Clone)]
@@ -579,9 +580,9 @@ impl DogStatsd {
             mogrifiers: self
                 .mogrifiers
                 .iter()
-                .map(|(key, pattern, name, tags)| {
-                    let tags = tags.iter().map(|(k, v)| (k.to_string(), v.to_string()));
-                    Mogrifier::new(key, pattern, name, tags.collect()).unwrap()
+                .map(|m| {
+                    let tags = m.tags.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+                    Mogrifier::new(m.key, m.pattern, m.name, tags.collect()).unwrap()
                 })
                 .collect(),
             ..Default::default()
@@ -597,13 +598,13 @@ impl DogStatsd {
             ("DD_SERVICE", self.service.clone()),
             ("DD_VERSION", self.version.clone()),
         ];
-        let keys: Vec<&str> = self.mogrifiers.iter().map(|m| m.0).collect();
+        let keys: Vec<&str> = self.mogrifiers.iter().map(|m| m.key).collect();
         environment.push(("USE_DOG_STATSD_MOGRIFIERS", keys.join(",")));
-        for (key, pattern, name, tags) in &self.mogrifiers {
-            let var = |field: &str| leak(format!("DOG_STATSD_MOGRIFIER_{key}_{field}"));
-            let tags: Vec<String> = tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
-            environment.push((var("PATTERN"), pattern.to_string()));
-            environment.push((var("NAME"), name.to_string()));
+        for m in &self.mogrifiers {
+            let var = |field: &str| leak(format!("DOG_STATSD_MOGRIFIER_{}_{field}", m.key));
+            let tags: Vec<String> = m.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            environment.push((var("PATTERN"), m.pattern.to_string()));
+            environment.push((var("NAME"), m.name.to_string()));
             environment.push((var("TAGS"), tags.join(",")));
         }
         environment
@@ -860,8 +861,8 @@ impl Harness {
             sink.flush().await;
         }
         assert_eq!(self.subject.stats.snapshot(), expected, "counters");
+        let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(dogstatsd) = &self.dogstatsd {
-            let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
             assert_eq!(
                 dogstatsd.subject.lines(count).await,
                 dogstatsd.oracle.lines(count).await,
@@ -869,7 +870,6 @@ impl Harness {
             );
         }
         if let Some(statsd) = &self.statsd {
-            let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
             assert_eq!(
                 statsd.subject.flushes(count).await,
                 statsd.oracle.flushes(count).await,
@@ -2159,18 +2159,24 @@ async fn counters_are_sent_to_dogstatsd_like_upstream() {
             service: "rl".into(),
             version: "1.2".into(),
             mogrifiers: vec![
-                (
-                    "HITS",
-                    r"^ratelimit\.service\.rate_limit\.(\w+)\.(\w+)\.total_hits$",
-                    "ratelimit.hits",
-                    vec![("domain", "$1")],
-                ),
-                (
-                    "ANY",
-                    r"^ratelimit\.service\.rate_limit\.([^.]+)\.(.+)$",
-                    "ratelimit.$2.$9",
-                    vec![("domain", "$1")],
-                ),
+                MogrifierSpec {
+                    key: "UNKNOWN",
+                    pattern: r"^ratelimit\.service\.rate_limit\.(\w+)\.domain_not_found$",
+                    name: "ratelimit.unknown",
+                    tags: vec![("domain", "$1")],
+                },
+                MogrifierSpec {
+                    key: "HITS",
+                    pattern: r"^ratelimit\.service\.rate_limit\.(\w+)\.(\w+)\.total_hits$",
+                    name: "ratelimit.hits",
+                    tags: vec![("domain", "$1")],
+                },
+                MogrifierSpec {
+                    key: "ANY",
+                    pattern: r"^ratelimit\.service\.rate_limit\.([^.]+)\.(.+)$",
+                    name: "ratelimit.$2.$9.$1a.$01.$",
+                    tags: vec![("domain", "$1")],
+                },
             ],
         }),
         extra_tags: [("cluster", "c1")]
@@ -2183,7 +2189,30 @@ async fn counters_are_sent_to_dogstatsd_like_upstream() {
     h.at(1_700_000_000).await;
     let user = || request("llm", &[&[("user", "alice")]]);
     h.call(with_hits(user(), 600, &[None])).await.unwrap();
-    h.call(with_hits(user(), 600, &[None])).await.unwrap();
     h.call(request("unknown", &[&[("a", "b")]])).await.unwrap();
+    // Not a word in Go's ASCII `\w`: UNKNOWN does not match, ANY does.
+    h.call(request("é٣", &[&[("a", "b")]])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// Without `DD_ENTITY_ID`, origin detection is on: both sides find the same container ID, if
+/// any; the other global tags still come first.
+#[tokio::test]
+async fn dogstatsd_without_an_entity_id_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        dogstatsd: Some(DogStatsd {
+            env: "prod".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    h.call(request("llm", &[&[("user", "alice")]]))
+        .await
+        .unwrap();
     h.assert_same_redis().await;
 }

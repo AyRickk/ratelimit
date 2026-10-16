@@ -88,24 +88,24 @@ func (s *countingSink) FlushTimer(name string, value float64) {}
 // teeSink flushes to both sinks.
 type teeSink struct {
 	counting *countingSink
-	other    gostats.Sink
+	upstream gostats.Sink
 }
 
 func (s *teeSink) FlushCounter(name string, value uint64) {
 	s.counting.FlushCounter(name, value)
-	s.other.FlushCounter(name, value)
+	s.upstream.FlushCounter(name, value)
 }
 func (s *teeSink) FlushGauge(name string, value uint64) {
 	s.counting.FlushGauge(name, value)
-	s.other.FlushGauge(name, value)
+	s.upstream.FlushGauge(name, value)
 }
 func (s *teeSink) FlushTimer(name string, value float64) {
 	s.counting.FlushTimer(name, value)
-	s.other.FlushTimer(name, value)
+	s.upstream.FlushTimer(name, value)
 }
 func (s *teeSink) Flush() {
 	// Like gostats' store: only a FlushableSink is flushed (the DogStatsD sink is not).
-	if flushable, ok := s.other.(gostats.FlushableSink); ok {
+	if flushable, ok := s.upstream.(gostats.FlushableSink); ok {
 		flushable.Flush()
 	}
 }
@@ -149,10 +149,10 @@ func main() {
 	sink := &countingSink{counters: map[string]uint64{}}
 	var storeSink gostats.Sink = sink
 	// The sink upstream's runner builds for USE_STATSD or USE_DOG_STATSD, if any.
-	var other gostats.Sink
+	var upstreamSink gostats.Sink
 	if *statsdAddr != "" {
 		host, port := hostAndPort(*statsdAddr)
-		other = gostats.NewTCPStatsdSink(gostats.WithStatsdHost(host), gostats.WithStatsdPort(port),
+		upstreamSink = gostats.NewTCPStatsdSink(gostats.WithStatsdHost(host), gostats.WithStatsdPort(port),
 			gostats.WithStatsdProtocol("tcp"))
 	}
 	if *dogstatsdAddr != "" {
@@ -162,10 +162,10 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		other = dog
+		upstreamSink = dog
 	}
-	if other != nil {
-		storeSink = &teeSink{counting: sink, other: other}
+	if upstreamSink != nil {
+		storeSink = &teeSink{counting: sink, upstream: upstreamSink}
 	}
 	store := gostats.NewStore(storeSink, false)
 	statsManager := stats.NewStatManager(store, settings.NewSettings())
@@ -218,9 +218,9 @@ func main() {
 	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		store.Flush()
-		if other != nil {
-			other.FlushCounter("harness.flushed", 1)
-			if flushable, ok := other.(gostats.FlushableSink); ok {
+		if upstreamSink != nil {
+			upstreamSink.FlushCounter("harness.flushed", 1)
+			if flushable, ok := upstreamSink.(gostats.FlushableSink); ok {
 				flushable.Flush()
 			}
 		}

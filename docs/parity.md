@@ -250,6 +250,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | DogStatsD lines are packed by 32 workers, by name hash | one buffer: the same lines, in other datagrams | datagram boundaries carry no meaning for the agent |
 | Mogrifier `PATTERN`s are Go RE2 | Rust `regex`, with `\d`, `\w`, `\s`, `\b` and their negations made ASCII as in Go; syntax only one of the two accepts (e.g. `\Q…\E`, `\b{start}`) differs | different engine |
 | An invalid mogrifier ⇒ panic at startup | configuration error | D1 |
+| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
+| A `STATSD_HOST` starting with `unix://` sends DogStatsD over a Unix socket | not supported: the address does not resolve | not needed by the targeted deployments; can be added |
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
 | statsd buffers are cut at the same line boundaries as gostats' but are not timed alike (gostats also pushes its buffer every second), so while the server is unreachable which lines are dropped can differ; the queue is bounded alike (about 4 MiB) | buffers pushed only when full or flushed | Not observable while the server is reachable |
