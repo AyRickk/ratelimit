@@ -2,7 +2,7 @@
 //! to a descriptor. A port of envoyproxy/ratelimit `src/config/config_impl.go`.
 
 mod schema;
-mod yaml;
+pub(crate) mod yaml;
 
 use rate_limit_response::rate_limit::Unit;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;

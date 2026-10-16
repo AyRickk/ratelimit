@@ -318,8 +318,8 @@ pub(crate) fn go_format(value: &Resolved) -> String {
     }
 }
 
-/// `strconv.FormatFloat(v, 'g', -1, 64)` as used by `%v`.
-fn go_format_float(v: f64) -> String {
+/// `strconv.FormatFloat(v, 'g', -1, 64)` as used by `%v`, with `+Inf`/`-Inf`.
+pub(crate) fn go_format_float(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
     }

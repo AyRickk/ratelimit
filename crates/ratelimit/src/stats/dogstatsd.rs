@@ -67,7 +67,7 @@ impl Mogrifier {
         if pattern.is_empty() {
             return Err(format!("no PATTERN specified for mogrifier {key}"));
         }
-        let compiled = regex::Regex::new(&ascii_perl_classes(pattern))
+        let compiled = go_regex(pattern)
             .map_err(|e| format!("failed to compile pattern for {key}: {pattern}: {e}"))?;
         if name.is_empty() {
             return Err(format!("no NAME specified for mogrifier {key}"));
@@ -134,6 +134,11 @@ fn substitute(template: &str, groups: &[&str]) -> String {
 
 /// Go's `\\s`: ASCII white space, without the vertical tab.
 pub(crate) const ASCII_SPACE: &str = "\\t\\n\\x0C\\r ";
+
+/// A Go `regexp` pattern compiled for Rust's engine, with Go's ASCII `\d`, `\s`, `\w` and `\b`.
+pub(crate) fn go_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&ascii_perl_classes(pattern))
+}
 
 /// Go's RE2 classes `\d`, `\s`, `\w` and `\b` are ASCII-only; Rust's are Unicode. Rewrites them
 /// (and their negations) into ASCII forms, outside and inside brackets.

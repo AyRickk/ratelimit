@@ -161,7 +161,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 **D29. Metrics** *(amended)*.
 
 - Same names as the reference. Exclusive sinks, fatal error if two are enabled: statsd over **TCP** (`USE_STATSD=true` by default, so `USE_PROMETHEUS=true` alone is fatal), DogStatsD with mogrifiers, native Prometheus; `DISABLE_STATS` wins; otherwise log.
-- Prometheus: reimplementation of the statsd_exporter mapper for the subset in use (globs, regexes, `$n`, `match_metric_type`, `drop`, observer types and buckets, `defaults`), following the actual evaluation order (all globs, then regexes in order) and the escaping of unmapped names. An unsupported mapper key is rejected at startup (documented divergence). Missing mapper file: upstream behaviour reproduced.
+- Prometheus *(amended)*: a port of statsd_exporter v0.26.1's mapper (every key, decoded with yaml.v2's rules and validated alike; the glob FSM with its ordering quirks, then the regexes in order; `$n` templates; the escaping of unmapped names), its exporter and registry (conflicts, TTLs, self-metrics), and client_golang's Gather checks and text format, served like promhttp. A mapper file that cannot be read or does not load maps nothing, silently, as upstream; one that makes upstream panic is an error at startup (D1). Summaries come with the timers that need them.
 - Several limits: a `~name` identifier appended to the **last segment** (`user_alice~weekly`), emitted **even for a single-limit list**. The shipped default mapper adds a `limit=` label and maps the new `total_capped_hits` (D11) and `opened_without_hits` (D9) stats.
 - Go stats (`go.*`, `/stats` expvar, pprof): replaced by the Rust process's stats (documented divergence).
 
@@ -169,7 +169,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 ## F. Code, tests and delivery
 
-**D30. Stack.** tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL.
+**D30. Stack** *(amended)*. tokio, tonic + prost, axum, serde, fred. TLS through `rustls`, for a binary without OpenSSL. The Prometheus listener is served by `hyper` directly, behind a port of Go's mux rules for its one path, rather than axum's router.
 
 **D31. Code layout** *(amended)*. A workspace of two crates: `ratelimit-proto` (flattened protos, compiled with `protox`, no `protoc`) and `ratelimit`. Seam by operations: `Store::apply(batch of ops {key, algo, limit, hits, now})`. Each algorithm of the new types is a pure function `step(state, op) → (state, result)` in Rust (in-memory backend), rewritten in Lua for Redis. **The legacy path stays an `INCRBY` + `EXPIRE` pipeline with the decision on the service side**, not a script, so the commands seen by Redis are identical. The decision layer (thresholds, shadow, quota, status reduction, response) is shared.
 
