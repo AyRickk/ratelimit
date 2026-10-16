@@ -1,7 +1,9 @@
 //! Stats sinks, against gostats v0.4.14 and envoyproxy/ratelimit@f4e7669's runner. The statsd
 //! stream itself is compared with upstream in `tests/differential.rs`.
 
-use ratelimit::stats::{LoggingSink, Sink, SinkSettings, Stats, StatsdProtocol, StatsdSink, sink};
+use ratelimit::stats::{
+    LoggingSink, Sink, SinkSettings, Stats, StatsdProtocol, StatsdSink, select_sink,
+};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -62,13 +64,13 @@ const SEVERAL_SINKS: &str = "Error: unable to use more than one stats sink at th
 #[tokio::test]
 async fn the_sink_is_chosen_like_upstream() {
     let settings = SinkSettings::default();
-    assert!(matches!(sink(&settings), Ok(Sink::Statsd(_))));
+    assert!(matches!(select_sink(&settings), Ok(Sink::Statsd(_))));
 
     let logging = SinkSettings {
         use_statsd: false,
         ..Default::default()
     };
-    assert!(matches!(sink(&logging), Ok(Sink::Logging(_))));
+    assert!(matches!(select_sink(&logging), Ok(Sink::Logging(_))));
 
     let disabled = SinkSettings {
         disable_stats: true,
@@ -76,7 +78,7 @@ async fn the_sink_is_chosen_like_upstream() {
         use_prometheus: true,
         ..Default::default()
     };
-    assert!(matches!(sink(&disabled), Ok(Sink::Null)));
+    assert!(matches!(select_sink(&disabled), Ok(Sink::Null)));
 
     // USE_STATSD is on by default, so another sink alone is one too many.
     for (dog, prometheus) in [(true, false), (false, true)] {
@@ -85,7 +87,7 @@ async fn the_sink_is_chosen_like_upstream() {
             use_prometheus: prometheus,
             ..Default::default()
         };
-        assert_eq!(sink(&several).err().as_deref(), Some(SEVERAL_SINKS));
+        assert_eq!(select_sink(&several).err().as_deref(), Some(SEVERAL_SINKS));
     }
 }
 
@@ -222,4 +224,25 @@ async fn stats_are_flushed_every_interval() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(flushes(&output), 2);
     assert_eq!(output.text().matches("config_load_success").count(), 2);
+}
+
+/// Tag rules upstream's `EXTRA_TAGS` parsing cannot express, from gostats' `NewTagSet`: a value's
+/// `:` becomes `_`, empty keys are left out, keys are written as they are.
+#[tokio::test]
+async fn tags_follow_gostats() {
+    let tags = [("", "x"), ("k.e:y", "a:b"), ("b", "1")]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let stats = Stats::new(&tags);
+    stats.config_load_success().inc();
+    let output = Output::default();
+    stats.flush(&Sink::Logging(logging_sink(&output))).await;
+    assert!(
+        output
+            .text()
+            .contains(r#""name":"ratelimit.service.config_load_success.__b=1.__k.e:y=a_b""#),
+        "{}",
+        output.text()
+    );
 }

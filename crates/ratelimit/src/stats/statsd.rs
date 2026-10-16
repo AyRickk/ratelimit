@@ -21,17 +21,31 @@ const APPROX_MAX_MEM_BYTES: usize = 1 << 22;
 const FLUSH_REQUESTS: usize = 8;
 
 pub struct StatsdSink {
-    buffer: Mutex<Buffer>,
+    pending: Arc<Pending>,
     buffer_size: usize,
     queue: mpsc::Sender<Vec<u8>>,
     flushes: mpsc::Sender<oneshot::Sender<()>>,
+}
+
+/// What the sink and its writer share: the lines not yet queued, and the bytes dropped so far.
+struct Pending {
+    lines: Mutex<Vec<u8>>,
+    dropped: Mutex<u64>,
     log: Arc<LoggingSink>,
 }
 
-/// Lines not yet queued, and the bytes dropped so far.
-struct Buffer {
-    lines: Vec<u8>,
-    dropped: Arc<Mutex<u64>>,
+impl Pending {
+    /// gostats' `handleFlushErrorSize`: counts `bytes` as dropped, logging when the total does
+    /// not cross a 32 KiB boundary (sic), and discards the lines not yet queued.
+    fn drop_bytes(&self, lines: &mut Vec<u8>, bytes: usize, reason: &str) {
+        let mut dropped = self.dropped.lock().unwrap();
+        let total = *dropped + bytes as u64;
+        if total % LOG_ON_EVERY_N_DROPPED_BYTES > *dropped % LOG_ON_EVERY_N_DROPPED_BYTES {
+            self.log.error(&format!("dropped {total} bytes: {reason}"));
+        }
+        *dropped = total;
+        lines.clear();
+    }
 }
 
 impl StatsdSink {
@@ -52,26 +66,27 @@ impl StatsdSink {
         };
         let (queue, queued) = mpsc::channel(APPROX_MAX_MEM_BYTES / buffer_size);
         let (flushes, flush_requests) = mpsc::channel(FLUSH_REQUESTS);
-        let dropped = Arc::new(Mutex::new(0));
+        let pending = Arc::new(Pending {
+            lines: Mutex::default(),
+            dropped: Mutex::default(),
+            log: log.clone(),
+        });
         let writer = Writer {
-            address: format!("{host}:{port}"),
+            host: host.to_string(),
+            port,
             protocol,
             connection: None,
             queued,
             flush_requests,
-            dropped: dropped.clone(),
-            log: log.clone(),
+            pending: pending.clone(),
+            log,
         };
         tokio::spawn(writer.run());
         Self {
-            buffer: Mutex::new(Buffer {
-                lines: Vec::new(),
-                dropped,
-            }),
+            pending,
             buffer_size,
             queue,
             flushes,
-            log,
         }
     }
 
@@ -82,45 +97,46 @@ impl StatsdSink {
     /// Adds `line` to the buffer, queueing the buffer first when the line does not fit. A line
     /// longer than a buffer is queued on its own.
     fn write_line(&self, line: &[u8]) {
-        let mut buffer = self.buffer.lock().unwrap();
-        if !buffer.lines.is_empty() && buffer.lines.len() + line.len() > self.buffer_size {
-            let lines = std::mem::take(&mut buffer.lines);
-            self.enqueue(&buffer, lines);
+        let mut pending = self.pending.lines.lock().unwrap();
+        if !pending.is_empty() && pending.len() + line.len() > self.buffer_size {
+            let lines = std::mem::take(&mut *pending);
+            let bytes = lines.len();
+            self.enqueue(&mut pending, lines, bytes);
         }
-        if buffer.lines.is_empty() && line.len() > self.buffer_size {
-            self.enqueue(&buffer, line.to_vec());
+        if pending.is_empty() && line.len() > self.buffer_size {
+            // gostats hands such a line straight to the queue; when it is full, the line goes
+            // without being counted as dropped.
+            self.enqueue(&mut pending, line.to_vec(), 0);
         } else {
-            buffer.lines.extend_from_slice(line);
+            pending.extend_from_slice(line);
         }
     }
 
-    /// Queues `lines` for the writer, or drops them when the queue is full.
-    fn enqueue(&self, buffer: &Buffer, lines: Vec<u8>) -> bool {
-        match self.queue.try_send(lines) {
-            Ok(()) => true,
-            Err(error) => {
-                let lines = match error {
-                    mpsc::error::TrySendError::Full(lines)
-                    | mpsc::error::TrySendError::Closed(lines) => lines,
-                };
-                let reason = format!(
-                    "statsd channel full, dropping stats buffer with {} bytes",
-                    lines.len()
-                );
-                record_drop(&buffer.dropped, &self.log, lines.len(), &reason);
-                false
-            }
-        }
+    /// Queues `lines` for the writer, or, when the queue is full, drops them, counting
+    /// `counted` bytes.
+    fn enqueue(&self, pending: &mut Vec<u8>, lines: Vec<u8>, counted: usize) -> bool {
+        let Err(error) = self.queue.try_send(lines) else {
+            return true;
+        };
+        let (mpsc::error::TrySendError::Full(lines) | mpsc::error::TrySendError::Closed(lines)) =
+            error;
+        let reason = format!(
+            "statsd channel full, dropping stats buffer with {} bytes",
+            lines.len()
+        );
+        self.pending.drop_bytes(pending, counted, &reason);
+        false
     }
 
     /// Queues the buffer and waits until the writer has sent everything queued, or has given
     /// up connecting. Returns at once when the buffer could not be queued.
     pub async fn flush(&self) {
         {
-            let mut buffer = self.buffer.lock().unwrap();
-            if !buffer.lines.is_empty() {
-                let lines = std::mem::take(&mut buffer.lines);
-                if !self.enqueue(&buffer, lines) {
+            let mut pending = self.pending.lines.lock().unwrap();
+            if !pending.is_empty() {
+                let lines = std::mem::take(&mut *pending);
+                let bytes = lines.len();
+                if !self.enqueue(&mut pending, lines, bytes) {
                     return;
                 }
             }
@@ -132,17 +148,6 @@ impl StatsdSink {
     }
 }
 
-/// Counts `bytes` as dropped, logging when the total does not cross a 32 KiB boundary, as
-/// gostats' `handleFlushErrorSize` (sic) does.
-fn record_drop(dropped: &Mutex<u64>, log: &LoggingSink, bytes: usize, reason: &str) {
-    let mut dropped = dropped.lock().unwrap();
-    let total = *dropped + bytes as u64;
-    if total % LOG_ON_EVERY_N_DROPPED_BYTES > *dropped % LOG_ON_EVERY_N_DROPPED_BYTES {
-        log.error(&format!("dropped {total} bytes: {reason}"));
-    }
-    *dropped = total;
-}
-
 enum Connection {
     Tcp(TcpStream),
     Udp(UdpSocket),
@@ -150,12 +155,13 @@ enum Connection {
 
 /// The background task that owns the connection.
 struct Writer {
-    address: String,
+    host: String,
+    port: u16,
     protocol: StatsdProtocol,
     connection: Option<Connection>,
     queued: mpsc::Receiver<Vec<u8>>,
     flush_requests: mpsc::Receiver<oneshot::Sender<()>>,
-    dropped: Arc<Mutex<u64>>,
+    pending: Arc<Pending>,
     log: Arc<LoggingSink>,
 }
 
@@ -184,7 +190,8 @@ impl Writer {
             }
             if let Some(lines) = retry.take() {
                 if let Err((error, unsent)) = self.write(lines).await {
-                    record_drop(&self.dropped, &self.log, unsent.len(), &error);
+                    let mut pending = self.pending.lines.lock().unwrap();
+                    self.pending.drop_bytes(&mut pending, unsent.len(), &error);
                 }
                 continue;
             }
@@ -214,12 +221,24 @@ impl Writer {
     }
 
     async fn connect(&self) -> std::io::Result<Connection> {
+        let address = (self.host.as_str(), self.port);
         let connect = async {
             Ok(match self.protocol {
-                StatsdProtocol::Tcp => Connection::Tcp(TcpStream::connect(&self.address).await?),
+                StatsdProtocol::Tcp => Connection::Tcp(TcpStream::connect(address).await?),
                 StatsdProtocol::Udp => {
-                    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                    socket.connect(&self.address).await?;
+                    let target =
+                        tokio::net::lookup_host(address)
+                            .await?
+                            .next()
+                            .ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::NotFound, "no address")
+                            })?;
+                    let local = match target {
+                        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                        std::net::SocketAddr::V6(_) => "[::]:0",
+                    };
+                    let socket = UdpSocket::bind(local).await?;
+                    socket.connect(target).await?;
                     Connection::Udp(socket)
                 }
             })
@@ -234,9 +253,9 @@ impl Writer {
     /// line is resent whole (docs/parity.md section 7).
     async fn write(&mut self, lines: Vec<u8>) -> Result<(), (String, Vec<u8>)> {
         let mut written = 0;
-        let result = match self.connection.as_mut().expect("connected") {
-            Connection::Tcp(stream) => {
-                let write = async {
+        let write = async {
+            match self.connection.as_mut().expect("connected") {
+                Connection::Tcp(stream) => {
                     while written < lines.len() {
                         match stream.write(&lines[written..]).await {
                             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
@@ -245,13 +264,13 @@ impl Writer {
                         }
                     }
                     Ok(())
-                };
-                tokio::time::timeout(WRITE_TIMEOUT, write)
-                    .await
-                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+                }
+                Connection::Udp(socket) => socket.send(&lines).await.map(|_| ()),
             }
-            Connection::Udp(socket) => socket.send(&lines).await.map(|_| ()),
         };
+        let result = tokio::time::timeout(WRITE_TIMEOUT, write)
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
         result.map_err(|error| {
             self.connection = None;
             (
@@ -261,7 +280,8 @@ impl Writer {
         })
     }
 
-    /// Answers the waiting flushes without sending anything.
+    /// Answers the waiting flushes without sending anything; at most eight times the queue's
+    /// capacity, as gostats' `drainFlushQueue`, so steady flushing cannot hold it.
     fn release_flushes(&mut self) {
         for _ in 0..FLUSH_REQUESTS * 8 {
             match self.flush_requests.try_recv() {

@@ -45,13 +45,13 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ⬜ | |
 | `USE_DOG_STATSD` | `false` | ⬜ | |
 | `USE_DOG_STATSD_MOGRIFIERS` | — | ⬜ | |
-| `USE_STATSD` | `true` | 🚧 | behaviour: `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet |
-| `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet |
-| `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet |
+| `USE_STATSD` | `true` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
+| `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `EXTRA_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet (a value containing `:` makes upstream panic at startup) |
-| `STATS_FLUSH_INTERVAL` | `10s` | 🚧 | behaviour: `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet |
-| `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet |
-| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour: `tests/stats.rs`; not read from the environment yet |
+| `STATS_FLUSH_INTERVAL` | `10s` | 🚧 | behaviour: `tests/stats.rs`; not read from the environment yet |
+| `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
+| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet (gostats also accepts `udp4`, `udp6` and any other network name) |
 | `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `USE_PROMETHEUS` | `false` | ⬜ | |
 | `PROMETHEUS_ADDR` | `:9090` | ⬜ | |
@@ -209,10 +209,10 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
 | `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
-| Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | `tests/differential.rs`, `tests/stats.rs` |
+| Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
 | DogStatsD (+ mogrifiers), native Prometheus + statsd_exporter mapper | ⬜ | |
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
-| `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `tests/differential.rs`, `tests/stats.rs` |
+| `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
 | OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
@@ -242,5 +242,6 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
 | `!!binary` decoding to invalid UTF-8 ⇒ `error parsing metadata` | decoded lossily | Rust strings are UTF-8 |
 | Negative or NaN `NEAR_LIMIT_RATIO`: the near threshold is converted to an integer by the CPU (amd64 wraps a negative value, arm64 gives 0) | 0 | Go leaves out-of-range float conversions to the platform |
+| The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
 | statsd buffers are cut at the same line boundaries as gostats' but are not timed alike (gostats also pushes its buffer every second), so while the server is unreachable which lines are dropped can differ; the queue is bounded alike (about 4 MiB) | buffers pushed only when full or flushed | Not observable while the server is reachable |

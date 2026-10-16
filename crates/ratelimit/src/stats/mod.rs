@@ -8,7 +8,7 @@ mod sink;
 mod statsd;
 
 pub use logging::LoggingSink;
-pub use sink::{Sink, SinkSettings, StatsdProtocol, sink};
+pub use sink::{Sink, SinkSettings, StatsdProtocol, select_sink};
 pub use statsd::StatsdSink;
 
 use std::collections::{BTreeMap, HashMap};

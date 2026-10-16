@@ -474,7 +474,7 @@ struct Harness {
     subject_redis: Redis,
     load_options: LoadOptions,
     /// With `Settings::statsd`, what the oracle and this implementation sent to statsd.
-    statsd: Option<(StatsdServer, StatsdServer)>,
+    statsd: Option<StatsdServers>,
     flushes: std::sync::atomic::AtomicUsize,
 }
 
@@ -492,6 +492,12 @@ struct Settings {
 
 /// The flush that marks the end of each flush in a statsd stream.
 const FLUSHED: &str = "harness.flushed:1|c";
+
+/// The statsd servers each side sends its stats to.
+struct StatsdServers {
+    oracle: StatsdServer,
+    subject: StatsdServer,
+}
 
 /// A statsd server over TCP, keeping every line it receives.
 struct StatsdServer {
@@ -519,8 +525,8 @@ impl StatsdServer {
         Self { address, lines }
     }
 
-    /// The service's lines of the first `count` flushes, each sorted (a flush's order is not
-    /// defined). The oracle's own Redis client stats are left out.
+    /// The lines of the first `count` flushes, each sorted (a flush's order is not defined).
+    /// The stats of the oracle's own Redis client are left out.
     async fn flushes(&self, count: usize) -> Vec<Vec<String>> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -530,10 +536,7 @@ impl StatsdServer {
                 .map(|flush| {
                     let mut flush: Vec<String> = flush
                         .iter()
-                        .filter(|line| {
-                            line.starts_with("ratelimit.service.")
-                                || line.starts_with("reserved_tag")
-                        })
+                        .filter(|line| !line.starts_with("redis."))
                         .cloned()
                         .collect();
                     flush.sort();
@@ -589,12 +592,20 @@ impl Harness {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
         let statsd = match settings.statsd {
-            true => Some((StatsdServer::start().await, StatsdServer::start().await)),
+            true => Some(StatsdServers {
+                oracle: StatsdServer::start().await,
+                subject: StatsdServer::start().await,
+            }),
             false => None,
         };
-        let oracle = Oracle::start(&oracle_redis, &settings, statsd.as_ref().map(|s| &s.0)).await;
-        let subject =
-            Subject::start(&subject_redis, &settings, statsd.as_ref().map(|s| &s.1)).await;
+        let oracle =
+            Oracle::start(&oracle_redis, &settings, statsd.as_ref().map(|s| &s.oracle)).await;
+        let subject = Subject::start(
+            &subject_redis,
+            &settings,
+            statsd.as_ref().map(|s| &s.subject),
+        )
+        .await;
         let mut h = Self {
             oracle,
             oracle_redis,
@@ -637,11 +648,11 @@ impl Harness {
             sink.flush().await;
         }
         assert_eq!(self.subject.stats.snapshot(), expected, "counters");
-        if let Some((oracle, subject)) = &self.statsd {
+        if let Some(statsd) = &self.statsd {
             let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
             assert_eq!(
-                subject.flushes(count).await,
-                oracle.flushes(count).await,
+                statsd.subject.flushes(count).await,
+                statsd.oracle.flushes(count).await,
                 "statsd lines, per flush"
             );
         }

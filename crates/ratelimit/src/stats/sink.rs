@@ -77,7 +77,7 @@ const SEVERAL_SINKS: &str = "Error: unable to use more than one stats sink at th
 /// The sink `settings` select, or why the process cannot start. As upstream, `DISABLE_STATS`
 /// wins, then DogStatsD, statsd and Prometheus each refuse the others, and stats are logged when
 /// none is enabled. Since `USE_STATSD` is on by default, enabling another sink alone is an error.
-pub fn sink(settings: &SinkSettings) -> Result<Sink, String> {
+pub fn select_sink(settings: &SinkSettings) -> Result<Sink, String> {
     let enabled = [
         settings.use_dog_statsd,
         settings.use_statsd,
