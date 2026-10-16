@@ -113,3 +113,20 @@ async fn service_errors_are_unknown_status_with_upstream_message() {
     assert_eq!(status.code(), tonic::Code::Unknown);
     assert_eq!(status.message(), "rate limit domain must not be empty");
 }
+
+#[tokio::test]
+async fn invalid_arguments_are_invalid_argument_status() {
+    let mut client = client().await;
+    let mut request = request("test-domain", &[("foo", "bar")]);
+    request.descriptors[0].limit = Some(
+        ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride {
+            requests_per_unit: 1,
+            unit: 0,
+            unit_multiplier: None,
+        },
+    );
+
+    let status = client.should_rate_limit(request).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}

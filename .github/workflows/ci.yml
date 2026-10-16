@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (${{ matrix.server }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The differential tests run envoyproxy/ratelimit and this implementation against each.
+        server: [redis, valkey]
+    env:
+      # Differential tests compare against envoyproxy/ratelimit (tools/oracle); fail if they cannot run.
+      RATELIMIT_REQUIRE_DIFFERENTIAL: "1"
+      VALKEY_VERSION: 9.1.2
+      VALKEY_SHA256: 0d2a79936cbafa5f527a5175536bb17bd3f767f95f53529e59dddfacf762eec0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: tools/oracle/go.mod
+          cache-dependency-path: tools/oracle/go.sum
+      - name: Install Redis
+        if: matrix.server == 'redis'
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Install Valkey
+        if: matrix.server == 'valkey'
+        run: |
+          archive="valkey-${VALKEY_VERSION}-noble-x86_64"
+          curl -sSfLO "https://download.valkey.io/releases/${archive}.tar.gz"
+          echo "${VALKEY_SHA256}  ${archive}.tar.gz" | sha256sum --check
+          tar -xzf "${archive}.tar.gz"
+          echo "RATELIMIT_REDIS_SERVER=$PWD/${archive}/bin/valkey-server" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          test -z "$(gofmt -l tools/oracle)"
+      - name: Lint
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          (cd tools/oracle && go vet ./...)
+      - name: Test
+        run: cargo test --workspace
