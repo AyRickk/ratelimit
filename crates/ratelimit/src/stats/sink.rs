@@ -1,7 +1,9 @@
 //! Where flushed stats go, chosen like envoyproxy/ratelimit's runner
 //! (`src/service_cmd/runner/runner.go`).
 
-use super::{DogStatsdSettings, DogStatsdSink, LoggingSink, StatsdSink};
+use super::{
+    DogStatsdSettings, DogStatsdSink, LoggingSink, PrometheusSettings, PrometheusSink, StatsdSink,
+};
 
 /// A destination for flushed stats.
 pub enum Sink {
@@ -13,6 +15,8 @@ pub enum Sink {
     Statsd(StatsdSink),
     /// `USE_DOG_STATSD`: DogStatsD lines over UDP.
     Dogstatsd(DogStatsdSink),
+    /// `USE_PROMETHEUS`: a registry served over HTTP.
+    Prometheus(PrometheusSink),
 }
 
 impl Sink {
@@ -22,6 +26,7 @@ impl Sink {
             Sink::Logging(sink) => sink.flush_counter(name, value),
             Sink::Statsd(sink) => sink.flush_counter(name, value),
             Sink::Dogstatsd(sink) => sink.flush_counter(name, value),
+            Sink::Prometheus(sink) => sink.flush_counter(name, value),
         }
     }
 
@@ -33,6 +38,8 @@ impl Sink {
             Sink::Statsd(sink) => sink.flush().await,
             // Upstream's DogStatsD sink cannot be flushed: its client sends every 100 ms.
             Sink::Dogstatsd(_) => {}
+            // Each stat is in the registry as soon as it is flushed.
+            Sink::Prometheus(_) => {}
         }
     }
 }
@@ -62,6 +69,7 @@ pub struct SinkSettings {
     pub statsd_port: u16,
     pub statsd_protocol: StatsdProtocol,
     pub dogstatsd: DogStatsdSettings,
+    pub prometheus: PrometheusSettings,
 }
 
 impl Default for SinkSettings {
@@ -75,6 +83,7 @@ impl Default for SinkSettings {
             statsd_port: 8125,
             statsd_protocol: StatsdProtocol::Tcp,
             dogstatsd: DogStatsdSettings::default(),
+            prometheus: PrometheusSettings::default(),
         }
     }
 }
@@ -106,7 +115,7 @@ pub fn select_sink(settings: &SinkSettings) -> Result<Sink, String> {
         .map_err(|e| format!("Failed to create dogstatsd sink: {e}"));
     }
     if settings.use_prometheus {
-        return Err("USE_PROMETHEUS is not supported yet".into());
+        return PrometheusSink::start(&settings.prometheus).map(Sink::Prometheus);
     }
     if settings.use_statsd {
         return Ok(Sink::Statsd(StatsdSink::new(

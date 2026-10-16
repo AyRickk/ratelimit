@@ -7,6 +7,8 @@ require (
 	github.com/envoyproxy/go-control-plane/envoy v1.37.1-0.20260409083702-98966259b99a
 	github.com/envoyproxy/ratelimit v1.4.1-0.20261006073346-f4e76690d9ce
 	github.com/lyft/gostats v0.4.14
+	github.com/prometheus/client_golang v1.19.1
+	github.com/prometheus/statsd_exporter v0.26.1
 	google.golang.org/grpc v1.83.2
 )
 
@@ -28,12 +30,15 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.40.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.47.1 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/envoyproxy/go-control-plane v0.14.0 // indirect
 	github.com/envoyproxy/go-control-plane/ratelimit v0.1.1-0.20260629194254-5581fade6089 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
+	github.com/go-kit/log v0.2.1 // indirect
+	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
@@ -44,6 +49,9 @@ require (
 	github.com/lyft/goruntime v0.3.0 // indirect
 	github.com/mediocregopher/radix/v4 v4.1.4 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
+	github.com/prometheus/common v0.48.0 // indirect
+	github.com/prometheus/procfs v0.12.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/tilinna/clock v1.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

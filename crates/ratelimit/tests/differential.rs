@@ -14,6 +14,7 @@ use ratelimit::grpc;
 use ratelimit::limiter::Clock;
 use ratelimit::redis::{RedisCache, RedisCacheSettings};
 use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
+use ratelimit::stats::prometheus::{self, PrometheusSettings, PrometheusSink};
 use ratelimit::stats::{
     DogStatsdSettings, DogStatsdSink, Mogrifier, Sink, Stats, StatsdProtocol, StatsdSink,
 };
@@ -376,6 +377,7 @@ impl Oracle {
         all: &Settings,
         statsd: Option<&StatsdServer>,
         dogstatsd: Option<&DogStatsdServer>,
+        prometheus: Option<&Prometheus>,
     ) -> Self {
         let settings = &all.cache;
         let near_limit_ratio = settings.near_limit_ratio.to_string();
@@ -391,6 +393,7 @@ impl Oracle {
             .args(["-near-limit-ratio", &near_limit_ratio])
             .args(statsd.map(|server| format!("-statsd={}", server.address)))
             .args(dogstatsd.map(|server| format!("-dogstatsd={}", server.address)))
+            .args(prometheus.map(Prometheus::oracle_args).unwrap_or_default())
             .env_clear()
             .envs(oracle_environment(all))
             .stdout(Stdio::piped())
@@ -469,6 +472,8 @@ struct Subject {
     clock: Arc<ManualClock>,
     stats: Arc<Stats>,
     sink: Option<Sink>,
+    /// With `Settings::prometheus`: the sink, its exporter's clock and where it serves.
+    prometheus: Option<(PrometheusSink, Arc<AtomicI64>, String)>,
 }
 
 impl Subject {
@@ -477,6 +482,7 @@ impl Subject {
         settings: &Settings,
         statsd: Option<&StatsdServer>,
         dogstatsd: Option<&DogStatsdServer>,
+        prometheus: Option<&Prometheus>,
     ) -> Self {
         let clock = Arc::new(ManualClock::default());
         let stats = Arc::new(Stats::new(&settings.extra_tags));
@@ -491,6 +497,22 @@ impl Subject {
                 DogStatsdSink::new("127.0.0.1", port, sink_settings).unwrap(),
             ));
         }
+        let prometheus = match prometheus {
+            Some(prometheus) => {
+                let exporter_clock = Arc::new(AtomicI64::new(0));
+                let now = exporter_clock.clone();
+                let mapper = prometheus::load_mapper(&prometheus.settings()).unwrap();
+                let clock: prometheus::Clock = Arc::new(move || now.load(Ordering::SeqCst));
+                let prometheus_sink = PrometheusSink::new(mapper, prometheus.path, clock).unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap().to_string();
+                let server = prometheus_sink.clone();
+                tokio::spawn(async move { server.serve(listener).await });
+                sink = Some(Sink::Prometheus(prometheus_sink.clone()));
+                Some((prometheus_sink, exporter_clock, address))
+            }
+            None => None,
+        };
         let cache = RedisCache::new(
             redis.connect().await,
             clock.clone(),
@@ -519,6 +541,7 @@ impl Subject {
             clock,
             stats,
             sink,
+            prometheus,
         }
     }
 }
@@ -533,6 +556,9 @@ struct Harness {
     statsd: Option<StatsdServers>,
     /// With `Settings::dogstatsd`, what they sent to DogStatsD.
     dogstatsd: Option<DogStatsdServers>,
+    /// With `Settings::prometheus`, where the oracle serves its metrics.
+    prometheus: Option<String>,
+    prometheus_path: &'static str,
     flushes: std::sync::atomic::AtomicUsize,
 }
 
@@ -548,6 +574,177 @@ struct Settings {
     statsd: bool,
     /// The same with DogStatsD, configured so.
     dogstatsd: Option<DogStatsd>,
+    /// Also send the stats to the Prometheus sink on each side, and compare what they serve.
+    prometheus: Option<Prometheus>,
+}
+
+/// The Prometheus sink's configuration, for both sides.
+#[derive(Clone)]
+struct Prometheus {
+    /// `PROMETHEUS_PATH`.
+    path: &'static str,
+    /// `PROMETHEUS_MAPPER_YAML`: a file with this content, a missing file, or the default.
+    mapper: MapperFile,
+    /// `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS`.
+    milliseconds: bool,
+    /// Where the oracle serves it (a free port, as upstream cannot report the one it gets).
+    oracle_address: String,
+}
+
+#[derive(Clone)]
+enum MapperFile {
+    Default,
+    Content(PathBuf),
+    Missing,
+}
+
+impl Prometheus {
+    async fn new(mapper: Option<&str>) -> Self {
+        let mapper = match mapper {
+            None => MapperFile::Default,
+            Some(content) => {
+                let path = std::env::temp_dir().join(format!(
+                    "ratelimit-mapper-{}-{}.yaml",
+                    std::process::id(),
+                    free_port().await
+                ));
+                std::fs::write(&path, content).unwrap();
+                MapperFile::Content(path)
+            }
+        };
+        Self {
+            path: "/metrics",
+            mapper,
+            milliseconds: false,
+            oracle_address: format!("127.0.0.1:{}", free_port().await),
+        }
+    }
+
+    fn mapper_path(&self) -> String {
+        match &self.mapper {
+            MapperFile::Default => String::new(),
+            MapperFile::Content(path) => path.to_string_lossy().into_owned(),
+            MapperFile::Missing => "/nonexistent/ratelimit-mapper.yaml".into(),
+        }
+    }
+
+    fn settings(&self) -> PrometheusSettings {
+        PrometheusSettings {
+            addr: String::new(),
+            path: self.path.into(),
+            mapper_yaml: self.mapper_path(),
+            response_time_as_milliseconds: self.milliseconds,
+        }
+    }
+
+    fn oracle_args(&self) -> Vec<String> {
+        vec![
+            format!("-prometheus={}", self.oracle_address),
+            format!("-prometheus-path={}", self.path),
+            format!("-prometheus-mapper={}", self.mapper_path()),
+            format!("-prometheus-ms={}", self.milliseconds),
+        ]
+    }
+}
+
+/// An HTTP answer, as far as the two sides must agree on it.
+#[derive(Debug, PartialEq)]
+struct Scraped {
+    status: u16,
+    /// Content-Type, Content-Encoding, Location and X-Content-Type-Options.
+    headers: BTreeMap<String, String>,
+    /// Decompressed.
+    body: String,
+}
+
+/// Sends an HTTP/1.0 request to `address`; returns the answer.
+async fn http_request(
+    address: &str,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> Scraped {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = None;
+    for _ in 0..300 {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            // The oracle's listener starts in the background.
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+    let mut stream = stream.expect("the Prometheus listener");
+    let mut request = format!("{method} {target} HTTP/1.0\r\nHost: scrape\r\n");
+    for (name, value) in headers {
+        request += &format!("{name}: {value}\r\n");
+    }
+    request += "\r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("an HTTP answer");
+    let head = String::from_utf8_lossy(&response[..split]).into_owned();
+    let raw_body = &response[split + 4..];
+    let mut lines = head.lines();
+    let status = lines.next().unwrap()[9..12].parse().unwrap();
+    let mut kept = BTreeMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').unwrap();
+        let name = name.trim().to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "content-type" | "content-encoding" | "location" | "x-content-type-options"
+        ) {
+            kept.insert(name, value.trim().to_string());
+        }
+    }
+    let body = match kept.get("content-encoding").map(String::as_str) {
+        Some("gzip") => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(raw_body), &mut text)
+                .unwrap();
+            text
+        }
+        _ => String::from_utf8_lossy(raw_body).into_owned(),
+    };
+    Scraped {
+        status,
+        headers: kept,
+        body,
+    }
+}
+
+/// Upstream's answer without what only Go serves: the `go_*` and `process_*` families
+/// (docs/parity.md §7). In Gather errors, which print protobuf messages with randomized
+/// spacing and a creation time, spaces are collapsed and the time left out.
+fn comparable(mut scraped: Scraped, upstream: bool) -> Scraped {
+    if upstream {
+        scraped.body = scraped
+            .body
+            .lines()
+            .filter(|line| {
+                let name = line
+                    .strip_prefix("# HELP ")
+                    .or_else(|| line.strip_prefix("# TYPE "))
+                    .unwrap_or(line);
+                !name.starts_with("go_") && !name.starts_with("process_")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+    }
+    if scraped.status == 500 {
+        let created = regex::Regex::new(r"created_timestamp:\s*\{[^}]*\}\s*").unwrap();
+        let body = created.replace_all(&scraped.body, "");
+        let spaces = regex::Regex::new(r" +").unwrap();
+        scraped.body = spaces.replace_all(&body, " ").replace(" }", "}");
+    }
+    scraped
 }
 
 /// A mogrifier, for both sides.
@@ -809,6 +1006,7 @@ impl Harness {
             &settings,
             statsd.as_ref().map(|s| &s.oracle),
             dogstatsd.as_ref().map(|s| &s.oracle),
+            settings.prometheus.as_ref(),
         )
         .await;
         let subject = Subject::start(
@@ -816,6 +1014,7 @@ impl Harness {
             &settings,
             statsd.as_ref().map(|s| &s.subject),
             dogstatsd.as_ref().map(|s| &s.subject),
+            settings.prometheus.as_ref(),
         )
         .await;
         let mut h = Self {
@@ -826,6 +1025,8 @@ impl Harness {
             load_options: settings.load,
             statsd,
             dogstatsd,
+            prometheus_path: settings.prometheus.as_ref().map_or("/metrics", |p| p.path),
+            prometheus: settings.prometheus.map(|p| p.oracle_address),
             flushes: Default::default(),
         };
         h.load_config(config).await.unwrap();
@@ -857,7 +1058,9 @@ impl Harness {
         let expected = self.oracle.stats().await;
         if let Some(sink) = &self.subject.sink {
             self.subject.stats.flush(sink).await;
-            sink.flush_counter("harness.flushed", 1);
+            if !matches!(sink, Sink::Prometheus(_)) {
+                sink.flush_counter("harness.flushed", 1);
+            }
             sink.flush().await;
         }
         assert_eq!(self.subject.stats.snapshot(), expected, "counters");
@@ -876,6 +1079,51 @@ impl Harness {
                 "statsd lines, per flush"
             );
         }
+        if self.prometheus.is_some() {
+            self.scrape("GET", self.prometheus_path, &[]).await;
+        }
+    }
+
+    /// Sends the same request to both Prometheus listeners and checks they answer the same;
+    /// returns upstream's answer.
+    async fn scrape(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Scraped {
+        let oracle = self.prometheus.as_ref().expect("Settings::prometheus");
+        let subject = &self.subject.prometheus.as_ref().unwrap().2;
+        let expected = comparable(http_request(oracle, method, target, headers).await, true);
+        let actual = comparable(http_request(subject, method, target, headers).await, false);
+        assert_eq!(actual, expected, "{method} {target} {headers:?}");
+        expected
+    }
+
+    /// Flushes `stats` (type, name, value) straight into both Prometheus sinks, then compares
+    /// what they serve.
+    async fn flush_to_prometheus(&self, stats: &[(&str, &str, f64)]) -> Scraped {
+        let body: String = stats
+            .iter()
+            .map(|(kind, name, value)| format!("{kind} {name} {value}\n"))
+            .collect();
+        let (status, response) = self.oracle.send("POST", "/flush", &body).await;
+        assert_eq!(status, 200, "oracle /flush: {response}");
+        let sink = &self.subject.prometheus.as_ref().unwrap().0;
+        for (kind, name, value) in stats {
+            match *kind {
+                "counter" => sink.flush_counter(name, *value as u64),
+                "gauge" => sink.flush_gauge(name, *value as u64),
+                "timer" => sink.flush_timer(name, *value),
+                other => panic!("unknown stat type {other}"),
+            }
+        }
+        self.scrape("GET", self.prometheus_path, &[]).await
+    }
+
+    /// Moves statsd_exporter's clock on both sides (nanoseconds), then lets them remove stale
+    /// series, and compares what they serve.
+    async fn exporter_at(&self, nanos: i64) -> Scraped {
+        self.oracle.put("/exporter-time", nanos.to_string()).await;
+        let (sink, clock, _) = self.subject.prometheus.as_ref().unwrap();
+        clock.store(nanos, Ordering::SeqCst);
+        sink.remove_stale_metrics();
+        self.scrape("GET", self.prometheus_path, &[]).await
     }
 
     async fn at(&mut self, now: i64) {
@@ -2215,4 +2463,525 @@ async fn dogstatsd_without_an_entity_id_like_upstream() {
         .await
         .unwrap();
     h.assert_same_redis().await;
+}
+
+const NESTED: &str = "
+domain: llm
+descriptors:
+  - key: user
+    rate_limit: {unit: minute, requests_per_unit: 1000}
+  - key: org
+    descriptors:
+      - key: model
+        rate_limit: {unit: minute, requests_per_unit: 2}
+  - key: shadow
+    shadow_mode: true
+    rate_limit: {unit: hour, requests_per_unit: 1}
+";
+
+/// The counters reach Prometheus through upstream's default mapper: one-key descriptors by its
+/// globs, deeper ones by its unanchored regexes, the rest escaped; values in Go's format.
+#[tokio::test]
+async fn counters_are_exposed_to_prometheus_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: RedisCacheSettings {
+            local_cache_size_in_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+        prometheus: Some(Prometheus::new(None).await),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(NESTED, settings).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "alice")]]);
+    h.call(with_hits(user(), 1_000_000, &[None])).await.unwrap();
+    h.call(user()).await.unwrap();
+    let model = || request("llm", &[&[("org", "acme"), ("model", "gpt")]]);
+    for _ in 0..4 {
+        h.call(model()).await.unwrap();
+    }
+    h.call(request("llm", &[&[("shadow", "s")]])).await.unwrap();
+    h.call(request("é-x", &[&[("a", "b")]])).await.unwrap();
+    h.call(request("9th", &[&[("a", "b")]])).await.unwrap();
+}
+
+/// promhttp's answer: gzip when the first Accept-Encoding lists it, the `escaping` parameter
+/// echoed, any method; Go's mux around the path.
+#[tokio::test]
+async fn prometheus_scrapes_are_answered_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        prometheus: Some(Prometheus::new(None).await),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    h.call(request("llm", &[&[("user", "alice")]]))
+        .await
+        .unwrap();
+    for headers in [
+        &[("Accept-Encoding", "gzip")][..],
+        &[("Accept-Encoding", "br, gzip;q=0")],
+        &[("Accept-Encoding", "GZIP")],
+        &[("Accept", "text/plain;version=0.0.4;escaping=underscores")],
+        &[("Accept", "application/json;escaping=dots, text/plain;q=0.5")],
+        &[("Accept", "text/plain;escaping=bogus")],
+        &[(
+            "Accept",
+            "*/*;escaping=allow-utf-8,text/plain;version=1.0.0",
+        )],
+    ] {
+        h.scrape("GET", "/metrics", headers).await;
+    }
+    h.scrape("POST", "/metrics", &[]).await;
+    h.scrape("HEAD", "/metrics", &[]).await;
+    for target in [
+        "/metrics?x=1",
+        "/metrics/",
+        "/",
+        "/other",
+        "/a/../metrics",
+        "//metrics?q",
+    ] {
+        h.scrape("GET", target, &[]).await;
+    }
+}
+
+/// What the mapper decided for one name, shaped like the oracle's JSON.
+fn mapped_json(mapped: Option<prometheus::Mapped>) -> serde_json::Value {
+    use prometheus::{Action, MatchType, ObserverType};
+    use serde_json::json;
+    let Some(m) = mapped else {
+        return json!({"matched": false, "name": "", "labels": null, "action": "", "help": "",
+            "honor_labels": false, "observer_type": "", "match_type": "", "match_metric_type": "",
+            "ttl": 0, "scale": null, "histogram_options": null, "summary_options": null});
+    };
+    let objectives = |o: &Option<Vec<prometheus::Objective>>| {
+        o.as_ref().map(|o| {
+            o.iter()
+                .map(|q| json!({"Quantile": q.quantile, "Error": q.error}))
+                .collect::<Vec<_>>()
+        })
+    };
+    json!({
+        "matched": true,
+        "name": m.name,
+        "labels": m.labels,
+        "action": match m.action { Action::Map => "map", Action::Drop => "drop" },
+        "help": m.help,
+        "honor_labels": m.honor_labels,
+        "observer_type": match m.observer_type {
+            None => "",
+            Some(ObserverType::Histogram) => "histogram",
+            Some(ObserverType::Summary) => "summary",
+        },
+        "match_type": match m.match_type { MatchType::Glob => "glob", MatchType::Regex => "regex" },
+        "match_metric_type": m.match_metric_type.map_or("", |t| t.as_str()),
+        "ttl": m.ttl,
+        "scale": m.scale,
+        "histogram_options": m.histogram_options.map(|h| json!({
+            "Buckets": h.buckets,
+            "NativeHistogramBucketFactor": h.native_histogram_bucket_factor,
+            "NativeHistogramMaxBuckets": h.native_histogram_max_buckets,
+        })),
+        "summary_options": m.summary_options.map(|s| json!({
+            "Quantiles": objectives(&s.quantiles),
+            "MaxAge": s.max_age,
+            "AgeBuckets": s.age_buckets,
+            "BufCap": s.buf_cap,
+        })),
+    })
+}
+
+/// JSON numbers as floats, so that Go's `1` and Rust's `1.0` compare equal.
+fn floats(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Number(n) => serde_json::json!(n.as_f64().unwrap()),
+        Value::Array(items) => Value::Array(items.into_iter().map(floats).collect()),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, floats(v))).collect()),
+        other => other,
+    }
+}
+
+/// Mapper files, valid or not, that exercise statsd_exporter's decoding, validation, glob
+/// FSM (ordering, prefixes, duplicates, backtracking), regexes and templates.
+const MAPPERS: &[&str] = &[
+    include_str!("../src/stats/prometheus/default_mapper.yaml"),
+    "",
+    "mappings:",
+    "defaults: {observer_type: histogram, ttl: 1m, buckets: [1, 2], quantiles: [{quantile: 0.4, error: 0.1}]}
+mappings:
+- match: a.*.c
+  name: abc_$1
+  labels: {first: $1, both: \"$1-$1\", none: $2, braced: \"${1}x\", zero: $0, pct: \"%d$1%\", big: $10, mix: \"$1 $10\"}
+- match: a.b.*
+  name: ab
+  match_metric_type: counter
+  help: The help.
+  ttl: 10
+- match: a.b
+  name: shorter_prefix
+- match: a.*.c
+  name: duplicate
+- match: '*.*.*'
+  name: any_three
+  action: drop
+  match_metric_type: gauge
+- match: x.*
+  name: x_$1
+  timer_type: summary
+  scale: 0.5
+  summary_options: {max_age: 1h30m, age_buckets: 3, buf_cap: 7}
+",
+    "defaults: {glob_disable_ordering: true, match_type: regex, observer_type: \"\"}
+mappings:
+- match: '^ratelimit\\.(\\w+)\\.(?P<rest>.+)$'
+  name: rl_${1}
+  labels: {lit: \"$$1\", rest: $rest, named: \"${rest}\", missing: $9, tail: \"$1x$\", word: $rest_}
+- match: 'b(.)'
+  name: unanchored
+  match_metric_type: timer
+  histogram_options: {buckets: [0.5, 5], native_histogram_bucket_factor: 2}
+  observer_type: histogram
+- match: a.*
+  match_type: glob
+  name: glob_$1
+- match: a.b
+  match_type: glob
+  name: glob_exact
+",
+    "mappings:
+- match: a.*
+  name: one
+- match: '*.b'
+  name: two
+- match: '*.*.c'
+  name: three
+- match: a.b.*
+  name: four
+- match: test.*.*.*
+  name: deep_$3_$1
+  labels: {kk: v, xx: '$2'}
+",
+    "mappings:
+- {match: a.b, name: \"$1\"}
+- {match: a.c, name: ok}",
+    "mappings:\n- {match: a, name: n, labels: {a: b}}",
+    "mappings:\n- {match: a, name: 1n}",
+    "mappings:\n- {match: 'a*', name: n}",
+    "mappings:\n- {match: '(', name: n, match_type: regex}",
+    "mappings:\n- {match: a, name: n, match_type: other}",
+    "mappings:\n- {match: a, name: n, buckets: [1], histogram_options: {buckets: [2]}}",
+    "mappings:\n- {match: a, name: n, buckets: [], histogram_options: {buckets: []}}",
+    "mappings:\n- {match: a, name: n, observer_type: histogram, summary_options: {}}",
+    "mappings:\n- {match: a, name: n, observer_type: summary, histogram_options: ~}",
+    "mappings:\n- {match: a, name: n, scale: '0.5'}",
+    "mappings:\n- {match: a, name: n, ttl: 1.5x}",
+    "mappings:\n- {match: a, name: n, ttl: 2.5}\n- {match: b, name: m, ttl: '-1h2m3.5s'}",
+    "mappings:\n- {match: a, name: n, unknown_key: 1, action: ''}\nother: true",
+    "mappings:\n- ~\n",
+    "mappings: 3",
+    "defaults: {ttl: 5s, match_type: glob}\nmappings:\n- {match: a, name: n, ttl: 0}\n- {match: b, name: m, match_metric_type: observer, quantiles: [{quantile: 0.1}]}",
+    "registerer: x",
+    "registerer: ~\nmappingscount: ~",
+    "mappingscount: 1",
+    "logger: {a: b}",
+    "fsm: {backtrackingneeded: yes, orderingdisabled: 2}",
+    "fsm: {backtrackingneeded: yes}\nmappings:\n- {match: a, name: n}",
+    "fsm: 3",
+    "mappings:\n- {match: a.*.*, name: \"n_$2\", labels: {ll: \"${2}${1}\"}}\n- {match: a.*.*, name: second}\n- {match: a.x.*, name: specific}",
+];
+
+/// Names to map: the stats the service emits, and every short path over a few segments that
+/// the mapper files above care about.
+fn mapper_names() -> Vec<String> {
+    let mut names: Vec<String> = [
+        "ratelimit.service.rate_limit.llm.user_alice.total_hits",
+        "ratelimit.service.rate_limit.llm.org_acme.model_gpt.near_limit",
+        "ratelimit.service.rate_limit.llm.org_acme.model_gpt.over_limit_with_local_cache",
+        "ratelimit.service.rate_limit.a.b.c.d.within_limit",
+        "ratelimit.service.rate_limit.x.shadow_mode",
+        "ratelimit.service.call.should_rate_limit.redis_error",
+        "ratelimit_server.ShouldRateLimit.response_time",
+        "ratelimit_server.ShouldRateLimit.total_requests",
+        "ratelimit.service.config_load_success",
+        "ratelimit.service.config_load_error",
+        "test.dispatcher.FooProcessor.send.success",
+        "x.y",
+        "",
+        "a..c",
+        "a.*.c",
+        "é.b.c",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let segments = ["a", "b", "c", "x", "*", "test"];
+    let mut paths = vec![String::new()];
+    for _ in 0..4 {
+        let mut longer = Vec::new();
+        for path in &paths {
+            for segment in segments {
+                let name = match path.is_empty() {
+                    true => segment.to_string(),
+                    false => format!("{path}.{segment}"),
+                };
+                longer.push(name);
+            }
+        }
+        names.extend(longer.iter().cloned());
+        paths = longer;
+    }
+    names
+}
+
+/// statsd_exporter's mapper, ported: the same files load or fail, and every name maps to the
+/// same name, labels and options.
+#[tokio::test]
+async fn the_prometheus_mapper_maps_like_statsd_exporter() {
+    if !tools_available() {
+        return;
+    }
+    let h = Harness::start(TOKENS).await;
+    let names = mapper_names();
+    let types = [
+        prometheus::MetricType::Counter,
+        prometheus::MetricType::Gauge,
+        prometheus::MetricType::Observer,
+    ];
+    for yaml in MAPPERS {
+        let (status, error) = h.oracle.send("PUT", "/mapper", yaml).await;
+        let mapper = prometheus::Mapper::from_yaml(yaml);
+        let outcome = match &mapper {
+            Ok(_) => 200,
+            Err(prometheus::MapperError::Invalid(_)) => 422,
+            Err(prometheus::MapperError::Panic(_)) => 500,
+        };
+        assert_eq!(
+            outcome, status,
+            "loading {yaml}: upstream {error}, ours {mapper:?}"
+        );
+        let mapper = mapper.unwrap_or_default();
+        let mut body = String::new();
+        let mut expected_order = Vec::new();
+        for name in &names {
+            for t in types {
+                body += &format!("{} {name}\n", t.as_str());
+                expected_order.push((t, name));
+            }
+        }
+        let (status, response) = h.oracle.send("POST", "/map", &body).await;
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response.lines().count(), expected_order.len(), "{response}");
+        for ((t, name), line) in expected_order.into_iter().zip(response.lines()) {
+            let expected: serde_json::Value = serde_json::from_str(line).unwrap();
+            let actual = mapped_json(mapper.get_mapping(name, t));
+            assert_eq!(
+                floats(actual),
+                floats(expected),
+                "{} {name} with {yaml}",
+                t.as_str()
+            );
+        }
+    }
+}
+
+/// Gauges and timers too: response times in a histogram scaled to seconds, other observers
+/// by the defaults; a name taken by another type is a conflict, a negative scaled counter an
+/// error; histogram and counter names that collide make the scrape fail.
+#[tokio::test]
+async fn gauges_and_timers_reach_prometheus_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mapper = "
+defaults: {observer_type: histogram, buckets: [1, 10, .inf]}
+mappings:
+- match: ratelimit_server.*.response_time
+  name: response_time_seconds
+  timer_type: histogram
+  scale: 0.001
+  labels: {grpc_method: $1}
+- match: neg.*
+  name: negative
+  scale: -1
+- match: empty.*
+  name: $2
+- match: drop.*
+  name: dropped
+  action: drop
+";
+    let settings = Settings {
+        prometheus: Some(Prometheus::new(Some(mapper)).await),
+        ..Default::default()
+    };
+    let h = Harness::configured(TOKENS, settings).await;
+    h.flush_to_prometheus(&[
+        (
+            "timer",
+            "ratelimit_server.ShouldRateLimit.response_time",
+            3.0,
+        ),
+        (
+            "timer",
+            "ratelimit_server.ShouldRateLimit.response_time",
+            1500.0,
+        ),
+        (
+            "timer",
+            "ratelimit_server.ShouldRateLimit.response_time",
+            20_000.0,
+        ),
+        ("timer", "other.timer", 0.5),
+        ("timer", "other.timer", 12.0),
+        ("gauge", "cache.size", 10.0),
+        ("gauge", "cache.size", 3.0),
+        ("gauge", "local.cache", 1_234_567.0),
+        ("counter", "neg.x", 2.0),
+        ("counter", "empty.x", 1.0),
+        ("counter", "drop.x", 1.0),
+        ("gauge", "other.timer", 1.0),
+        ("counter", "other_timer_bucket", 1.0),
+        ("counter", "plain", 1.0),
+        ("counter", "dash--es---here-", 1.0),
+        ("counter", "late_sum", 1.0),
+        ("timer", "late", 1.0),
+    ])
+    .await;
+    // A counter named like a histogram's series: upstream's registry takes it, Gather refuses.
+    h.flush_to_prometheus(&[("counter", "other_timer_sum", 1.0)])
+        .await;
+}
+
+/// A custom mapper file: its help texts and labels; a series not updated within its TTL
+/// disappears and restarts from 0.
+#[tokio::test]
+async fn a_prometheus_mapper_file_is_used_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mapper = "
+mappings:
+- match: ratelimit.service.rate_limit.*.*.*
+  name: rl_$3
+  help: Rate limit counters.
+  ttl: 2s
+  labels: {domain: $1, descriptor: $2}
+";
+    let settings = Settings {
+        prometheus: Some(Prometheus::new(Some(mapper)).await),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    h.exporter_at(1_000_000_000).await;
+    h.call(request("llm", &[&[("user", "alice")]]))
+        .await
+        .unwrap();
+    h.exporter_at(2_000_000_000).await;
+    h.call(request("llm", &[&[("user", "bob")]])).await.unwrap();
+    h.exporter_at(3_000_000_001).await;
+    let scraped = h.exporter_at(4_000_000_001).await;
+    assert!(!scraped.body.contains("alice"), "{}", scraped.body);
+    h.call(request("llm", &[&[("user", "alice")]]))
+        .await
+        .unwrap();
+}
+
+/// Series the registry takes but Gather refuses make every scrape fail with its error: a
+/// reserved label name, a series that duplicates one of statsd_exporter's own.
+#[tokio::test]
+async fn invalid_series_fail_prometheus_scrapes_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    for mapping in [
+        "{match: ratelimit.service.config_load_success, name: loads, labels: {__reserved: x}}",
+        // The same help, as which family Go collects first, and so which help it expects, is
+        // random.
+        "{match: ratelimit.service.config_load_success, name: statsd_exporter_events_total, \
+         labels: {type: counter}, help: The total number of StatsD events seen.}",
+    ] {
+        let mapper = format!("mappings:\n- {mapping}\n");
+        let settings = Settings {
+            prometheus: Some(Prometheus::new(Some(&mapper)).await),
+            ..Default::default()
+        };
+        let h = Harness::configured(TOKENS, settings).await;
+        let scraped = h
+            .scrape("GET", "/metrics", &[("Accept-Encoding", "gzip")])
+            .await;
+        assert_eq!(scraped.status, 500, "{}", scraped.body);
+    }
+}
+
+/// A mapper file that cannot be read, or does not load, maps nothing: the default mapper is
+/// not used instead.
+#[tokio::test]
+async fn an_unusable_prometheus_mapper_file_maps_nothing_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    for mapper in [None, Some("mappings: [{match: a, name: 1}]")] {
+        let mut prometheus = Prometheus::new(mapper).await;
+        if mapper.is_none() {
+            prometheus.mapper = MapperFile::Missing;
+        }
+        let settings = Settings {
+            prometheus: Some(prometheus),
+            ..Default::default()
+        };
+        let mut h = Harness::configured(TOKENS, settings).await;
+        h.at(1_700_000_000).await;
+        h.call(request("llm", &[&[("user", "alice")]]))
+            .await
+            .unwrap();
+        h.flush_to_prometheus(&[("gauge", "ratelimit.localcache.entryCount", 2.0)])
+            .await;
+    }
+}
+
+/// `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` drops the default mapper's scaling; a subtree
+/// `PROMETHEUS_PATH` serves everything under it and redirects to it.
+#[tokio::test]
+async fn prometheus_options_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut prometheus = Prometheus::new(None).await;
+    prometheus.milliseconds = true;
+    prometheus.path = "/stats/";
+    let settings = Settings {
+        prometheus: Some(prometheus),
+        ..Default::default()
+    };
+    let h = Harness::configured(TOKENS, settings).await;
+    for target in [
+        "/stats/",
+        "/stats",
+        "/stats/x?y",
+        "/metrics",
+        "/stats/../stats/",
+    ] {
+        h.scrape("GET", target, &[]).await;
+    }
+    let time = "ratelimit_server.ShouldRateLimit.response_time";
+    let body = h
+        .oracle
+        .send("POST", "/flush", &format!("timer {time} 7\n"))
+        .await;
+    assert_eq!(body.0, 200);
+    h.subject
+        .prometheus
+        .as_ref()
+        .unwrap()
+        .0
+        .flush_timer(time, 7.0);
+    h.scrape("GET", "/stats/", &[]).await;
 }

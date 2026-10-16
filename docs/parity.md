@@ -55,11 +55,11 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
 | `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet (gostats also accepts `udp4`, `udp6` and any other network name) |
 | `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `USE_PROMETHEUS` | `false` | ⬜ | |
-| `PROMETHEUS_ADDR` | `:9090` | ⬜ | |
-| `PROMETHEUS_PATH` | `/metrics` | ⬜ | |
-| `PROMETHEUS_MAPPER_YAML` | — | ⬜ | |
-| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | ⬜ | |
+| `USE_PROMETHEUS` | `false` | 🚧 | behaviour: `tests/stats.rs`, `tests/prometheus.rs` (selection); not read from the environment yet |
+| `PROMETHEUS_ADDR` | `:9090` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `PROMETHEUS_PATH` | `/metrics` | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not read from the environment yet |
+| `PROMETHEUS_MAPPER_YAML` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not read from the environment yet |
+| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
 | `RUNTIME_ROOT` | `/srv/runtime_data/current` | ⬜ | |
 | `RUNTIME_SUBDIRECTORY` | — | ⬜ | |
 | `RUNTIME_APPDIRECTORY` | `config` | ⬜ | |
@@ -213,7 +213,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
 | DogStatsD (+ mogrifiers, global tags, origin detection) | ✅ | lines and tags: `tests/differential.rs`; datagrams, `int64` values, mogrifier rules and errors, origin detection: `tests/dogstatsd.rs` |
-| Native Prometheus + statsd_exporter mapper | ⬜ | |
+| Native Prometheus + statsd_exporter mapper: counters, gauges, histograms, TTLs, self-metrics, scrape answers | ✅ | mapper (loading, globs, regexes, templates) against statsd_exporter itself, series, text format, Gather errors, HTTP answers: `tests/differential.rs`; what panics upstream: `tests/prometheus.rs` |
+| Prometheus summaries (observers not mapped to a histogram) | ⬜ | upstream's only timer, `response_time`, is a histogram with the default mapper |
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
@@ -240,6 +241,16 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
 | `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
 | Go stats (`go.*`), `/stats` expvar, pprof | Rust process stats, documented equivalents | no Rust equivalent |
+| The Prometheus registry also holds Go's `go_*` and `process_*` collectors (a mapped name colliding with them makes scrapes fail) | not exposed | no Rust equivalent; see the row above |
+| Go's default mux also serves `/debug/pprof/*` and `/debug/vars` on `PROMETHEUS_ADDR` (405 for other methods) | 404 | the same pprof and expvar question as above |
+| A `PROMETHEUS_PATH` Go's mux panics on (not a clean absolute path), or reads as a method, a host or wildcards | error at startup; method, host and wildcard patterns are not supported | D1; not needed by the targeted deployments |
+| A Prometheus mapper file using the top-level `buckets` or `quantiles` in a way statsd_exporter warns about, or setting `registerer`, `mappingscount` or `logger`, makes upstream panic at startup (its mapper has no logger) | error at startup | D1 |
+| A histogram series with an `le` label or buckets not in increasing order makes upstream's exporter panic, which stops the process | the event counts in `statsd_exporter_events_conflict_total` | D1 |
+| A scrape asking for protobuf gets it | the text format (with the same `Content-Type` parameters) | Prometheus asks for text unless native histograms are enabled |
+| When a Prometheus scrape fails, Go gathers concurrently: the order of several errors, and which of two help texts counts as expected, are random; the messages print metrics as Go prototext with random spacing and their creation time | registration order; single spaces, no creation time | deterministic |
+| The text format sorts series with the same label values but different label names in a random order; gzip output is Go's | by label names; the same text, compressed by `flate2` | deterministic; the decompressed body is identical |
+| A Prometheus mapper template with `%` directives using flags, widths or precisions (e.g. `%5s`) next to a `$n` is formatted by Go's `fmt` | printed as an unknown verb (`%!5(string=…)`) | not worth porting `fmt`; plain verbs, `%%` and missing or extra arguments match |
+| An `Accept` header with more than 12 clauses of equal weight is ordered by Go's pdqsort | kept in order | the order only matters for the `escaping` parameter |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |

@@ -12,10 +12,27 @@
 //	                                         the flush also reaches the statsd server, followed
 //	                                         by a "harness.flushed:1|c" line; with -dogstatsd,
 //	                                         the DogStatsD server, the same way.
+//	PUT /mapper  body: statsd_exporter mapper YAML    loads it into a standalone mapper (not the
+//	                                         sink's), as upstream's sink would (without a
+//	                                         logger); 422 with the error when it does not load,
+//	                                         500 when loading it panics
+//	POST /map    body: "<type> <name>" lines  maps each name with that mapper; returns one JSON
+//	                                         object per line
+//
+// With -prometheus, the stats also go to upstream's Prometheus sink, served on that address:
+//
+//	POST /flush  body: "<counter|gauge|timer> <name> <value>" lines
+//	                                         flushes them straight into the sink
+//	PUT /exporter-time  body: unix nanoseconds
+//	                                         sets statsd_exporter's clock, then lets it remove
+//	                                         stale series
+//
+// GET /stats and POST /flush answer once the sink's exporter has handled every event.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +50,7 @@ import (
 	"github.com/coocood/freecache"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	gostats "github.com/lyft/gostats"
+	"github.com/prometheus/statsd_exporter/pkg/mapper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 
@@ -44,7 +62,10 @@ import (
 	ratelimit "github.com/envoyproxy/ratelimit/src/service"
 	"github.com/envoyproxy/ratelimit/src/settings"
 	"github.com/envoyproxy/ratelimit/src/stats"
+	"github.com/envoyproxy/ratelimit/src/stats/prom"
 	"github.com/envoyproxy/ratelimit/src/utils"
+	"github.com/prometheus/client_golang/prometheus"
+	exporterclock "github.com/prometheus/statsd_exporter/pkg/clock"
 )
 
 type clock struct{ now atomic.Int64 }
@@ -85,23 +106,67 @@ func (s *countingSink) FlushCounter(name string, value uint64) {
 func (s *countingSink) FlushGauge(name string, value uint64)  {}
 func (s *countingSink) FlushTimer(name string, value float64) {}
 
-// teeSink flushes to both sinks.
+// teeSink flushes to both sinks, counting what reaches the upstream one.
 type teeSink struct {
-	counting *countingSink
-	upstream gostats.Sink
+	counting   *countingSink
+	upstream   gostats.Sink
+	prometheus bool
+	sent       atomic.Int64
 }
 
 func (s *teeSink) FlushCounter(name string, value uint64) {
 	s.counting.FlushCounter(name, value)
-	s.upstream.FlushCounter(name, value)
+	if s.forward(name) {
+		s.upstream.FlushCounter(name, value)
+	}
 }
 func (s *teeSink) FlushGauge(name string, value uint64) {
 	s.counting.FlushGauge(name, value)
-	s.upstream.FlushGauge(name, value)
+	if s.forward(name) {
+		s.upstream.FlushGauge(name, value)
+	}
 }
 func (s *teeSink) FlushTimer(name string, value float64) {
 	s.counting.FlushTimer(name, value)
-	s.upstream.FlushTimer(name, value)
+	if s.forward(name) {
+		s.upstream.FlushTimer(name, value)
+	}
+}
+
+// forward tells whether a stat goes on to the upstream sink, counting it. The Prometheus sink
+// does not get the Redis client's stats (redis.*), which the Rust implementation does not
+// emit yet.
+func (s *teeSink) forward(name string) bool {
+	if s.prometheus && strings.HasPrefix(name, "redis.") {
+		return false
+	}
+	s.sent.Add(1)
+	return true
+}
+
+// handledEvents is how many events statsd_exporter has handled: each one counts once in
+// exactly one of these families (or ends the process).
+func handledEvents() int64 {
+	families, _ := prometheus.DefaultGatherer.Gather()
+	var total float64
+	for _, family := range families {
+		switch family.GetName() {
+		case "statsd_exporter_events_total", "statsd_exporter_events_conflict_total",
+			"statsd_exporter_events_error_total":
+			for _, metric := range family.Metric {
+				total += metric.GetCounter().GetValue()
+			}
+		case "statsd_exporter_events_actions_total":
+			for _, metric := range family.Metric {
+				for _, label := range metric.Label {
+					if label.GetValue() == "drop" {
+						total += metric.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	return int64(total)
 }
 func (s *teeSink) Flush() {
 	// Like gostats' store: only a FlushableSink is flushed (the DogStatsD sink is not).
@@ -133,6 +198,53 @@ func loadConfig(content string, statsManager stats.Manager) (cfg config.RateLimi
 	return config.NewRateLimitConfigImpl(files, statsManager, false), nil
 }
 
+// mapResult is what the mapper decided for one name, with every option of the mapping.
+type mapResult struct {
+	Matched          bool                     `json:"matched"`
+	Name             string                   `json:"name"`
+	Labels           map[string]string        `json:"labels"`
+	Action           string                   `json:"action"`
+	Help             string                   `json:"help"`
+	HonorLabels      bool                     `json:"honor_labels"`
+	ObserverType     string                   `json:"observer_type"`
+	MatchType        string                   `json:"match_type"`
+	MatchMetricType  string                   `json:"match_metric_type"`
+	TtlNanos         int64                    `json:"ttl"`
+	Scale            *float64                 `json:"scale"`
+	HistogramOptions *mapper.HistogramOptions `json:"histogram_options"`
+	SummaryOptions   *mapper.SummaryOptions   `json:"summary_options"`
+}
+
+// mapNames maps each "<type> <name>" line of body with m.
+func mapNames(m *mapper.MetricMapper, body string) []mapResult {
+	var results []mapResult
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" {
+			continue
+		}
+		metricType, name, _ := strings.Cut(line, " ")
+		mapping, labels, matched := m.GetMapping(name, mapper.MetricType(metricType))
+		result := mapResult{Matched: matched, Labels: labels}
+		if mapping != nil {
+			result.Name = mapping.Name
+			result.Action = string(mapping.Action)
+			result.Help = mapping.HelpText
+			result.HonorLabels = mapping.HonorLabels
+			result.ObserverType = string(mapping.ObserverType)
+			result.MatchType = string(mapping.MatchType)
+			result.MatchMetricType = string(mapping.MatchMetricType)
+			result.TtlNanos = int64(mapping.Ttl)
+			if mapping.Scale.Set {
+				result.Scale = &mapping.Scale.Val
+			}
+			result.HistogramOptions = mapping.HistogramOptions
+			result.SummaryOptions = mapping.SummaryOptions
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
 func main() {
 	grpcAddr := flag.String("grpc", "127.0.0.1:0", "gRPC listen address")
 	controlAddr := flag.String("control", "127.0.0.1:0", "control HTTP listen address")
@@ -143,6 +255,10 @@ func main() {
 	nearLimitRatio := flag.Float64("near-limit-ratio", 0.8, "NEAR_LIMIT_RATIO")
 	statsdAddr := flag.String("statsd", "", "host:port of a statsd server (TCP) that also receives the stats")
 	dogstatsdAddr := flag.String("dogstatsd", "", "host:port of a DogStatsD server (UDP) that also receives the stats")
+	prometheusAddr := flag.String("prometheus", "", "PROMETHEUS_ADDR: also send the stats to the Prometheus sink, served there")
+	prometheusPath := flag.String("prometheus-path", "/metrics", "PROMETHEUS_PATH")
+	prometheusMapper := flag.String("prometheus-mapper", "", "PROMETHEUS_MAPPER_YAML")
+	prometheusMs := flag.Bool("prometheus-ms", false, "PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -164,8 +280,27 @@ func main() {
 		}
 		upstreamSink = dog
 	}
+	// statsd_exporter's clock, which PUT /exporter-time moves; set before the sink starts.
+	var exporterClock *exporterclock.Clock
+	if *prometheusAddr != "" {
+		exporterClock = &exporterclock.Clock{Instant: time.Unix(0, 0), TickerCh: make(chan time.Time)}
+		exporterclock.ClockInstance = exporterClock
+		upstreamSink = prom.NewPrometheusSink(prom.WithAddr(*prometheusAddr), prom.WithPath(*prometheusPath),
+			prom.WithMapperYamlPath(*prometheusMapper), prom.WithResponseTimeAsMilliseconds(*prometheusMs))
+	}
+	var tee *teeSink
 	if upstreamSink != nil {
-		storeSink = &teeSink{counting: sink, upstream: upstreamSink}
+		tee = &teeSink{counting: sink, upstream: upstreamSink, prometheus: exporterClock != nil}
+		storeSink = tee
+	}
+	// Waits until the exporter has handled every event sent to it.
+	awaitExporter := func() {
+		if exporterClock == nil {
+			return
+		}
+		for handledEvents() < tee.sent.Load() {
+			time.Sleep(time.Millisecond)
+		}
 	}
 	store := gostats.NewStore(storeSink, false)
 	statsManager := stats.NewStatManager(store, settings.NewSettings())
@@ -216,9 +351,73 @@ func main() {
 			http.Error(w, fmt.Sprint(loadErr), http.StatusUnprocessableEntity)
 		}
 	})
+	standalone := &mapper.MetricMapper{}
+	var standaloneMu sync.Mutex
+	mux.HandleFunc("PUT /mapper", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		standaloneMu.Lock()
+		defer standaloneMu.Unlock()
+		standalone = &mapper.MetricMapper{}
+		defer func() {
+			// Like upstream's sink, which sets no logger: a deprecation warning panics.
+			if r := recover(); r != nil {
+				standalone = &mapper.MetricMapper{}
+				http.Error(w, fmt.Sprint("panic: ", r), http.StatusInternalServerError)
+			}
+		}()
+		if err := standalone.InitFromYAMLString(string(body)); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		}
+	})
+	mux.HandleFunc("POST /map", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		standaloneMu.Lock()
+		defer standaloneMu.Unlock()
+		encoder := json.NewEncoder(w)
+		for _, result := range mapNames(standalone, string(body)) {
+			_ = encoder.Encode(result)
+		}
+	})
+	mux.HandleFunc("POST /flush", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		for _, line := range strings.Split(string(body), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 3 {
+				continue
+			}
+			value, err := strconv.ParseFloat(fields[2], 64)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			switch fields[0] {
+			case "counter":
+				tee.FlushCounter(fields[1], uint64(value))
+			case "gauge":
+				tee.FlushGauge(fields[1], uint64(value))
+			case "timer":
+				tee.FlushTimer(fields[1], value)
+			}
+		}
+		awaitExporter()
+	})
+	mux.HandleFunc("PUT /exporter-time", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		nanos, err := strconv.ParseInt(strings.TrimSpace(string(body)), 10, 64)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		exporterClock.Instant = time.Unix(0, nanos)
+		// The exporter handles one tick at a time: once the second is taken, the first
+		// removal is done.
+		exporterClock.TickerCh <- exporterClock.Instant
+		exporterClock.TickerCh <- exporterClock.Instant
+	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		store.Flush()
-		if upstreamSink != nil {
+		awaitExporter()
+		if exporterClock == nil && upstreamSink != nil {
 			upstreamSink.FlushCounter("harness.flushed", 1)
 			if flushable, ok := upstreamSink.(gostats.FlushableSink); ok {
 				flushable.Flush()
