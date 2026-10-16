@@ -262,6 +262,8 @@ impl Redis {
         };
         keys.into_iter()
             .zip(replies.chunks(2))
+            // A key may expire between KEYS and GET.
+            .filter(|(_, reply)| !reply[0].is_null())
             .map(|(key, reply)| {
                 let value: String = reply[0].clone().convert().unwrap();
                 let ttl: i64 = reply[1].clone().convert().unwrap();

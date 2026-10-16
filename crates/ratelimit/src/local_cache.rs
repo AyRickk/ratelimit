@@ -11,9 +11,19 @@ use xxhash_rust::xxh64::xxh64;
 
 /// freecache's smallest cache.
 const MIN_BYTES: usize = 512 * 1024;
+/// freecache splits its memory into this many segments, chosen by the key's hash.
 const SEGMENTS: usize = 256;
+/// Each segment indexes its entries in this many slots, chosen by the key's hash.
+const SLOTS: usize = 256;
+/// freecache's entry header, stored before every key.
 const ENTRY_HEADER_BYTES: usize = 24;
+/// freecache refuses longer keys.
 const MAX_KEY_BYTES: usize = 65535;
+
+/// Where a key's hash puts it in a segment: its slot, and the 16 bits slots are sorted by.
+fn slot_and_hash16(hash: u64) -> (u8, u16) {
+    ((hash >> 8) as u8, (hash >> 16) as u16)
+}
 
 pub struct LocalCache {
     segments: Vec<Mutex<Segment>>,
@@ -45,7 +55,7 @@ impl LocalCache {
     }
 
     fn segment(&self, hash: u64) -> std::sync::MutexGuard<'_, Segment> {
-        self.segments[(hash & 255) as usize].lock().unwrap()
+        self.segments[hash as usize % SEGMENTS].lock().unwrap()
     }
 }
 
@@ -112,7 +122,7 @@ struct Segment {
     total_count: i64,
     total_time: i64,
     vacuum_len: i64,
-    slot_lens: [i32; 256],
+    slot_lens: [i32; SLOTS],
     slot_cap: i32,
     slots_data: Vec<EntryPtr>,
 }
@@ -124,9 +134,9 @@ impl Segment {
             total_count: 0,
             total_time: 0,
             vacuum_len: size as i64,
-            slot_lens: [0; 256],
+            slot_lens: [0; SLOTS],
             slot_cap: 1,
-            slots_data: vec![EntryPtr::default(); 256],
+            slots_data: vec![EntryPtr::default(); SLOTS],
         }
     }
 
@@ -146,7 +156,7 @@ impl Segment {
         if key.len() > MAX_KEY_BYTES {
             return;
         }
-        let max_key_val_len = self.rb.data.len() as i64 / 4 - ENTRY_HEADER_BYTES as i64;
+        let max_key_val_len = self.rb.size() / 4 - ENTRY_HEADER_BYTES as i64;
         if key.len() as i64 > max_key_val_len {
             return;
         }
@@ -155,8 +165,7 @@ impl Segment {
         } else {
             0
         };
-        let slot_id = (hash >> 8) as u8;
-        let hash16 = (hash >> 16) as u16;
+        let (slot_id, hash16) = slot_and_hash16(hash);
         let (mut idx, matched) = self.lookup(slot_id, hash16, key);
 
         let mut hdr;
@@ -242,8 +251,7 @@ impl Segment {
     /// `seg.locate` without peeking: found and not expired. Refreshes the access time, and
     /// removes an expired entry.
     fn locate(&mut self, key: &[u8], hash: u64, now: u32) -> bool {
-        let slot_id = (hash >> 8) as u8;
-        let hash16 = (hash >> 16) as u16;
+        let (slot_id, hash16) = slot_and_hash16(hash);
         let (idx, matched) = self.lookup(slot_id, hash16, key);
         if !matched {
             return false;
@@ -262,8 +270,8 @@ impl Segment {
 
     fn expand(&mut self) {
         let old_cap = self.slot_cap as usize;
-        let mut data = vec![EntryPtr::default(); old_cap * 2 * 256];
-        for i in 0..256 {
+        let mut data = vec![EntryPtr::default(); old_cap * 2 * SLOTS];
+        for i in 0..SLOTS {
             let off = i * old_cap;
             let len = self.slot_lens[i] as usize;
             data[off * 2..off * 2 + len].copy_from_slice(&self.slots_data[off..off + len]);
