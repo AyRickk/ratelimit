@@ -193,7 +193,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | 🚧 | `tests/differential.rs` (calendar month missing) |
 | Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | 🚧 | `tests/differential.rs` (jitter missing) |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
-| Local cache of over-limit keys (set before the shadow check, TTL = unit) | 🚧 | `tests/differential.rs` (eviction order when full differs from freecache) |
+| Local cache of over-limit keys (set before the shadow check, TTL = unit), freecache's size limits and eviction | ✅ | `tests/differential.rs` |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ⬜ | |
 | `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
 | Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |

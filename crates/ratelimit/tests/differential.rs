@@ -249,13 +249,25 @@ impl Redis {
             )
             .await
             .unwrap();
-        let mut dump = BTreeMap::new();
-        for key in keys {
-            let value: String = self.client.get(&key).await.unwrap();
-            let ttl: i64 = self.client.ttl(&key).await.unwrap();
-            dump.insert(key, (value, ttl));
+        // One pipeline, so the TTLs are read at about the same moment.
+        let pipeline = self.client.pipeline();
+        for key in &keys {
+            let () = pipeline.get(key.as_str()).await.unwrap();
+            let () = pipeline.ttl(key.as_str()).await.unwrap();
         }
-        dump
+        let replies: Vec<Value> = if keys.is_empty() {
+            Vec::new()
+        } else {
+            pipeline.all().await.unwrap()
+        };
+        keys.into_iter()
+            .zip(replies.chunks(2))
+            .map(|(key, reply)| {
+                let value: String = reply[0].clone().convert().unwrap();
+                let ttl: i64 = reply[1].clone().convert().unwrap();
+                (key, (value, ttl))
+            })
+            .collect()
     }
 }
 
@@ -423,8 +435,7 @@ impl Harness {
             self.oracle_redis.commands().await,
             "commands received by Redis"
         );
-        let expected = self.oracle_redis.dump().await;
-        let actual = self.subject_redis.dump().await;
+        let (expected, actual) = tokio::join!(self.oracle_redis.dump(), self.subject_redis.dump());
         assert!(
             !expected.is_empty(),
             "the scenario should leave keys in Redis"
@@ -941,5 +952,52 @@ async fn stop_increment_branches_like_upstream() {
     let mut mixed = hits_each(&[&[("a", "x")], &[("b", "y")]], &[1, 3]);
     mixed.descriptors[1].is_negative_hits = true;
     h.call(mixed).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn a_full_local_cache_evicts_like_freecache() {
+    if !tools_available() {
+        return;
+    }
+    // freecache's minimum: 256 segments of 2 KiB, about 45 of these keys each.
+    let settings = RedisCacheSettings {
+        local_cache_size_in_bytes: 1,
+        ..Default::default()
+    };
+    let mut h = Harness::with_settings(
+        "
+domain: d
+descriptors:
+  - key: k
+    rate_limit: {unit: hour, requests_per_unit: 0}
+",
+        settings,
+    )
+    .await;
+    const KEYS: usize = 30_000;
+    const BATCH: usize = 100;
+    let values: Vec<String> = (0..KEYS).map(|i| format!("v{i}")).collect();
+    let batch = |chunk: &[String]| {
+        let descriptors: Vec<Vec<(&str, &str)>> =
+            chunk.iter().map(|v| vec![("k", v.as_str())]).collect();
+        let refs: Vec<&[(&str, &str)]> = descriptors.iter().map(Vec::as_slice).collect();
+        request("d", &refs)
+    };
+
+    let start = 1_700_000_000 / 3600 * 3600;
+    for (n, chunk) in values.chunks(BATCH).enumerate() {
+        // Time moves on, so access times differ and freecache's second chance comes into play.
+        h.at(start + (n / 20) as i64).await;
+        h.call(batch(chunk)).await.unwrap();
+        // Re-reading early keys refreshes their access time.
+        if n % 10 == 9 {
+            h.call(batch(&values[..BATCH])).await.unwrap();
+        }
+    }
+    // Probe every key: those still cached send nothing to Redis.
+    for chunk in values.chunks(BATCH) {
+        h.call(batch(chunk)).await.unwrap();
+    }
     h.assert_same_redis().await;
 }
