@@ -451,3 +451,27 @@ async fn a_cache_answer_of_the_wrong_length_is_an_error() {
         assert!(matches!(error, ServiceError::Cache(_)), "{error:?}");
     }
 }
+
+#[tokio::test]
+async fn a_limit_with_an_unknown_unit_is_an_invalid_argument() {
+    // Upstream panics and the process dies (D1: becomes INVALID_ARGUMENT, see docs/parity.md).
+    let cache = Arc::new(FakeCache::returning(vec![status(Code::Ok, 0)]));
+    let service = RateLimitService::new(cache.clone(), ServiceSettings::default());
+    service.set_config(load(CONFIG));
+    let mut request = request("test-domain", &[&[("foo", "bar")]]);
+    request.descriptors[0].limit = Some(
+        ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride {
+            requests_per_unit: 1,
+            unit: 0, // UNKNOWN
+            unit_multiplier: None,
+        },
+    );
+
+    let error = service.should_rate_limit(&request).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        ServiceError::InvalidArgument("invalid rate limit unit UNKNOWN".into())
+    );
+    assert!(cache.received().is_empty(), "nothing is counted");
+}

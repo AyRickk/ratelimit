@@ -109,9 +109,13 @@ fn status(
     })
 }
 
-/// The status of a descriptor whose counter is `after` once its hits are added.
-pub(crate) fn counted_status(
+/// The status of a descriptor whose counter is `after` once its hits are applied. Without a
+/// limit it is a bare OK. A refund is always OK, with what remains. Otherwise it is over the
+/// limit when the counter exceeds it, though a rule in shadow mode then still answers OK
+/// (keeping the remaining count of 0).
+pub(crate) fn descriptor_status(
     limit: Option<&RateLimit>,
+    hits: Hits,
     after: u64,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
@@ -122,8 +126,9 @@ pub(crate) fn counted_status(
         });
     };
     let threshold = u64::from(limit.limit.requests_per_unit);
-    if after > threshold {
-        // A rule in shadow mode reports OK but keeps the over-limit remaining count of 0.
+    if hits.refund {
+        status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now)
+    } else if after > threshold {
         let code = if limit.shadow_mode {
             Code::Ok
         } else {
@@ -133,20 +138,4 @@ pub(crate) fn counted_status(
     } else {
         status(Code::Ok, limit, (threshold - after) as u32, now)
     }
-}
-
-/// The status of a refunded descriptor: always OK, with what remains after the refund.
-pub(crate) fn refunded_status(
-    limit: Option<&RateLimit>,
-    after: u64,
-    now: i64,
-) -> Result<DescriptorStatus, CacheError> {
-    let Some(limit) = limit else {
-        return Ok(DescriptorStatus {
-            code: Code::Ok as i32,
-            ..Default::default()
-        });
-    };
-    let remaining = u64::from(limit.limit.requests_per_unit).saturating_sub(after);
-    status(Code::Ok, limit, remaining as u32, now)
 }

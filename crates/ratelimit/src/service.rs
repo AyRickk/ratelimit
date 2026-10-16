@@ -5,7 +5,7 @@ use crate::config::{LimitLookup, RateLimit, RateLimitConfig};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
-    rate_limit_response::{Code, DescriptorStatus},
+    rate_limit_response::{Code, DescriptorStatus, rate_limit::Unit},
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -52,6 +52,9 @@ pub enum ServiceError {
     /// An invalid request or no configuration (upstream's `serviceError`).
     #[error("{0}")]
     Service(String),
+    /// A request upstream cannot handle (it panics); answered with `INVALID_ARGUMENT` (D1).
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error(transparent)]
     Cache(#[from] CacheError),
 }
@@ -100,6 +103,14 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let config = config
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
         let checks = descriptor_checks(&config, request);
+        let unknown_unit = checks.iter().any(|check| {
+            matches!(check, Check::Limit(Some(limit)) if limit.limit.unit() == Unit::Unknown)
+        });
+        if unknown_unit {
+            return Err(ServiceError::InvalidArgument(
+                "invalid rate limit unit UNKNOWN".into(),
+            ));
+        }
         let limits: Vec<Option<RateLimit>> = checks
             .iter()
             .map(|check| match check {

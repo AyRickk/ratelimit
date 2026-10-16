@@ -2,8 +2,10 @@
 //! itself (the Go program in `tools/oracle`) and against this implementation, each with its own
 //! Redis, on the same simulated clock. Responses and the final Redis contents must be identical.
 //!
-//! Needs `go` and `redis-server` on the PATH. Without them the tests are skipped, unless
-//! `RATELIMIT_REQUIRE_DIFFERENTIAL` is set (as in CI), in which case they fail.
+//! Needs `go` and a Redis-compatible server: `redis-server` by default, or the binary named by
+//! `RATELIMIT_REDIS_SERVER` (e.g. `valkey-server`). Both the oracle and this implementation
+//! use that server. Without them the tests are skipped, unless `RATELIMIT_REQUIRE_DIFFERENTIAL`
+//! is set (as in CI), in which case they fail.
 
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
@@ -38,6 +40,11 @@ impl Clock for ManualClock {
     }
 }
 
+/// The Redis-compatible server to run.
+fn redis_server() -> String {
+    std::env::var("RATELIMIT_REDIS_SERVER").unwrap_or_else(|_| "redis-server".to_string())
+}
+
 fn tools_available() -> bool {
     let found = |tool: &str| {
         std::process::Command::new(tool)
@@ -47,13 +54,17 @@ fn tools_available() -> bool {
             .status()
             .is_ok()
     };
-    let available = found("go") && found("redis-server");
+    let available = found("go") && found(&redis_server());
     if !available {
         assert!(
             std::env::var_os("RATELIMIT_REQUIRE_DIFFERENTIAL").is_none(),
-            "differential tests need `go` and `redis-server`"
+            "differential tests need `go` and `{}`",
+            redis_server()
         );
-        eprintln!("skipping: differential tests need `go` and `redis-server`");
+        eprintln!(
+            "skipping: differential tests need `go` and `{}`",
+            redis_server()
+        );
     }
     available
 }
@@ -97,7 +108,7 @@ struct Redis {
 impl Redis {
     async fn start() -> Self {
         let port = free_port().await;
-        let process = Command::new("redis-server")
+        let process = Command::new(redis_server())
             .args([
                 "--port",
                 &port.to_string(),
@@ -109,7 +120,7 @@ impl Redis {
             .stdout(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("start redis-server");
+            .expect("start the Redis server");
         let address = format!("127.0.0.1:{port}");
         let config = Config::from_url(&format!("redis://{address}")).unwrap();
         let client = Builder::from_config(config).build().unwrap();
@@ -285,13 +296,39 @@ impl Harness {
         actual
     }
 
+    /// Same keys and values, and TTLs within a second: TTLs run on the servers' real clocks
+    /// and the two dumps are taken one after the other.
     async fn assert_same_redis(&self) {
         let expected = self.oracle_redis.dump().await;
+        let actual = self.subject_redis.dump().await;
         assert!(
             !expected.is_empty(),
             "the scenario should leave keys in Redis"
         );
-        assert_eq!(self.subject_redis.dump().await, expected, "Redis contents");
+        let values = |dump: &BTreeMap<String, (String, i64)>| {
+            dump.iter()
+                .map(|(k, (v, _))| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&actual), values(&expected), "Redis keys and values");
+        for (key, (_, ttl)) in &expected {
+            let actual_ttl = actual[key].1;
+            assert!(
+                (actual_ttl - ttl).abs() <= 1,
+                "TTL of {key}: {actual_ttl}, upstream {ttl}"
+            );
+        }
+    }
+
+    /// Stores a raw value under `key` in both Redis servers.
+    async fn set_raw(&self, key: &str, value: &str) {
+        for redis in [&self.oracle_redis, &self.subject_redis] {
+            let () = redis
+                .client
+                .set(key, value, None, None, false)
+                .await
+                .unwrap();
+        }
     }
 }
 
@@ -508,4 +545,111 @@ async fn invalid_requests_fail_like_upstream() {
     h.at(1_700_000_000).await;
     assert!(h.call(request("", &[&[("user", "x")]])).await.is_err());
     assert!(h.call(request("llm", &[])).await.is_err());
+}
+
+#[tokio::test]
+async fn huge_refunds_are_sent_as_signed_integers_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "dave")]]);
+
+    h.call(with_hits(user(), 0, &[Some(1)])).await.unwrap();
+    // u64::MAX goes over the wire as the signed integer -1, so the refund adds one.
+    h.call(refund(user(), u64::MAX)).await.unwrap();
+    h.call(with_hits(user(), 0, &[Some(u64::MAX)]))
+        .await
+        .unwrap();
+    h.assert_same_redis().await;
+}
+
+#[tokio::test]
+async fn redis_errors_are_reported_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    h.at(1_700_000_000).await;
+    let window = 1_700_000_000 / 60 * 60;
+    h.set_raw(&format!("llm_user_carol_{window}"), "not a number")
+        .await;
+
+    let error = h
+        .call(request("llm", &[&[("user", "carol")]]))
+        .await
+        .unwrap_err();
+    assert!(error.contains("in pipeline returned error"), "{error}");
+    h.call(refund(request("llm", &[&[("user", "carol")]]), 1))
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn refunds_reset_the_ttl_to_a_full_window() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "erin")]]);
+
+    h.call(with_hits(user(), 0, &[Some(10)])).await.unwrap();
+    // TTLs run on the servers' real clocks: let them drop before refunding.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    h.call(refund(user(), 4)).await.unwrap();
+    h.assert_same_redis().await;
+    // A refund in a later window finds no key.
+    h.at(1_700_000_060).await;
+    h.call(refund(user(), 4)).await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_values_and_nested_shared_wildcards_make_upstream_keys() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(
+        "
+domain: keys
+descriptors:
+  - key: k
+    rate_limit: {unit: minute, requests_per_unit: 5}
+  - key: user
+    value: user/*
+    share_threshold: true
+    descriptors:
+      - key: resource
+        value: res/*
+        share_threshold: true
+        descriptors:
+          - key: action
+            rate_limit: {unit: minute, requests_per_unit: 5}
+",
+    )
+    .await;
+    h.at(1_712_345_678).await;
+    h.call(request("keys", &[&[("k", "")]])).await.unwrap();
+    h.call(request(
+        "keys",
+        &[&[
+            ("user", "user/alice"),
+            ("resource", "res/file1"),
+            ("action", "read"),
+        ]],
+    ))
+    .await
+    .unwrap();
+    h.call(request(
+        "keys",
+        &[&[
+            ("user", "user/bob"),
+            ("resource", "res/file2"),
+            ("action", "write"),
+        ]],
+    ))
+    .await
+    .unwrap();
+    h.assert_same_redis().await;
 }

@@ -1,6 +1,6 @@
 //! The `envoy.service.ratelimit.v3.RateLimitService` gRPC endpoint.
 
-use crate::service::{RateLimitCache, RateLimitService};
+use crate::service::{RateLimitCache, RateLimitService, ServiceError};
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_service_server::{self, RateLimitServiceServer},
@@ -30,6 +30,9 @@ impl<C: RateLimitCache> rate_limit_service_server::RateLimitService for GrpcServ
             .should_rate_limit(request.get_ref())
             .await
             .map(Response::new)
-            .map_err(|e| Status::unknown(e.to_string()))
+            .map_err(|e| match e {
+                ServiceError::InvalidArgument(message) => Status::invalid_argument(message),
+                e => Status::unknown(e.to_string()),
+            })
     }
 }

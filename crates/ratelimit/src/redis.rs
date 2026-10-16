@@ -45,7 +45,56 @@ impl RedisCache {
 }
 
 fn cache_error(e: fred::error::Error) -> CacheError {
-    CacheError(e.to_string())
+    CacheError(e.details().to_string())
+}
+
+/// A Redis command as upstream's client (radix) sends it: every argument as a string.
+struct Command {
+    name: &'static str,
+    args: Vec<String>,
+}
+
+impl Command {
+    /// radix's rendering in errors: `["INCRBY" "key" "1"]`, each part quoted like Go's
+    /// `strconv.QuoteToASCII`.
+    fn describe(&self) -> String {
+        let parts: Vec<String> = std::iter::once(self.name)
+            .chain(self.args.iter().map(String::as_str))
+            .map(go_quote_ascii)
+            .collect();
+        format!("[{}]", parts.join(" "))
+    }
+}
+
+/// Go's `strconv.QuoteToASCII`.
+fn go_quote_ascii(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\x07' => out += "\\a",
+            '\x08' => out += "\\b",
+            '\x0c' => out += "\\f",
+            '\n' => out += "\\n",
+            '\r' => out += "\\r",
+            '\t' => out += "\\t",
+            '\x0b' => out += "\\v",
+            '\\' => out += "\\\\",
+            '"' => out += "\\\"",
+            ' '..='~' => out.push(c),
+            c if (c as u32) < 0x80 => out += &format!("\\x{:02x}", c as u32),
+            c if (c as u32) < 0x10000 => out += &format!("\\u{:04x}", c as u32),
+            c => out += &format!("\\U{:08x}", c as u32),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A descriptor counted in Redis.
+struct Counted {
+    index: usize,
+    /// Index of the command whose reply is the counter after this descriptor's hits.
+    command: usize,
 }
 
 impl RateLimitCache for RedisCache {
@@ -57,58 +106,76 @@ impl RateLimitCache for RedisCache {
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
 
-        // Descriptors with a limit, in order, with their key and window length.
+        // Per descriptor with a limit, in order: INCRBY + EXPIRE, or the refund script.
+        // Hits go over the wire as signed 64-bit integers, as upstream sends them.
+        let mut commands = Vec::new();
         let mut counted = Vec::new();
-        for (i, limit) in limits.iter().enumerate() {
-            if let Some(limit) = limit {
-                let key = limiter::cache_key(
-                    &self.settings.cache_key_prefix,
-                    &request.domain,
-                    &request.descriptors[i],
-                    limit,
-                    now,
-                )?;
-                counted.push((i, key, limiter::window_seconds(limit)?));
+        for (index, limit) in limits.iter().enumerate() {
+            let Some(limit) = limit else { continue };
+            let key = limiter::cache_key(
+                &self.settings.cache_key_prefix,
+                &request.domain,
+                &request.descriptors[index],
+                limit,
+                now,
+            )?;
+            let expiration = limiter::window_seconds(limit)?.to_string();
+            let amount = (hits[index].value as i64).to_string();
+            counted.push(Counted {
+                index,
+                command: commands.len(),
+            });
+            if hits[index].refund {
+                let args = vec![
+                    DECREMENT_SCRIPT.to_string(),
+                    "1".to_string(),
+                    key,
+                    amount,
+                    expiration,
+                ];
+                commands.push(Command { name: "EVAL", args });
+            } else {
+                commands.push(Command {
+                    name: "INCRBY",
+                    args: vec![key.clone(), amount],
+                });
+                commands.push(Command {
+                    name: "EXPIRE",
+                    args: vec![key, expiration],
+                });
             }
         }
 
         let mut after = vec![0u64; limits.len()];
-        if !counted.is_empty() {
+        if !commands.is_empty() {
             let pipeline = self.client.pipeline();
-            for (i, key, expiration) in &counted {
-                let hits = hits[*i];
-                if hits.refund {
-                    // EVAL script 1 key hits ttl, routed by the key (argument 2) in a cluster.
-                    let eval = CustomCommand::new_static("EVAL", ClusterHash::Offset(2), false);
-                    let args = vec![
-                        DECREMENT_SCRIPT.to_string(),
-                        "1".to_string(),
-                        key.clone(),
-                        hits.value.to_string(),
-                        expiration.to_string(),
-                    ];
-                    let () = pipeline.custom(eval, args).await.map_err(cache_error)?;
+            for command in &commands {
+                // EVAL is routed by its key, the third argument, in a cluster.
+                let hash = if command.name == "EVAL" {
+                    ClusterHash::Offset(2)
                 } else {
-                    let () = pipeline
-                        .incr_by(key.as_str(), hits.value as i64)
-                        .await
-                        .map_err(cache_error)?;
-                    let () = pipeline
-                        .expire(key.as_str(), *expiration, None)
-                        .await
-                        .map_err(cache_error)?;
+                    ClusterHash::FirstKey
+                };
+                let custom = CustomCommand::new_static(command.name, hash, false);
+                let () = pipeline
+                    .custom(custom, command.args.clone())
+                    .await
+                    .map_err(cache_error)?;
+            }
+            let replies: Vec<Result<Value, fred::error::Error>> = pipeline.try_all().await;
+            // Like upstream, report the first command that failed.
+            for (command, reply) in commands.iter().zip(&replies) {
+                if let Err(e) = reply {
+                    return Err(CacheError(format!(
+                        "command {} in pipeline returned error: {}",
+                        command.describe(),
+                        e.details()
+                    )));
                 }
             }
-            let results: Vec<Value> = pipeline.all().await.map_err(cache_error)?;
-            let mut results = results.into_iter();
-            for (i, _, _) in &counted {
-                let value = results
-                    .next()
-                    .ok_or_else(|| CacheError("missing Redis reply".into()))?;
-                after[*i] = value.convert::<u64>().map_err(cache_error)?;
-                if !hits[*i].refund {
-                    results.next(); // EXPIRE
-                }
+            for Counted { index, command } in counted {
+                let reply = replies[command].clone().map_err(cache_error)?;
+                after[index] = reply.convert::<u64>().map_err(cache_error)?;
             }
         }
 
@@ -117,11 +184,7 @@ impl RateLimitCache for RedisCache {
             .zip(&hits)
             .zip(after)
             .map(|((limit, hits), after)| {
-                if hits.refund {
-                    limiter::refunded_status(limit.as_ref(), after, now)
-                } else {
-                    limiter::counted_status(limit.as_ref(), after, now)
-                }
+                limiter::descriptor_status(limit.as_ref(), *hits, after, now)
             })
             .collect()
     }
