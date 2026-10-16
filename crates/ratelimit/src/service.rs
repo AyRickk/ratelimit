@@ -7,7 +7,7 @@ use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_response::{Code, DescriptorStatus},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
@@ -56,7 +56,7 @@ pub enum ServiceError {
     Cache(#[from] CacheError),
 }
 
-fn check(condition: bool, message: &str) -> Result<(), ServiceError> {
+fn require(condition: bool, message: &str) -> Result<(), ServiceError> {
     if condition {
         Ok(())
     } else {
@@ -88,41 +88,60 @@ impl<C: RateLimitCache> RateLimitService<C> {
         &self,
         request: &RateLimitRequest,
     ) -> Result<RateLimitResponse, ServiceError> {
-        check(
+        require(
             !request.domain.is_empty(),
             "rate limit domain must not be empty",
         )?;
-        check(
+        require(
             !request.descriptors.is_empty(),
             "rate limit descriptor list must not be empty",
         )?;
         let config = self.config.read().unwrap().clone();
         let config = config
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
-        let (limits, unlimited) = limits_to_check(&config, request);
+        let checks = descriptor_checks(&config, request);
+        let limits: Vec<Option<RateLimit>> = checks
+            .iter()
+            .map(|check| match check {
+                Check::Limit(limit) => limit.clone(),
+                Check::Unlimited => None,
+            })
+            .collect();
         let mut statuses = self.cache.do_limit(request, &limits).await?;
+        if statuses.len() != checks.len() {
+            // Upstream asserts here and crashes; this is a backend bug, reported as such.
+            return Err(CacheError(format!(
+                "cache returned {} statuses for {} descriptors",
+                statuses.len(),
+                checks.len()
+            ))
+            .into());
+        }
 
         // A regular descriptor over its limit makes the request over. Quota descriptors are
         // grouped by model: a group is over when any of its descriptors is, and the request
         // only when every group is (so another model can take over).
         let mut regular_over = false;
         let mut quota_groups: HashMap<String, bool> = HashMap::new();
-        for (i, status) in statuses.iter_mut().enumerate() {
-            if unlimited[i] {
-                *status = DescriptorStatus {
-                    code: Code::Ok as i32,
-                    limit_remaining: u32::MAX,
-                    ..Default::default()
-                };
-                continue;
-            }
+        for ((status, check), descriptor) in
+            statuses.iter_mut().zip(&checks).zip(&request.descriptors)
+        {
+            let limit = match check {
+                Check::Unlimited => {
+                    *status = DescriptorStatus {
+                        code: Code::Ok as i32,
+                        limit_remaining: u32::MAX,
+                        ..Default::default()
+                    };
+                    continue;
+                }
+                Check::Limit(limit) => limit,
+            };
             let over = status.code() == Code::OverLimit;
             let quota_mode =
-                self.settings.global_quota_mode || limits[i].as_ref().is_some_and(|l| l.quota_mode);
+                self.settings.global_quota_mode || limit.as_ref().is_some_and(|l| l.quota_mode);
             if quota_mode {
-                *quota_groups
-                    .entry(quota_group_key(&request.descriptors[i]))
-                    .or_default() |= over;
+                *quota_groups.entry(quota_group_key(descriptor)).or_default() |= over;
             } else if over {
                 regular_over = true;
             }
@@ -144,37 +163,46 @@ impl<C: RateLimitCache> RateLimitService<C> {
     }
 }
 
-/// `constructLimitsToCheck`: the limit of each descriptor, with unlimited ones and those
-/// replaced by another descriptor's limit (`replaces`, by name) left out, and which
-/// descriptors are unlimited.
-fn limits_to_check(
-    config: &RateLimitConfig,
-    request: &RateLimitRequest,
-) -> (Vec<Option<RateLimit>>, Vec<bool>) {
-    let mut limits = Vec::with_capacity(request.descriptors.len());
-    let mut unlimited = Vec::with_capacity(request.descriptors.len());
-    let mut replaced = std::collections::HashSet::new();
-    for descriptor in &request.descriptors {
-        let limit = match config.get_limit(&request.domain, descriptor) {
-            LimitLookup::Limit(limit) => Some(limit),
-            LimitLookup::NoLimit | LimitLookup::UnknownDomain => None,
-        };
-        if let Some(limit) = &limit {
-            replaced.extend(limit.replaces.iter().cloned());
-        }
-        let is_unlimited = limit.as_ref().is_some_and(|l| l.unlimited);
-        unlimited.push(is_unlimited);
-        limits.push(limit.filter(|_| !is_unlimited));
-    }
-    for limit in &mut limits {
-        if limit
-            .as_ref()
-            .is_some_and(|l| !l.name.is_empty() && replaced.contains(&l.name))
+/// What to do with one descriptor of a request.
+enum Check {
+    /// Its limit is `unlimited`: never counted, always `OK`.
+    Unlimited,
+    /// Count it against this limit, if any.
+    Limit(Option<RateLimit>),
+}
+
+/// `constructLimitsToCheck`: each descriptor's limit, left out when another descriptor's
+/// limit replaces it by name (`replaces`). Replacements are collected from every matched
+/// limit first, unlimited and replaced ones included, so they are not transitive.
+fn descriptor_checks(config: &RateLimitConfig, request: &RateLimitRequest) -> Vec<Check> {
+    let mut replaced = HashSet::new();
+    let mut checks: Vec<Check> = request
+        .descriptors
+        .iter()
+        .map(
+            |descriptor| match config.get_limit(&request.domain, descriptor) {
+                LimitLookup::Limit(limit) => {
+                    replaced.extend(limit.replaces.iter().cloned());
+                    if limit.unlimited {
+                        Check::Unlimited
+                    } else {
+                        Check::Limit(Some(limit))
+                    }
+                }
+                LimitLookup::NoLimit | LimitLookup::UnknownDomain => Check::Limit(None),
+            },
+        )
+        .collect();
+    for check in &mut checks {
+        if let Check::Limit(limit) = check
+            && limit
+                .as_ref()
+                .is_some_and(|l| !l.name.is_empty() && replaced.contains(&l.name))
         {
             *limit = None;
         }
     }
-    (limits, unlimited)
+    checks
 }
 
 /// The quota group of a descriptor: its model, from the `backend_name` and

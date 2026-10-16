@@ -429,3 +429,25 @@ async fn global_quota_mode_puts_every_descriptor_in_a_quota_group() {
     ];
     assert_eq!(overall(quota, QUOTA, cases).await, Code::OverLimit);
 }
+
+#[tokio::test]
+async fn a_cache_answer_of_the_wrong_length_is_an_error() {
+    // Upstream asserts and crashes the process; per D1 this becomes a clean error.
+    for statuses in [vec![status(Code::Ok, 0)], vec![status(Code::Ok, 0); 3]] {
+        let service = RateLimitService::new(
+            Arc::new(FakeCache::returning(statuses)),
+            ServiceSettings::default(),
+        );
+        service.set_config(load(CONFIG));
+
+        let error = service
+            .should_rate_limit(&request(
+                "test-domain",
+                &[&[("foo", "bar")], &[("hello", "world")]],
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ServiceError::Cache(_)), "{error:?}");
+    }
+}
