@@ -12,6 +12,8 @@ require (
 
 require (
 	cel.dev/expr v0.25.2 // indirect
+	github.com/DataDog/datadog-go/v5 v5.5.0 // indirect
+	github.com/Microsoft/go-winio v0.5.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.45.1 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.33.1 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1 // indirect

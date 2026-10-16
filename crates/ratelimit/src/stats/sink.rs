@@ -1,7 +1,7 @@
 //! Where flushed stats go, chosen like envoyproxy/ratelimit's runner
 //! (`src/service_cmd/runner/runner.go`).
 
-use super::{LoggingSink, StatsdSink};
+use super::{DogStatsdSettings, DogStatsdSink, LoggingSink, StatsdSink};
 
 /// A destination for flushed stats.
 pub enum Sink {
@@ -11,6 +11,8 @@ pub enum Sink {
     Logging(LoggingSink),
     /// `USE_STATSD`: statsd lines over TCP or UDP.
     Statsd(StatsdSink),
+    /// `USE_DOG_STATSD`: DogStatsD lines over UDP.
+    Dogstatsd(DogStatsdSink),
 }
 
 impl Sink {
@@ -19,6 +21,7 @@ impl Sink {
             Sink::Null => {}
             Sink::Logging(sink) => sink.flush_counter(name, value),
             Sink::Statsd(sink) => sink.flush_counter(name, value),
+            Sink::Dogstatsd(sink) => sink.flush_counter(name, value),
         }
     }
 
@@ -28,6 +31,8 @@ impl Sink {
             Sink::Null => {}
             Sink::Logging(sink) => sink.flush(),
             Sink::Statsd(sink) => sink.flush().await,
+            // Upstream's DogStatsD sink cannot be flushed: its client sends every 100 ms.
+            Sink::Dogstatsd(_) => {}
         }
     }
 }
@@ -56,6 +61,7 @@ pub struct SinkSettings {
     /// `STATSD_PORT`.
     pub statsd_port: u16,
     pub statsd_protocol: StatsdProtocol,
+    pub dogstatsd: DogStatsdSettings,
 }
 
 impl Default for SinkSettings {
@@ -68,6 +74,7 @@ impl Default for SinkSettings {
             statsd_host: "localhost".into(),
             statsd_port: 8125,
             statsd_protocol: StatsdProtocol::Tcp,
+            dogstatsd: DogStatsdSettings::default(),
         }
     }
 }
@@ -90,7 +97,13 @@ pub fn select_sink(settings: &SinkSettings) -> Result<Sink, String> {
         return Err(SEVERAL_SINKS.into());
     }
     if settings.use_dog_statsd {
-        return Err("USE_DOG_STATSD is not supported yet".into());
+        return DogStatsdSink::new(
+            &settings.statsd_host,
+            settings.statsd_port,
+            settings.dogstatsd.clone(),
+        )
+        .map(Sink::Dogstatsd)
+        .map_err(|e| format!("Failed to create dogstatsd sink: {e}"));
     }
     if settings.use_prometheus {
         return Err("USE_PROMETHEUS is not supported yet".into());

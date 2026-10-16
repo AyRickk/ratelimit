@@ -14,7 +14,9 @@ use ratelimit::grpc;
 use ratelimit::limiter::Clock;
 use ratelimit::redis::{RedisCache, RedisCacheSettings};
 use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
-use ratelimit::stats::{Sink, Stats, StatsdProtocol, StatsdSink};
+use ratelimit::stats::{
+    DogStatsdSettings, DogStatsdSink, Mogrifier, Sink, Stats, StatsdProtocol, StatsdSink,
+};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
@@ -323,6 +325,7 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
         .iter()
         .map(|(key, value)| format!("{key}:{value}"))
         .collect();
+    let dogstatsd = settings.dogstatsd.as_ref().map(DogStatsd::environment);
     let settings = &settings.service;
     let mut environment = vec![
         ("EXTRA_TAGS", extra_tags.join(",")),
@@ -363,11 +366,17 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
             ("LIMIT_REQUEST_RESET_HEADER", names.reset.clone()),
         ]);
     }
+    environment.extend(dogstatsd.into_iter().flatten());
     environment
 }
 
 impl Oracle {
-    async fn start(redis: &Redis, all: &Settings, statsd: Option<&StatsdServer>) -> Self {
+    async fn start(
+        redis: &Redis,
+        all: &Settings,
+        statsd: Option<&StatsdServer>,
+        dogstatsd: Option<&DogStatsdServer>,
+    ) -> Self {
         let settings = &all.cache;
         let near_limit_ratio = settings.near_limit_ratio.to_string();
         let local_cache_size = settings.local_cache_size_in_bytes.to_string();
@@ -381,6 +390,7 @@ impl Oracle {
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
             .args(["-near-limit-ratio", &near_limit_ratio])
             .args(statsd.map(|server| format!("-statsd={}", server.address)))
+            .args(dogstatsd.map(|server| format!("-dogstatsd={}", server.address)))
             .env_clear()
             .envs(oracle_environment(all))
             .stdout(Stdio::piped())
@@ -462,13 +472,25 @@ struct Subject {
 }
 
 impl Subject {
-    async fn start(redis: &Redis, settings: &Settings, statsd: Option<&StatsdServer>) -> Self {
+    async fn start(
+        redis: &Redis,
+        settings: &Settings,
+        statsd: Option<&StatsdServer>,
+        dogstatsd: Option<&DogStatsdServer>,
+    ) -> Self {
         let clock = Arc::new(ManualClock::default());
         let stats = Arc::new(Stats::new(&settings.extra_tags));
-        let sink = statsd.map(|server| {
+        let mut sink = statsd.map(|server| {
             let port = server.address.port();
             Sink::Statsd(StatsdSink::new("127.0.0.1", port, StatsdProtocol::Tcp))
         });
+        if let (Some(server), Some(dog)) = (dogstatsd, &settings.dogstatsd) {
+            let port = server.address.port();
+            let sink_settings = dog.settings();
+            sink = Some(Sink::Dogstatsd(
+                DogStatsdSink::new("127.0.0.1", port, sink_settings).unwrap(),
+            ));
+        }
         let cache = RedisCache::new(
             redis.connect().await,
             clock.clone(),
@@ -509,6 +531,8 @@ struct Harness {
     load_options: LoadOptions,
     /// With `Settings::statsd`, what the oracle and this implementation sent to statsd.
     statsd: Option<StatsdServers>,
+    /// With `Settings::dogstatsd`, what they sent to DogStatsD.
+    dogstatsd: Option<DogStatsdServers>,
     flushes: std::sync::atomic::AtomicUsize,
 }
 
@@ -522,6 +546,146 @@ struct Settings {
     extra_tags: BTreeMap<String, String>,
     /// Also send the stats to a statsd server for each side, and compare what they receive.
     statsd: bool,
+    /// The same with DogStatsD, configured so.
+    dogstatsd: Option<DogStatsd>,
+}
+
+/// A mogrifier for both sides: key, pattern, name, tags.
+type MogrifierSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// The DogStatsD sink's configuration, for both sides.
+#[derive(Default, Clone)]
+struct DogStatsd {
+    /// `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`.
+    entity_id: String,
+    env: String,
+    service: String,
+    version: String,
+    mogrifiers: Vec<MogrifierSpec>,
+}
+
+impl DogStatsd {
+    fn settings(&self) -> DogStatsdSettings {
+        DogStatsdSettings {
+            entity_id: self.entity_id.clone(),
+            env: self.env.clone(),
+            service: self.service.clone(),
+            version: self.version.clone(),
+            mogrifiers: self
+                .mogrifiers
+                .iter()
+                .map(|(key, pattern, name, tags)| {
+                    let tags = tags.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+                    Mogrifier::new(key, pattern, name, tags.collect()).unwrap()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The oracle's environment for the same configuration (`DOG_STATSD_MOGRIFIER_<KEY>_*`).
+    fn environment(&self) -> Vec<(&'static str, String)> {
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let mut environment = vec![
+            ("DD_ENTITY_ID", self.entity_id.clone()),
+            ("DD_ENV", self.env.clone()),
+            ("DD_SERVICE", self.service.clone()),
+            ("DD_VERSION", self.version.clone()),
+        ];
+        let keys: Vec<&str> = self.mogrifiers.iter().map(|m| m.0).collect();
+        environment.push(("USE_DOG_STATSD_MOGRIFIERS", keys.join(",")));
+        for (key, pattern, name, tags) in &self.mogrifiers {
+            let var = |field: &str| leak(format!("DOG_STATSD_MOGRIFIER_{key}_{field}"));
+            let tags: Vec<String> = tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            environment.push((var("PATTERN"), pattern.to_string()));
+            environment.push((var("NAME"), name.to_string()));
+            environment.push((var("TAGS"), tags.join(",")));
+        }
+        environment
+    }
+}
+
+/// The DogStatsD servers each side sends its stats to.
+struct DogStatsdServers {
+    oracle: DogStatsdServer,
+    subject: DogStatsdServer,
+}
+
+/// A DogStatsD server over UDP, keeping every datagram it receives.
+struct DogStatsdServer {
+    address: std::net::SocketAddr,
+    datagrams: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl DogStatsdServer {
+    async fn start() -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let datagrams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = datagrams.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 65536];
+            while let Ok(n) = socket.recv(&mut buffer).await {
+                sink.lock().unwrap().push(buffer[..n].to_vec());
+            }
+        });
+        Self { address, datagrams }
+    }
+
+    /// Every line received once `count` flushes have arrived and nothing more for 300 ms (the
+    /// client sends every 100 ms, from 32 buffers in turn), sorted; datadog-go's telemetry and
+    /// the oracle's Redis client stats are left out. Every datagram holds whole lines, at most
+    /// 1432 bytes of them.
+    async fn lines(&self, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = 0;
+        let mut quiet_since = std::time::Instant::now();
+        loop {
+            let datagrams = self.datagrams.lock().unwrap().clone();
+            if datagrams.len() != seen {
+                seen = datagrams.len();
+                quiet_since = std::time::Instant::now();
+            }
+            let text: Vec<String> = datagrams
+                .iter()
+                .map(|d| String::from_utf8(d.clone()).unwrap())
+                .collect();
+            let flushes = text
+                .iter()
+                .flat_map(|d| d.lines())
+                .filter(|line| line.starts_with("harness.flushed:"))
+                .count();
+            if flushes >= count && quiet_since.elapsed() >= std::time::Duration::from_millis(300) {
+                for datagram in &text {
+                    assert!(
+                        datagram.len() <= 1432 && datagram.ends_with('\n'),
+                        "datagram {datagram:?}"
+                    );
+                }
+                let mut lines: Vec<String> = text
+                    .iter()
+                    .flat_map(|d| d.lines())
+                    .filter(|line| {
+                        !line.starts_with("datadog.dogstatsd.client.")
+                            && !line.starts_with("redis.")
+                    })
+                    .map(str::to_string)
+                    .collect();
+                lines.sort();
+                return lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DogStatsD received {text:?}, expected {count} flushes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// The flush that marks the end of each flush in a statsd stream.
@@ -632,12 +796,25 @@ impl Harness {
             }),
             false => None,
         };
-        let oracle =
-            Oracle::start(&oracle_redis, &settings, statsd.as_ref().map(|s| &s.oracle)).await;
+        let dogstatsd = match settings.dogstatsd {
+            Some(_) => Some(DogStatsdServers {
+                oracle: DogStatsdServer::start().await,
+                subject: DogStatsdServer::start().await,
+            }),
+            None => None,
+        };
+        let oracle = Oracle::start(
+            &oracle_redis,
+            &settings,
+            statsd.as_ref().map(|s| &s.oracle),
+            dogstatsd.as_ref().map(|s| &s.oracle),
+        )
+        .await;
         let subject = Subject::start(
             &subject_redis,
             &settings,
             statsd.as_ref().map(|s| &s.subject),
+            dogstatsd.as_ref().map(|s| &s.subject),
         )
         .await;
         let mut h = Self {
@@ -647,6 +824,7 @@ impl Harness {
             subject_redis,
             load_options: settings.load,
             statsd,
+            dogstatsd,
             flushes: Default::default(),
         };
         h.load_config(config).await.unwrap();
@@ -682,6 +860,14 @@ impl Harness {
             sink.flush().await;
         }
         assert_eq!(self.subject.stats.snapshot(), expected, "counters");
+        if let Some(dogstatsd) = &self.dogstatsd {
+            let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_eq!(
+                dogstatsd.subject.lines(count).await,
+                dogstatsd.oracle.lines(count).await,
+                "DogStatsD lines"
+            );
+        }
         if let Some(statsd) = &self.statsd {
             let count = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
             assert_eq!(
@@ -1955,6 +2141,49 @@ async fn extra_tags_are_appended_like_upstream() {
     h.call(request("llm", &[&[("user", "alice")], &[("x", "y")]]))
         .await
         .unwrap();
+    h.call(request("unknown", &[&[("a", "b")]])).await.unwrap();
+    h.assert_same_redis().await;
+}
+
+/// The counters reach DogStatsD as upstream's sink sends them: `name:value|c` lines with the
+/// global tags, then `EXTRA_TAGS` pulled out of the name, then the first matching mogrifier's.
+#[tokio::test]
+async fn counters_are_sent_to_dogstatsd_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        dogstatsd: Some(DogStatsd {
+            entity_id: "entity".into(),
+            env: "prod".into(),
+            service: "rl".into(),
+            version: "1.2".into(),
+            mogrifiers: vec![
+                (
+                    "HITS",
+                    r"^ratelimit\.service\.rate_limit\.(\w+)\.(\w+)\.total_hits$",
+                    "ratelimit.hits",
+                    vec![("domain", "$1")],
+                ),
+                (
+                    "ANY",
+                    r"^ratelimit\.service\.rate_limit\.([^.]+)\.(.+)$",
+                    "ratelimit.$2.$9",
+                    vec![("domain", "$1")],
+                ),
+            ],
+        }),
+        extra_tags: [("cluster", "c1")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let mut h = Harness::configured(TOKENS, settings).await;
+    h.at(1_700_000_000).await;
+    let user = || request("llm", &[&[("user", "alice")]]);
+    h.call(with_hits(user(), 600, &[None])).await.unwrap();
+    h.call(with_hits(user(), 600, &[None])).await.unwrap();
     h.call(request("unknown", &[&[("a", "b")]])).await.unwrap();
     h.assert_same_redis().await;
 }
