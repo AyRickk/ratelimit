@@ -1,0 +1,15 @@
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let protos = [
+        "proto/envoy/service/ratelimit/v3/rls.proto",
+        "proto/envoy/extensions/common/ratelimit/v3/ratelimit.proto",
+        "proto/envoy/type/v3/ratelimit_unit.proto",
+        "proto/envoy/config/core/v3/base.proto",
+    ];
+    let fds = protox::compile(protos, ["proto"])?;
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_fds(fds)?;
+    println!("cargo:rerun-if-changed=proto");
+    Ok(())
+}

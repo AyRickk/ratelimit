@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/ratelimit", "crates/ratelimit-proto"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+prost = "0.14"
+prost-types = "0.14"
+protox = "0.10"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+base64 = "0.22"
+thiserror = "2"
+yaml-rust2 = "0.13"
+ratelimit-proto = { path = "crates/ratelimit-proto" }

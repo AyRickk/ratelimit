@@ -1,0 +1,13 @@
+// Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/config/core/v3/base.proto:
+// only HeaderValue is kept; validation and udpa annotations and comments removed;
+// packages, names and field numbers unchanged.
+
+syntax = "proto3";
+
+package envoy.config.core.v3;
+
+message HeaderValue {
+  string key = 1;
+  string value = 2;
+  bytes raw_value = 3;
+}

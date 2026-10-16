@@ -1,0 +1,76 @@
+// Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/service/ratelimit/v3/rls.proto:
+// validation and udpa annotations and comments removed; packages, names and field numbers unchanged.
+
+syntax = "proto3";
+
+package envoy.service.ratelimit.v3;
+
+import "envoy/config/core/v3/base.proto";
+import "envoy/extensions/common/ratelimit/v3/ratelimit.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+service RateLimitService {
+  rpc ShouldRateLimit(RateLimitRequest) returns (RateLimitResponse) {
+  }
+}
+
+message RateLimitRequest {
+  string domain = 1;
+  repeated envoy.extensions.common.ratelimit.v3.RateLimitDescriptor descriptors = 2;
+  uint32 hits_addend = 3;
+}
+
+message RateLimitResponse {
+  enum Code {
+    UNKNOWN = 0;
+    OK = 1;
+    OVER_LIMIT = 2;
+  }
+
+  message RateLimit {
+    enum Unit {
+      UNKNOWN = 0;
+      SECOND = 1;
+      MINUTE = 2;
+      HOUR = 3;
+      DAY = 4;
+      WEEK = 7;
+      MONTH = 5;
+      YEAR = 6;
+    }
+
+    string name = 3;
+    uint32 requests_per_unit = 1;
+    Unit unit = 2;
+    google.protobuf.UInt32Value unit_multiplier = 4;
+  }
+
+  message Quota {
+    uint32 requests = 1;
+
+    oneof expiration_specifier {
+      google.protobuf.Timestamp valid_until = 2;
+    }
+
+    string id = 3;
+  }
+
+  message DescriptorStatus {
+    Code code = 1;
+    RateLimit current_limit = 2;
+    uint32 limit_remaining = 3;
+    google.protobuf.Duration duration_until_reset = 4;
+    Quota quota = 5;
+  }
+
+  Code overall_code = 1;
+  repeated DescriptorStatus statuses = 2;
+  repeated config.core.v3.HeaderValue response_headers_to_add = 3;
+  repeated config.core.v3.HeaderValue request_headers_to_add = 4;
+  bytes raw_body = 5;
+  google.protobuf.Struct dynamic_metadata = 6;
+  Quota quota = 7;
+}

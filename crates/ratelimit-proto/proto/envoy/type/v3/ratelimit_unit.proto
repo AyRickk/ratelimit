@@ -1,0 +1,16 @@
+// Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/type/v3/ratelimit_unit.proto:
+// udpa annotations and comments removed; packages, names and values unchanged.
+
+syntax = "proto3";
+
+package envoy.type.v3;
+
+enum RateLimitUnit {
+  UNKNOWN = 0;
+  SECOND = 1;
+  MINUTE = 2;
+  HOUR = 3;
+  DAY = 4;
+  MONTH = 5;
+  YEAR = 6;
+}
