@@ -5869,53 +5869,60 @@ async fn server_stats_are_reported_like_upstream() {
     );
     assert_eq!(sums[1], sums[0], "DogStatsD");
 
-    // Prometheus, with the default mapper and no `EXTRA_TAGS` (which would leave the names
-    // unmapped, and the timers summaries): a counter and a histogram per method, whose
-    // buckets depend on each side's timing and are left out.
-    let mut series = Vec::new();
-    for (binary, redis) in [
-        upstream_binary(),
-        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
-    ]
-    .iter()
-    .zip(&redis)
-    {
-        let address = format!("127.0.0.1:{}", reserved_port());
-        let sink = vec![
-            ("USE_STATSD", "false".to_string()),
-            ("USE_PROMETHEUS", "true".into()),
-            ("PROMETHEUS_ADDR", address.clone()),
-        ];
-        let service = Service::start(binary, &stats_environment(redis, sink)).await;
-        server_calls(&service).await;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let lines = loop {
-            let scraped = http_request(&address, "GET", "/metrics", &[]).await;
-            let lines: Vec<String> = scraped
-                .body
-                .lines()
-                .filter(|l| {
-                    l.starts_with("ratelimit_service_total_requests")
-                        || l.starts_with("ratelimit_service_response_time_seconds_count")
-                        || l.starts_with("# TYPE ratelimit_service_")
-                })
-                .map(String::from)
-                .collect();
-            // 6 calls counted, and 6 timed.
-            let total: f64 = lines
-                .iter()
-                .filter(|l| !l.starts_with('#'))
-                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-                .sum();
-            if total >= 12.0 || std::time::Instant::now() > deadline {
-                break lines;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-        series.push(lines);
+    // Prometheus with the default mapper: a counter and a histogram per method; with
+    // `EXTRA_TAGS` the names are not mapped, and the timers become summaries. Bucket and
+    // quantile values depend on each side's timing and are left out.
+    for tags in [None, Some(tagged.clone())] {
+        let mut series = Vec::new();
+        for (binary, redis) in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ]
+        .iter()
+        .zip(&redis)
+        {
+            let address = format!("127.0.0.1:{}", reserved_port());
+            let mut sink = vec![
+                ("USE_STATSD", "false".to_string()),
+                ("USE_PROMETHEUS", "true".into()),
+                ("PROMETHEUS_ADDR", address.clone()),
+            ];
+            sink.extend(tags.clone());
+            let service = Service::start(binary, &stats_environment(redis, sink)).await;
+            server_calls(&service).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let lines = loop {
+                let scraped = http_request(&address, "GET", "/metrics", &[]).await;
+                let lines: Vec<String> = scraped
+                    .body
+                    .lines()
+                    .filter(|l| {
+                        l.starts_with("# TYPE ratelimit_s")
+                            || (l.starts_with("ratelimit_s")
+                                && (l.contains("total_requests") || l.contains("_count")))
+                    })
+                    .map(String::from)
+                    .collect();
+                // 6 calls counted, and 6 timed.
+                let total: f64 = lines
+                    .iter()
+                    .filter(|l| !l.starts_with('#'))
+                    .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                    .sum();
+                if total >= 12.0 || std::time::Instant::now() > deadline {
+                    break lines;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            series.push(lines);
+        }
+        assert!(
+            series[0].iter().any(|l| l.contains("_count")),
+            "{:?}",
+            series[0]
+        );
+        assert_eq!(series[1], series[0], "Prometheus with {tags:?}");
     }
-    assert!(!series[0].is_empty());
-    assert_eq!(series[1], series[0], "Prometheus");
 }
 
 /// The server's stats from `lines` once every call of `server_calls` is in them (3
@@ -5934,4 +5941,116 @@ async fn wait_for_server_stats(lines: impl Fn() -> Vec<String>) -> BTreeMap<Stri
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Timers mapped to summaries (the default observer type) reach Prometheus like upstream's:
+/// statsd_exporter's quantiles, the defaults' or the mapping's (a quantile given twice keeps
+/// its last error), the mapping's options in full, the streams' estimates over many
+/// observations and buffer flushes, and the names a summary takes from other metrics.
+#[tokio::test]
+async fn summaries_reach_prometheus_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let dense: Vec<String> = (1..20)
+        .map(|i| format!("{{quantile: {}, error: 0.005}}", i as f64 / 20.0))
+        .chain(["{quantile: 0.99, error: 0.0005}".to_string()])
+        .collect();
+    let mapper = format!(
+        "
+defaults:
+  summary_options:
+    quantiles: [{{quantile: 0.3, error: 0.03}}, {{quantile: 0.7, error: 0.01}}]
+mappings:
+- match: labelled.*
+  name: labelled
+  labels: {{kind: $1}}
+- match: custom.*
+  name: custom
+  summary_options:
+    quantiles: [{{quantile: 0.25, error: 0.001}}, {{quantile: 0.75, error: 0.02}}, {{quantile: 0.25, error: 0.2}}]
+    buf_cap: 3
+- match: empty.*
+  name: empty
+  summary_options: {{quantiles: [], age_buckets: 2}}
+- match: legacy.*
+  name: legacy
+  summary_options: {{quantiles: [{{quantile: 0.1, error: 0.01}}, {{quantile: 0.999, error: 0.0001}}]}}
+- match: dense.*
+  name: dense
+  summary_options: {{quantiles: [{}]}}
+- match: hist.*
+  name: plain_timer_sum
+  observer_type: histogram
+",
+        dense.join(", ")
+    );
+    let settings = Settings {
+        prometheus: Some(Prometheus::new(Some(&mapper)).await),
+        ..Default::default()
+    };
+    let h = Harness::configured(TOKENS, settings).await;
+    // Values in a shuffled order, with repeats, negatives and large ones.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut values: Vec<f64> = (0..4000)
+        .map(|_| (next() % 100_000) as f64 - 1000.0)
+        .collect();
+    values.extend([0.0, -0.5, 1e9, 3.25, 3.25, 3.25]);
+    let batch = |name: &'static str, values: &[f64]| -> Vec<(&'static str, &'static str, f64)> {
+        values.iter().map(|v| ("timer", name, *v)).collect()
+    };
+    // A counter named like a summary's `_sum` makes the summary a conflict.
+    h.flush_to_prometheus(&[("counter", "pre_sum", 1.0), ("timer", "pre", 1.0)])
+        .await;
+    h.flush_to_prometheus(&batch("plain_timer", &values[..10]))
+        .await;
+    for name in [
+        "labelled.a",
+        "labelled.b",
+        "custom.x",
+        "empty.x",
+        "legacy.x",
+        "dense.x",
+    ] {
+        h.flush_to_prometheus(&batch(name, &values[..7])).await;
+    }
+    // Scraped between batches, so that each Write flushes the buffers in between.
+    let mut scraped = None;
+    for chunk in values.chunks(800) {
+        let mut stats = batch("plain_timer", chunk);
+        for name in ["custom.x", "dense.x", "labelled.a", "empty.x"] {
+            stats.extend(batch(name, chunk));
+        }
+        scraped = Some(h.flush_to_prometheus(&stats).await);
+    }
+    let body = scraped.unwrap().body;
+    for series in [
+        "dense{quantile=\"0.95\"}",
+        "custom{quantile=\"0.25\"}",
+        "empty{quantile=\"0.7\"}",
+        "legacy{quantile=\"0.999\"}",
+        "labelled{kind=\"a\",quantile=\"0.3\"}",
+        "plain_timer_count 4016",
+    ] {
+        assert!(body.contains(series), "{series} in {body}");
+    }
+    // A summary's `_count` taken first, a counter's name taken by a summary.
+    h.flush_to_prometheus(&[
+        ("counter", "taken", 1.0),
+        ("timer", "taken", 1.0),
+        ("counter", "late_count", 1.0),
+        ("timer", "late", 1.0),
+    ])
+    .await;
+    // A gauge named like a summary's `_sum` is refused; a histogram is registered, but
+    // Gather refuses it.
+    h.flush_to_prometheus(&[("gauge", "plain_timer_sum", 1.0)])
+        .await;
+    h.flush_to_prometheus(&[("timer", "hist.x", 1.0)]).await;
 }
