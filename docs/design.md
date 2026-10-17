@@ -163,7 +163,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 - Same names as the reference. Exclusive sinks, fatal error if two are enabled: statsd over **TCP** (`USE_STATSD=true` by default, so `USE_PROMETHEUS=true` alone is fatal), DogStatsD with mogrifiers, native Prometheus; `DISABLE_STATS` wins; otherwise log.
 - Prometheus *(amended)*: a port of statsd_exporter v0.26.1's mapper (every key, decoded with yaml.v2's rules and validated alike; the glob FSM with its ordering quirks, then the regexes in order; `$n` templates; the escaping of unmapped names), its exporter and registry (conflicts, TTLs, self-metrics), and client_golang's Gather checks and text format, served like promhttp. A mapper file that cannot be read or does not load maps nothing, silently, as upstream; one that makes upstream panic is an error at startup (D1). Summaries come with the timers that need them.
 - Several limits: a `~name` identifier appended to the **last segment** (`user_alice~weekly`), emitted **even for a single-limit list**. The shipped default mapper adds a `limit=` label and maps the new `total_capped_hits` (D11) and `opened_without_hits` (D9) stats.
-- Go stats (`go.*`, `/stats` expvar, pprof): replaced by the Rust process's stats (documented divergence).
+- Go stats (`go.*`): replaced by the Rust process's stats (documented divergence). *(amended)* The debug port's `/stats` keeps expvar's `cmdline`, without `memstats`; pprof's paths answer as pprof does when it has no such profile or cannot start one.
 
 ---
 

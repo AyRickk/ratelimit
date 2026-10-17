@@ -3934,20 +3934,25 @@ struct Service {
     grpc: String,
     /// `HOST:PORT`.
     http: String,
+    /// `DEBUG_HOST:DEBUG_PORT`.
+    debug: String,
 }
 
 impl Service {
     async fn start(binary: &std::path::Path, environment: &[(&str, String)]) -> Self {
-        let (grpc_port, http_port) = (reserved_port(), reserved_port());
-        let mut environment = environment.to_vec();
-        environment.extend([
+        let (grpc_port, http_port, debug_port) =
+            (reserved_port(), reserved_port(), reserved_port());
+        // The caller's variables come last, so that they win.
+        let mut defaults = vec![
             ("GRPC_HOST", "127.0.0.1".to_string()),
             ("GRPC_PORT", grpc_port.to_string()),
             ("HOST", "127.0.0.1".into()),
             ("PORT", http_port.to_string()),
             ("DEBUG_HOST", "127.0.0.1".into()),
-            ("DEBUG_PORT", reserved_port().to_string()),
-        ]);
+            ("DEBUG_PORT", debug_port.to_string()),
+        ];
+        defaults.extend(environment.iter().cloned());
+        let environment = defaults;
         let process = Command::new(binary)
             .env_clear()
             .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
@@ -3960,6 +3965,7 @@ impl Service {
             _process: process,
             grpc: format!("http://127.0.0.1:{grpc_port}"),
             http: format!("127.0.0.1:{http_port}"),
+            debug: format!("127.0.0.1:{debug_port}"),
         }
     }
 
@@ -5331,4 +5337,367 @@ fn without_go_spaces(text: &str) -> String {
         }
     }
     out
+}
+
+/// Sends `request` as is to `address`; returns the answer once the connection closes.
+async fn send_raw(address: &str, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("the connection is closed")
+    .unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// An answer's status line (but its version), headers (but the date) and body.
+fn answer_parts(response: &str) -> (String, Vec<String>, String) {
+    let (head, body) = response.split_once("\r\n\r\n").expect("an HTTP answer");
+    let mut lines = head.lines();
+    let status = lines.next().unwrap()[9..].to_string();
+    // Go ends its own 400s by closing the connection; hyper sends a length too (§7).
+    let refused = status.starts_with("400");
+    let mut headers: Vec<String> = lines
+        .map(str::to_ascii_lowercase)
+        .filter(|l| !l.starts_with("date:"))
+        .filter(|l| !(refused && l.starts_with("content-length:")))
+        .collect();
+    headers.sort();
+    (status, headers, body.to_string())
+}
+
+/// The debug port answers like upstream's: the endpoints' list for any path `/` catches,
+/// Go's mux redirects, `/rlconfig` (whose order is random upstream: compared line by line),
+/// `/stats`' `cmdline`, and pprof's answer for profiles it does not have.
+#[tokio::test]
+async fn the_debug_port_answers_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("debug");
+    let dump = "domain: dump
+descriptors:
+  - key: a
+    rate_limit: {unit: week, requests_per_unit: 3}
+    descriptors:
+      - key: b
+        value: v
+        shadow_mode: true
+        rate_limit: {unit: second, requests_per_unit: 1}
+      - key: c
+        rate_limit: {unlimited: true, requests_per_unit: 7}
+  - key: w
+    value: pre*
+    rate_limit: {unit: day, requests_per_unit: 9}
+  - key: q
+    quota_mode: true
+    rate_limit: {unit: month, requests_per_unit: 2}
+  - key: nolimit
+    descriptors:
+      - key: deep
+        rate_limit: {unit: year, requests_per_unit: 4}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v1/ratelimit/config/dump.yaml", dump.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let (services, _redis) = both_services(|redis| binary_environment(&runtime, redis)).await;
+    for (method, target) in [
+        ("GET", "/"),
+        ("HEAD", "/"),
+        ("POST", "/"),
+        ("GET", "/foo"),
+        ("GET", "/stats/"),
+        ("GET", "/debug"),
+        ("GET", "/debug/pprof"),
+        ("GET", "/debug/pprof?x=1"),
+        ("HEAD", "/debug/pprof"),
+        ("POST", "/debug/pprof"),
+        ("GET", "/debug/ppro%66"),
+        ("GET", "/a/../rlconfig"),
+        ("GET", "/a/../%2Fx"),
+        ("GET", "/a/../b!"),
+        ("GET", "//stats"),
+        ("GET", "/x/../debug/pprof"),
+        ("GET", "/debug/pprof/cmdline"),
+        ("GET", "/debug/pprof/symbol"),
+        ("GET", "/debug/pprof/profile/"),
+        ("GET", "/debug/pprof/x/y"),
+        ("GET", "/debug/pprof/trace/"),
+        ("GET", "/%zz"),
+        ("GET", "/a|b"),
+        ("GET", "/x/../a|b"),
+    ] {
+        let request = format!("{method} {target} HTTP/1.0\r\nHost: h\r\n\r\n");
+        let upstream = answer_parts(&send_raw(&services[0].debug, &request).await);
+        let ours = answer_parts(&send_raw(&services[1].debug, &request).await);
+        assert_eq!(ours, upstream, "{method} {target}");
+    }
+    for request in [
+        "GET * HTTP/1.0\r\n\r\n",
+        "HEAD * HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET http://h/a/../stats HTTP/1.0\r\n\r\n",
+        "CONNECT h:1 HTTP/1.0\r\n\r\n",
+        "CONNECT /debug/pprof HTTP/1.0\r\n\r\n",
+        "GET /a/../x?q=\u{e9} HTTP/1.0\r\n\r\n",
+        "GET /debug/pprof?\u{e9} HTTP/1.0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n",
+    ] {
+        let upstream = answer_parts(&send_raw(&services[0].debug, request).await);
+        let ours = answer_parts(&send_raw(&services[1].debug, request).await);
+        assert_eq!(ours, upstream, "{request:?}");
+    }
+    // The config, in any order.
+    for target in ["/rlconfig", "/rlconfi%67"] {
+        let request = format!("GET {target} HTTP/1.0\r\nHost: h\r\n\r\n");
+        let lines = |response: &str| {
+            let (status, headers, body) = answer_parts(response);
+            let mut lines: Vec<String> = body.lines().map(String::from).collect();
+            lines.sort();
+            (status, headers, lines, body.ends_with('\n'))
+        };
+        let upstream = lines(&send_raw(&services[0].debug, &request).await);
+        let ours = lines(&send_raw(&services[1].debug, &request).await);
+        assert_eq!(ours, upstream, "{target}");
+        assert!(ours.2.len() > 5, "{ours:?}");
+    }
+    // `/stats`: the command line as JSON, then upstream's `memstats` only.
+    let request = "GET /stats HTTP/1.0\r\nHost: h\r\n\r\n";
+    let (upstream_status, upstream_headers, upstream_body) =
+        answer_parts(&send_raw(&services[0].debug, request).await);
+    let (status, headers, body) = answer_parts(&send_raw(&services[1].debug, request).await);
+    assert_eq!(
+        (
+            &status,
+            &headers
+                .iter()
+                .filter(|h| !h.starts_with("content-length"))
+                .collect::<Vec<_>>()
+        ),
+        (
+            &upstream_status,
+            &upstream_headers
+                .iter()
+                .filter(|h| !h.starts_with("content-length"))
+                .collect::<Vec<_>>()
+        )
+    );
+    let upstream_lines: Vec<&str> = upstream_body.lines().collect();
+    assert_eq!(upstream_lines.len(), 2);
+    assert!(
+        upstream_lines[1].starts_with("memstats: {"),
+        "{}",
+        upstream_lines[1]
+    );
+    let binary = |path: &std::path::Path| {
+        format!(
+            "cmdline: [{}]",
+            serde_json::to_string(&path.display().to_string()).unwrap()
+        )
+    };
+    assert_eq!(upstream_lines[0], binary(&upstream_binary()));
+    assert_eq!(
+        body,
+        format!(
+            "{}\n",
+            binary(std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")))
+        )
+    );
+    // pprof cannot profile here: its own answer when profiling does not start.
+    for (target, text) in [
+        (
+            "/debug/pprof/profile",
+            "Could not enable CPU profiling: not available",
+        ),
+        (
+            "/debug/pprof/trace",
+            "Could not enable tracing: not available",
+        ),
+    ] {
+        let request = format!("GET {target} HTTP/1.0\r\nHost: h\r\n\r\n");
+        let (status, _, body) = answer_parts(&send_raw(&services[1].debug, &request).await);
+        assert_eq!(
+            (status.as_str(), body.as_str()),
+            ("500 Internal Server Error", format!("{text}\n").as_str())
+        );
+    }
+}
+
+/// The content type Go's server sniffs for a body (`http.DetectContentType`), and Go's JSON
+/// strings (`json.Marshal`, as `/stats` writes the command line), for bytes of any kind.
+#[test]
+fn bodies_are_sniffed_and_strings_quoted_like_go() {
+    if !tools_available() {
+        return;
+    }
+    let mut inputs: Vec<Vec<u8>> = [
+        &b""[..],
+        b"text",
+        b"  \t\n<html>",
+        b"<HTML ",
+        b"<html",
+        b"<htmlx",
+        b"<!DOCTYPE html>",
+        b"<!doctype HTML ",
+        b"<head>",
+        b"<script ",
+        b"<iframe>",
+        b"<h1>",
+        b"<div>",
+        b"<font>",
+        b"<table>",
+        b"<a>",
+        b"<a",
+        b"<style>",
+        b"<title>",
+        b"<b>",
+        b"<body>",
+        b"<br>",
+        b"<p>",
+        b"<!-->",
+        b"<!--x",
+        b" <?xml",
+        b"<?XML",
+        b"%PDF-1",
+        b"%!PS-Adobe-3",
+        b"\xFE\xFF\x00\x00",
+        b"\xFF\xFE\x00\x01",
+        b"\xEF\xBB\xBFx",
+        b"\xEF\xBB\xBF",
+        b"\x00\x00\x01\x00",
+        b"\x00\x00\x02\x00",
+        b"BMx",
+        b"GIF87a",
+        b"GIF89a!",
+        b"RIFF1234WEBPVP8",
+        b"\x89PNG\x0D\x0A\x1A\x0A",
+        b"\xFF\xD8\xFF\xE0",
+        b"FORM1234AIFF",
+        b"ID3x",
+        b"OggS\x00",
+        b"MThd\x00\x00\x00\x06",
+        b"RIFF1234AVI ",
+        b"RIFF1234WAVE",
+        b"\x1A\x45\xDF\xA3",
+        b"\x00\x01\x00\x00",
+        b"OTTO",
+        b"ttcf",
+        b"wOFF",
+        b"wOF2",
+        b"\x1F\x8B\x08",
+        b"PK\x03\x04",
+        b"Rar!\x1A\x07\x00",
+        b"Rar!\x1A\x07\x01\x00",
+        b"\x00asm",
+        b"a\x00b",
+        b"a\x08",
+        b"a\x0b",
+        b"a\x0c",
+        b"a\x1b",
+        b"a\x1c",
+        b"a\x7f",
+        b"\xff\xfe",
+        b"\x80",
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp41isom",
+        b"\x00\x00\x00\x10ftypisom\x00\x00\x00\x00",
+        b"\x00\x00\x00\x14ftypxxxxmp4\x00\x00\x00\x00\x00",
+        // JSON strings.
+        b"\"\\/",
+        b"\x01\x1f\x08\x0c\n\r\t",
+        b"<>&",
+        "\u{2028}\u{2029}é😀".as_bytes(),
+        b"\xe2\x82",
+        b"\xe2\x82A",
+        b"\xed\xa0\x80",
+        b"\xc0\xaf",
+        b"\xf4\x90\x80\x80",
+        b"a\xffb\xfe",
+        "\u{fffd}".as_bytes(),
+    ]
+    .iter()
+    .map(|b| b.to_vec())
+    .collect();
+    let mut font = vec![0u8; 34];
+    font.extend_from_slice(b"LP");
+    inputs.push(font);
+    let mut webm_font = b"\x1A\x45\xDF\xA3".to_vec();
+    webm_font.resize(34, 0);
+    webm_font.extend_from_slice(b"LP");
+    inputs.push(webm_font);
+    let mut long = vec![b'a'; 512];
+    long.push(0);
+    inputs.push(long);
+    let mut late_html = vec![b' '; 600];
+    late_html.extend_from_slice(b"<html>");
+    inputs.push(late_html);
+
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-sniff")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let lines: String = inputs
+        .iter()
+        .map(|input| format!("{}\n", hex(input)))
+        .collect();
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    assert_eq!(upstream.len(), inputs.len());
+    for (input, upstream) in inputs.iter().zip(&upstream) {
+        let ours = format!(
+            "{}\t{}",
+            ratelimit::goserver::detect_content_type(input),
+            ratelimit::go::json_string(input)
+        );
+        assert_eq!(&ours, upstream, "{input:?}");
+    }
+}
+
+/// A debug port that cannot be listened on is not fatal: the service serves anyway.
+#[tokio::test]
+async fn a_busy_debug_port_is_ignored_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("busy-debug");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    // Taken without SO_REUSEPORT, so that neither service can share it.
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = busy.local_addr().unwrap().port().to_string();
+    let (services, _redis) = both_services(|redis| {
+        let mut environment = binary_environment(&runtime, redis);
+        environment.push(("DEBUG_PORT", port.clone()));
+        environment
+    })
+    .await;
+    for service in &services {
+        let status = http_request(&service.http, "GET", "/healthcheck", &[])
+            .await
+            .status;
+        assert_eq!(status, 200, "{}", service.grpc);
+    }
 }

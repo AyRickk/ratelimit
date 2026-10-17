@@ -330,6 +330,24 @@ func printProtojson() {
 	}
 }
 
+// printSniffed prints, for each stdin line (hex), http.DetectContentType of its bytes and
+// json.Marshal of them as a string, separated by a tab.
+func printSniffed() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(nil, 1<<24)
+	for scanner.Scan() {
+		input, err := hex.DecodeString(scanner.Text())
+		if err != nil {
+			log.Fatal(err)
+		}
+		encoded, err := json.Marshal(string(input))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%s\t%s\n", http.DetectContentType(input), encoded)
+	}
+}
+
 // printProtojsonMarshal reads each stdin line, a RateLimitResponse's binary encoding in hex,
 // and prints "ok" and its protojson.Marshal, as upstream's /json handler writes it, or
 // "error".
@@ -439,7 +457,12 @@ func main() {
 	useFileProvider := flag.Bool("file-provider", false, "load the config with upstream's file provider")
 	decodeProtojson := flag.Bool("protojson", false, "decode each stdin line (hex) as /json does and exit")
 	encodeProtojson := flag.Bool("protojson-marshal", false, "encode each stdin line (hex) as /json does and exit")
+	sniff := flag.Bool("sniff", false, "print each stdin line's (hex) sniffed content type and JSON string, and exit")
 	flag.Parse()
+	if *sniff {
+		printSniffed()
+		return
+	}
 	if *decodeProtojson {
 		printProtojson()
 		return

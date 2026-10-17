@@ -132,6 +132,11 @@ impl<C: RateLimitCache> RateLimitService<C> {
         self.update_config(Ok(config));
     }
 
+    /// `GetCurrentConfig`: the configuration in use, if one loaded.
+    pub fn current_config(&self) -> Option<Arc<RateLimitConfig>> {
+        self.config.read().unwrap().clone()
+    }
+
     /// `SetConfig`: uses a configuration that loaded; one that did not leaves the current one
     /// in place.
     pub fn update_config(&self, update: Result<RateLimitConfig, ConfigError>) {
@@ -166,7 +171,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
             !request.descriptors.is_empty(),
             "rate limit descriptor list must not be empty",
         )?;
-        let config = self.config.read().unwrap().clone();
+        let config = self.current_config();
         let config = config
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
         let checks = descriptor_checks(&config, request, &self.stats);

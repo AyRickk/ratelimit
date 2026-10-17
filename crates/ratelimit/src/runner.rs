@@ -192,6 +192,17 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         .add_service(health_service.server())
         .add_service(grpc::server(service.clone()));
     let stop = shutting_down(signals.stop);
+    // Start: the debug port first; a failure to listen there is not fatal (upstream logs it).
+    let (grpc_done, grpc_stopped) = tokio::sync::watch::channel(false);
+    let debug_address = crate::net::join_host_port(&settings.debug_host, settings.debug_port);
+    let debug = match crate::net::listen(&debug_address, true).await {
+        Ok(listener) => Some(tokio::spawn(crate::debug::serve(
+            listener,
+            service.clone(),
+            stopped(grpc_stopped.clone()),
+        ))),
+        Err(_) => None,
+    };
     let grpc_served: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
     > = if !settings.grpc_uds.is_empty() {
@@ -222,17 +233,23 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
     let http_listener = crate::net::listen(&http_address, true)
         .await
         .map_err(|e| format!("Failed to open HTTP listener: '{e}'"))?;
-    let (grpc_done, grpc_stopped) = tokio::sync::oneshot::channel::<()>();
     let http = tokio::spawn(crate::http::serve(
         http_listener,
         health,
         service,
-        async move {
-            let _ = grpc_stopped.await;
-        },
+        stopped(grpc_stopped),
     ));
+    // Stop: gRPC stops gracefully, then the debug port and the HTTP server close.
     let served = grpc_served.await;
-    let _ = grpc_done.send(());
+    let _ = grpc_done.send(true);
+    if let Some(debug) = debug {
+        let _ = debug.await;
+    }
     let _ = http.await;
     served
+}
+
+/// Resolves once gRPC has stopped.
+async fn stopped(mut grpc_stopped: tokio::sync::watch::Receiver<bool>) {
+    let _ = grpc_stopped.wait_for(|stopped| *stopped).await;
 }

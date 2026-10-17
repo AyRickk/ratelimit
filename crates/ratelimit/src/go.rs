@@ -682,3 +682,44 @@ pub fn parse_duration(text: &str) -> Result<i64, String> {
     }
     i64::try_from(total).map_err(|_| invalid())
 }
+
+/// `json.Marshal` of a string of any bytes (Go 1.27): `<`, `>`, `&`, U+2028, U+2029 and
+/// control characters escaped, each invalid UTF-8 byte replaced with U+FFFD.
+pub fn json_string(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (valid, invalid) = match std::str::from_utf8(rest) {
+            Ok(text) => (text, 0),
+            Err(e) => {
+                let invalid = e.error_len().unwrap_or(rest.len() - e.valid_up_to());
+                (
+                    std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap(),
+                    invalid,
+                )
+            }
+        };
+        for c in valid.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c < ' ' || matches!(c, '<' | '>' | '&' | '\u{2028}' | '\u{2029}') => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        // Go replaces each byte of an invalid sequence.
+        for _ in 0..invalid {
+            out.push('\u{fffd}');
+        }
+        rest = &rest[valid.len() + invalid..];
+    }
+    out.push('"');
+    out
+}
