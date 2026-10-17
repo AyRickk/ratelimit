@@ -286,3 +286,30 @@ async fn timers_are_written_like_gostats() {
         )
     );
 }
+
+/// A call dropped before it ends (its client gone) still has its time recorded, as Go's
+/// handler runs to its end.
+#[tokio::test]
+async fn a_dropped_call_is_timed() {
+    let output = Output::default();
+    let stats = Arc::new(Stats::default());
+    let _flushing = ratelimit::stats::flush_every(
+        stats.clone(),
+        Sink::Logging(logging_sink(&output)),
+        Duration::from_secs(3600),
+    );
+    let server = ratelimit::stats::ServerStats::new(stats);
+    let call = server.record("M", std::future::pending::<()>());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), call)
+            .await
+            .is_err()
+    );
+    assert!(
+        output
+            .text()
+            .contains(r#""name":"ratelimit_server.M.response_time","type":"timer""#),
+        "{}",
+        output.text()
+    );
+}

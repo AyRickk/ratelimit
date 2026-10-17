@@ -140,6 +140,11 @@ impl Stats {
         }
     }
 
+    /// `ScopeWithTags` for a scope that has no stats here yet: only its tags count.
+    pub fn count_tagged_scope(&self) {
+        self.count_reserved_tags();
+    }
+
     /// `ScopeWithTags(name, EXTRA_TAGS)`: a scope whose counters carry the tags.
     pub fn scope_with_tags(&self, name: &str) -> Scope {
         self.count_reserved_tags();
@@ -288,18 +293,31 @@ impl ServerStats {
         Self { stats, scope }
     }
 
-    /// The interceptor around a unary call of `method`, once its request is decoded.
+    /// The interceptor around a unary call of `method`, once its request is decoded. The time
+    /// is recorded even when the call is dropped (its client gone): Go's handler runs on.
     pub async fn record<F: std::future::Future>(&self, method: &str, call: F) -> F::Output {
         let start = std::time::Instant::now();
         let total_requests = format!("{method}.total_requests");
         self.stats.scope_counter(&self.scope, &total_requests).inc();
-        let output = call.await;
         let timer = self
             .stats
             .scope_timer(&self.scope, &format!("{method}.response_time"));
+        let _timing = Timing { timer, start };
+        call.await
+    }
+}
+
+/// Records the time since `start` when dropped.
+struct Timing {
+    timer: Timer,
+    start: std::time::Instant,
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
         // `time.Since(start).Milliseconds()`: whole milliseconds.
-        timer.add_value(start.elapsed().as_millis() as f64);
-        output
+        self.timer
+            .add_value(self.start.elapsed().as_millis() as f64);
     }
 }
 

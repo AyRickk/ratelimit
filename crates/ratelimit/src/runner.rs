@@ -125,7 +125,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
     let health_service = HealthService::default().with_stats(server_stats.clone());
     // NewServer's own scope (that of the `go.*` and `localcache.*` gauges): its tags count in
     // `reserved_tag` like every tagged scope's.
-    let _server_scope = stats.scope_with_tags("ratelimit");
+    stats.count_tagged_scope();
     let with_config = settings.healthy_with_at_least_one_config_loaded;
     let health = Arc::new(HealthChecker::new(health_service.clone(), with_config));
     let sigterm_health = health.clone();

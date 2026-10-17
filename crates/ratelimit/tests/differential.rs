@@ -5812,8 +5812,7 @@ async fn server_stats_are_reported_like_upstream() {
         ];
         let service = Service::start(binary, &stats_environment(redis, sink)).await;
         server_calls(&service).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        sums.push(server_stat_lines(&server.lines.lock().unwrap()));
+        sums.push(wait_for_server_stats(|| server.lines.lock().unwrap().clone()).await);
     }
     assert!(
         sums[0]
@@ -5847,20 +5846,19 @@ async fn server_stats_are_reported_like_upstream() {
         ];
         let service = Service::start(binary, &stats_environment(redis, sink)).await;
         server_calls(&service).await;
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        let lines: Vec<String> = server
-            .datagrams
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|d| {
-                String::from_utf8_lossy(d)
-                    .lines()
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        sums.push(server_stat_lines(&lines));
+        let lines = || {
+            let datagrams = server.datagrams.lock().unwrap();
+            datagrams
+                .iter()
+                .flat_map(|d| {
+                    String::from_utf8_lossy(d)
+                        .lines()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        sums.push(wait_for_server_stats(lines).await);
     }
     assert!(
         sums[0]
@@ -5871,8 +5869,9 @@ async fn server_stats_are_reported_like_upstream() {
     );
     assert_eq!(sums[1], sums[0], "DogStatsD");
 
-    // Prometheus, with the default mapper: a counter and a histogram per method (with
-    // `EXTRA_TAGS` the names are not mapped, and timers become summaries).
+    // Prometheus, with the default mapper and no `EXTRA_TAGS` (which would leave the names
+    // unmapped, and the timers summaries): a counter and a histogram per method, whose
+    // buckets depend on each side's timing and are left out.
     let mut series = Vec::new();
     for (binary, redis) in [
         upstream_binary(),
@@ -5889,21 +5888,50 @@ async fn server_stats_are_reported_like_upstream() {
         ];
         let service = Service::start(binary, &stats_environment(redis, sink)).await;
         server_calls(&service).await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let scraped = http_request(&address, "GET", "/metrics", &[]).await;
-        // Every request takes less than the first bucket's 5 ms here.
-        let lines: Vec<String> = scraped
-            .body
-            .lines()
-            .filter(|l| {
-                l.starts_with("ratelimit_service_total_requests")
-                    || l.starts_with("ratelimit_service_response_time")
-            })
-            .filter(|l| !l.contains("_sum{"))
-            .map(String::from)
-            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let lines = loop {
+            let scraped = http_request(&address, "GET", "/metrics", &[]).await;
+            let lines: Vec<String> = scraped
+                .body
+                .lines()
+                .filter(|l| {
+                    l.starts_with("ratelimit_service_total_requests")
+                        || l.starts_with("ratelimit_service_response_time_seconds_count")
+                        || l.starts_with("# TYPE ratelimit_service_")
+                })
+                .map(String::from)
+                .collect();
+            // 6 calls counted, and 6 timed.
+            let total: f64 = lines
+                .iter()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .sum();
+            if total >= 12.0 || std::time::Instant::now() > deadline {
+                break lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         series.push(lines);
     }
     assert!(!series[0].is_empty());
     assert_eq!(series[1], series[0], "Prometheus");
+}
+
+/// The server's stats from `lines` once every call of `server_calls` is in them (3
+/// `ShouldRateLimit`, 2 `Check`, 1 `List`, each counted and timed), or after 10 s.
+async fn wait_for_server_stats(lines: impl Fn() -> Vec<String>) -> BTreeMap<String, u64> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let sums = server_stat_lines(&lines());
+        let calls: u64 = sums
+            .iter()
+            .filter(|(name, _)| name.starts_with("ratelimit_server."))
+            .map(|(_, n)| n)
+            .sum();
+        if calls >= 12 || std::time::Instant::now() > deadline {
+            return sums;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
