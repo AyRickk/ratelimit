@@ -4088,7 +4088,10 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("RUNTIME_WATCH_ROOT", "false".into()), ("RUNTIME_APPDIRECTORY", "missing".into())], format!("unable to watch file ({}/ratelimit/missing)", runtime.join("current").display())),
         (vec![("BACKEND_TYPE", "bogus".into())], "Invalid setting for BackendType: bogus".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
-        (vec![("REDIS_TYPE", "foo".into())], "Unrecognized redis type foo".into()),
+        (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
+        // Redis refuses the database: its error ends the message.
+        (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
+        (vec![("REDIS_URL", "::1:6379".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to ::1:6379 after ".into()),
         (vec![("REDIS_URL", "127.0.0.1:1".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to 127.0.0.1:1 after ".into()),
         (vec![("GRPC_PORT_BUSY", busy_port.clone())], format!("Failed to listen for gRPC on '127.0.0.1:{busy_port}': ")),
     ];
@@ -4200,4 +4203,44 @@ async fn the_binary_serves_on_a_unix_socket_like_upstream() {
         actual.statuses[0].limit_remaining,
         expected.statuses[0].limit_remaining
     );
+}
+
+/// On SIGTERM both binaries stop serving gracefully and exit successfully.
+#[tokio::test]
+async fn the_binary_stops_on_sigterm_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("sigterm");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let mut service = Service::start(&binary, &binary_environment(&runtime, &redis)).await;
+        let mut client = service.client().await;
+        client
+            .should_rate_limit(request("llm", &[&[("user", "a")]]))
+            .await
+            .unwrap();
+        let pid = service._process.id().unwrap();
+        let killed = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(30), service._process.wait())
+                .await
+                .expect("the service did not stop")
+                .unwrap();
+        assert!(status.success(), "{}: {status}", binary.display());
+    }
 }

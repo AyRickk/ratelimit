@@ -156,6 +156,59 @@ pub fn format_duration(nanos: i64) -> String {
     }
 }
 
+/// `net.SplitHostPort`: the host (without brackets) and port of `host:port`, or Go's error.
+pub fn split_host_port(address: &str) -> Result<(String, String), String> {
+    let error = |reason: &str| format!("address {address}: {reason}");
+    let Some(colon) = address.rfind(':') else {
+        return Err(error("missing port in address"));
+    };
+    let (host, port) = (&address[..colon], &address[colon + 1..]);
+    if let Some(inner) = host.strip_prefix('[') {
+        let inner = inner
+            .strip_suffix(']')
+            .ok_or_else(|| error("missing ']' in address"))?;
+        if inner.contains(['[', ']']) {
+            return Err(error("unexpected '[' in address"));
+        }
+        return Ok((inner.to_string(), port.to_string()));
+    }
+    if host.contains(':') {
+        return Err(error("too many colons in address"));
+    }
+    if host.contains(['[', ']']) {
+        return Err(error("unexpected ']' in address"));
+    }
+    Ok((host.to_string(), port.to_string()))
+}
+
+/// `url.PathUnescape` (or `url.QueryUnescape` with `query`, where `+` is a space): `None` for
+/// a malformed `%` escape, as Go refuses it.
+pub fn unescape(s: &str, query: bool) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match bytes[i] {
+            b'%' => {
+                let high = bytes.get(i + 1).copied().and_then(hex)?;
+                let low = bytes.get(i + 2).copied().and_then(hex)?;
+                out.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            b'+' if query => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// Why a `strconv` parser failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumError {

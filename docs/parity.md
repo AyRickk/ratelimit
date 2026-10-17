@@ -19,8 +19,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `GRPC_UDS` | — | ✅ | `the_binary_serves_on_a_unix_socket_like_upstream` in `tests/differential.rs` |
 | `GRPC_HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_binary_*`), listening like Go (dual-stack wildcard, `SO_REUSEPORT`) |
 | `GRPC_PORT` | `8081` | ✅ | `tests/differential.rs` (`the_binary_*`); a busy port fails like upstream |
-| `GRPC_MAX_CONNECTION_AGE` | `24h` | ⬜ | |
-| `GRPC_MAX_CONNECTION_AGE_GRACE` | `1h` | ⬜ | |
+| `GRPC_MAX_CONNECTION_AGE` | `24h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
+| `GRPC_MAX_CONNECTION_AGE_GRACE` | `1h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
 | `GRPC_SERVER_USE_TLS` | `false` | ⬜ | |
 | `GRPC_SERVER_TLS_CERT` | — | ⬜ | |
 | `GRPC_SERVER_TLS_KEY` | — | ⬜ | |
@@ -189,11 +189,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
-| `/healthcheck`: 500 with no body when unhealthy; SIGTERM ⇒ unhealthy + graceful shutdown | ⬜ | |
+| SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
+| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down | ⬜ | |
 | `grpc.health.v1`, service `ratelimit` | ⬜ | |
 | Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
 | `GRPC_UDS` | ✅ | `tests/differential.rs` |
-| Max connection age, client mTLS + SAN, server certificate hot reload | ⬜ | |
+| Max connection age | ✅ | the gRPC server's keepalive settings |
+| Client mTLS + SAN, server certificate hot reload | ⬜ | |
 
 ## 4. Algorithm and storage
 
@@ -270,6 +272,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A startup failure is a logrus `level=fatal` line (exit status 1) or a Go panic with its stack trace (exit status 2) | the message alone on stderr, exit status 1 | the message is the same; the log format comes with `LOG_FORMAT` |
 | radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |
 | Redis connection errors read as Go's `net` errors (`dial tcp 127.0.0.1:1: connect: connection refused`) | as fred's | different libraries; the messages around them are upstream's |
+| `GRPC_MAX_CONNECTION_AGE` gets ±10% of jitter (grpc-go) | applied as it is (tonic) | spreads reconnections only |
+| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info) | masked too | keeps secrets out of logs |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |

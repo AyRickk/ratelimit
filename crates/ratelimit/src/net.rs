@@ -38,7 +38,11 @@ pub async fn listen(addr: &str, reuse_port: bool) -> std::io::Result<tokio::net:
     if matches!(host, "" | "0.0.0.0" | "::") {
         let any6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
         let any4 = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-        return bind(any6).or_else(|_| bind(any4));
+        // Go falls back to IPv4 only when the system has no IPv6.
+        return match bind(any6) {
+            Err(e) if e.raw_os_error() == Some(libc_eafnosupport()) => bind(any4),
+            result => result,
+        };
     }
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     let address = addresses
@@ -55,4 +59,9 @@ pub fn join_host_port(host: &str, port: i64) -> String {
         true => format!("[{host}]:{port}"),
         false => format!("{host}:{port}"),
     }
+}
+
+/// `EAFNOSUPPORT`: the address family (here IPv6) is not supported.
+fn libc_eafnosupport() -> i32 {
+    if cfg!(target_os = "linux") { 97 } else { 47 }
 }

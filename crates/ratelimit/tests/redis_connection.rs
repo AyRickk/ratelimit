@@ -1,7 +1,7 @@
 //! How the service reaches Redis and retries at startup, from its settings (radix's and
 //! upstream's rules; the binary itself is compared with upstream's in `differential.rs`).
 
-use ratelimit::redis::{RedisAddress, RedisConnection, StartupBackoff, mask_credentials_in_url};
+use ratelimit::redis::{RedisConnection, StartupBackoff, mask_credentials_in_url};
 use ratelimit::settings::Settings;
 use std::time::Duration;
 
@@ -16,72 +16,76 @@ fn connection(environment: &[(&str, &str)]) -> Result<RedisConnection, String> {
     RedisConnection::from_settings(&settings)
 }
 
+fn credentials(c: &RedisConnection) -> (&str, &str, &str, &str) {
+    (&c.address, &c.username, &c.password, &c.database)
+}
+
 #[test]
 fn the_default_is_the_nutcracker_socket() {
     let c = connection(&[]).unwrap();
     assert_eq!(
-        c.address,
-        RedisAddress::Unix("/var/run/nutcracker/ratelimit.sock".into())
+        (c.network.as_str(), c.address.as_str()),
+        ("unix", "/var/run/nutcracker/ratelimit.sock")
     );
     assert_eq!((c.pool_size, c.timeout), (10, Duration::from_secs(10)));
-    assert_eq!((c.username, c.password, c.database), (None, None, None));
+    assert_eq!(
+        credentials(&c),
+        ("/var/run/nutcracker/ratelimit.sock", "", "", "")
+    );
 }
 
-/// `REDIS_AUTH` is `user:password` or a password; a `redis://` URL fills in what it lacks.
+/// `REDIS_AUTH` is `user:password` or a password; radix fills in what is still empty from a
+/// `redis://` URL (user info, path, then the query's first values).
 #[test]
 fn credentials_come_from_redis_auth_then_the_url() {
-    let tcp = [("REDIS_SOCKET_TYPE", "tcp")];
-    let with = |more: &[(&'static str, &'static str)]| {
-        let environment: Vec<_> = tcp.iter().chain(more).copied().collect();
-        connection(&environment).unwrap()
+    let with = |url: &str, auth: &str| {
+        let c = connection(&[("REDIS_URL", url), ("REDIS_AUTH", auth)]).unwrap();
+        let (a, u, p, d) = credentials(&c);
+        (a.to_string(), u.to_string(), p.to_string(), d.to_string())
     };
-    let c = with(&[("REDIS_URL", "h:1"), ("REDIS_AUTH", "user:pa:ss")]);
+    let owned = |a: &str, u: &str, p: &str, d: &str| (a.into(), u.into(), p.into(), d.into());
+    assert_eq!(with("h:1", "user:pa:ss"), owned("h:1", "user", "pa:ss", ""));
+    assert_eq!(with("h:1", "secret"), owned("h:1", "", "secret", ""));
+    assert_eq!(with("h:1", "user:"), owned("h:1", "user", "", ""));
     assert_eq!(
-        (c.username.as_deref(), c.password.as_deref()),
-        (Some("user"), Some("pa:ss"))
-    );
-    let c = with(&[("REDIS_URL", "h:1"), ("REDIS_AUTH", "secret")]);
-    assert_eq!(
-        (c.username.as_deref(), c.password.as_deref()),
-        (None, Some("secret"))
-    );
-    let c = with(&[(
-        "REDIS_URL",
-        "redis://u%40x:p%2B@db.example:6380/3?password=q",
-    )]);
-    assert_eq!(
-        c.address,
-        RedisAddress::Tcp {
-            host: "db.example".into(),
-            port: 6380
-        }
+        with("redis://bob@h:1", ":pw"),
+        owned("h:1", "bob", "pw", "")
     );
     assert_eq!(
-        (c.username.as_deref(), c.password.as_deref(), c.database),
-        (Some("u@x"), Some("p+"), Some(3))
+        with("redis://u%40x:p%2B@db.example:6380/3?password=q", ""),
+        owned("db.example:6380", "u@x", "p+", "3")
     );
-    let c = with(&[
-        ("REDIS_URL", "redis://h:1?username=a+b&password=c&db=2"),
-        ("REDIS_AUTH", "pw"),
-    ]);
     assert_eq!(
-        (c.username.as_deref(), c.password.as_deref(), c.database),
-        (Some("a b"), Some("pw"), Some(2))
+        with("redis://h:1?username=a+b&password=c&db=2&db=9", "pw"),
+        owned("h:1", "a b", "pw", "2")
     );
-    assert_eq!(c.masked_url, "redis://h:1?username=a+b&password=c&db=2");
-    let c = with(&[("REDIS_URL", "redis://u:p@h:1")]);
-    assert_eq!(c.masked_url, "redis://*****@h:1");
+    // A key without a value is empty; a pair with `;` is dropped; a fragment is not the host.
+    assert_eq!(
+        with("redis://h:1?username&username=x;y&db=05#frag", ""),
+        owned("h:1", "", "", "05")
+    );
+    assert_eq!(with("redis://h:1/abc/", ""), owned("h:1", "", "", "abc/"));
+    // What Go cannot parse is dialled as it is.
+    assert_eq!(
+        with("redis://u:%zz@h:1", ""),
+        owned("redis://u:%zz@h:1", "", "", "")
+    );
 }
 
+/// Upstream's masking, and the query's credentials too (`docs/parity.md` §7).
 #[test]
 fn credentials_are_masked_in_each_url() {
     assert_eq!(
         mask_credentials_in_url("redis://a:b@h1:1,h2:2,redis://c@d@h3:3"),
         "redis://*****@h1:1,h2:2,redis://*****@h3:3"
     );
+    assert_eq!(
+        mask_credentials_in_url("redis://h:1?username=u&password=p&db=2"),
+        "redis://h:1?username=*****&password=*****&db=2"
+    );
 }
 
-/// radix's pool size defaults to 4; upstream refuses CREATE and ERROR.
+/// radix's pool size defaults to 4; upstream refuses CREATE and ERROR, and unknown types.
 #[test]
 fn pool_settings_like_upstream() {
     assert_eq!(
@@ -95,16 +99,12 @@ fn pool_settings_like_upstream() {
         "{error}"
     );
     assert!(connection(&[("REDIS_POOL_ON_EMPTY_BEHAVIOR", "anything")]).is_ok());
+    assert!(connection(&[("REDIS_TYPE", "Single")]).is_ok());
     assert_eq!(
-        connection(&[("REDIS_TYPE", "Single")]).unwrap().address,
-        connection(&[]).unwrap().address
-    );
-    assert_eq!(
-        connection(&[("REDIS_TYPE", "x")]).unwrap_err(),
-        "Unrecognized redis type x"
+        connection(&[("REDIS_TYPE", "FOO")]).unwrap_err(),
+        "Unrecognized redis type FOO"
     );
 }
-
 /// jpillora/backoff: between `min` and `min × 2^attempt`, never beyond `[min, max]`.
 #[test]
 fn startup_retries_back_off_like_upstream() {

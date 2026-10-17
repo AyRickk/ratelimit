@@ -16,14 +16,40 @@ fn check_log_level(level: &str) -> Result<(), String> {
     match level.to_lowercase().as_str() {
         "panic" | "fatal" | "error" | "warn" | "warning" | "info" | "debug" | "trace" => Ok(()),
         _ => Err(format!(
-            "Could not parse log level. not a valid logrus Level: {}\n",
+            "Could not parse log level. not a valid logrus Level: {}",
             crate::go::quote(level)
         )),
     }
 }
 
-/// Runs the service until the gRPC server stops: stats, config, Redis, then serving.
+/// Tells when the process gets SIGINT, SIGTERM or SIGHUP, as the runner's signal handler.
+fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<bool>, String> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    let listen = |kind| signal(kind).map_err(|e| e.to_string());
+    let mut interrupt = listen(SignalKind::interrupt())?;
+    let mut terminate = listen(SignalKind::terminate())?;
+    let mut hangup = listen(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        let _ = sender.send(true);
+    });
+    Ok(receiver)
+}
+
+/// Resolves once `receiver` says the service is shutting down.
+async fn shutting_down(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    let _ = receiver.wait_for(|down| *down).await;
+}
+
+/// Runs the service until it is told to stop (then stops gracefully): stats, config, Redis,
+/// then serving.
 pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
+    let shutdown = shutdown_signal()?;
     // NewRunner: the logger, then the stats sink and its flushes.
     check_log_level(&settings.log_level)?;
     let sink = stats::select_sink(&settings.sinks(lookup)?)?;
@@ -31,10 +57,10 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
     let stats = Arc::new(Stats::new(&settings.extra_tags));
     stats::flush_every(stats.clone(), sink, interval);
 
-    let unsupported = [(settings.tracing_enabled, "TRACING_ENABLED")];
-    if let Some((_, name)) = unsupported.iter().find(|(on, _)| *on) {
-        return Err(format!("{name} is not supported yet"));
-    }
+    crate::settings::refuse_unsupported(&[
+        (settings.tracing_enabled, "TRACING_ENABLED"),
+        (settings.grpc_server_use_tls, "GRPC_SERVER_USE_TLS"),
+    ])?;
 
     // NewServer: the config provider.
     let loader = match settings.config_type.as_str() {
@@ -50,7 +76,10 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         other => return Err(format!("Invalid setting for BackendType: {other}")),
     };
     let pool = connection
-        .connect(&StartupBackoff::from_settings(&settings))
+        .connect(
+            &StartupBackoff::from_settings(&settings),
+            shutting_down(shutdown.clone()),
+        )
         .await?;
     let clock = Arc::new(SystemClock);
     let cache = RedisCache::new(pool, clock.clone(), stats.clone(), settings.redis_cache());
@@ -76,15 +105,25 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         let _ = first_rx.await;
     }
 
-    // startGrpc.
-    let server = tonic::transport::Server::builder().add_service(grpc::server(service));
+    // startGrpc, with gRPC's keepalive settings; stopped gracefully on a signal.
+    let mut builder = tonic::transport::Server::builder();
+    let age = crate::settings::duration(settings.grpc_max_connection_age);
+    let grace = crate::settings::duration(settings.grpc_max_connection_age_grace);
+    if !age.is_zero() {
+        builder = builder.max_connection_age(age);
+    }
+    if !grace.is_zero() {
+        builder = builder.max_connection_age_grace(grace);
+    }
+    let server = builder.add_service(grpc::server(service));
+    let stop = shutting_down(shutdown);
     if !settings.grpc_uds.is_empty() {
         let address = settings.grpc_uds.clone();
         let listener = tokio::net::UnixListener::bind(&address)
             .map_err(|e| format!("Failed to listen for gRPC on '{address}': {e}"))?;
         let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
         return server
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, stop)
             .await
             .map_err(|e| e.to_string());
     }
@@ -94,7 +133,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         .map_err(|e| format!("Failed to listen for gRPC on '{address}': {e}"))?;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     server
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, stop)
         .await
         .map_err(|e| e.to_string())
 }

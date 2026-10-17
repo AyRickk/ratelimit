@@ -483,25 +483,7 @@ impl MetricsPath {
 fn unescaped_segments(path: &str) -> Vec<String> {
     path.split('/')
         .skip(1)
-        .map(|segment| {
-            let bytes = segment.as_bytes();
-            let mut out = Vec::with_capacity(bytes.len());
-            let mut i = 0;
-            while i < bytes.len() {
-                let hex = |b: u8| (b as char).to_digit(16);
-                match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
-                    (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
-                        out.push((hex(h).unwrap() * 16 + hex(l).unwrap()) as u8);
-                        i += 3;
-                    }
-                    (b, _, _) => {
-                        out.push(b);
-                        i += 1;
-                    }
-                }
-            }
-            String::from_utf8_lossy(&out).into_owned()
-        })
+        .map(|segment| crate::go::unescape(segment, false).unwrap_or_else(|| segment.to_string()))
         .collect()
 }
 
