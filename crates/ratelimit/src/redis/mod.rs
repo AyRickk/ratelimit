@@ -1,6 +1,10 @@
 //! The Redis backend for fixed windows. A port of envoyproxy/ratelimit
 //! `src/redis/fixed_cache_impl.go`: one pipeline of `INCRBY` + `EXPIRE` per request, and a Lua
-//! script for refunds.
+//! script for refunds. How the service reaches Redis is in [`connection`].
+
+mod connection;
+
+pub use connection::{RedisConnection, StartupBackoff, mask_credentials_in_url};
 
 use crate::config::RateLimit;
 use crate::limiter::{self, Clock, Count, Hits, RequestState};
@@ -50,7 +54,8 @@ impl Default for RedisCacheSettings {
 }
 
 pub struct RedisCache {
-    client: Client,
+    /// Connections, each request's pipeline on one of them (radix's pool).
+    pool: Pool,
     clock: Arc<dyn Clock>,
     stats: Arc<Stats>,
     local_cache: Option<LocalCache>,
@@ -59,7 +64,7 @@ pub struct RedisCache {
 
 impl RedisCache {
     pub fn new(
-        client: Client,
+        pool: Pool,
         clock: Arc<dyn Clock>,
         stats: Arc<Stats>,
         settings: RedisCacheSettings,
@@ -67,7 +72,7 @@ impl RedisCache {
         let local_cache = (settings.local_cache_size_in_bytes > 0)
             .then(|| LocalCache::new(settings.local_cache_size_in_bytes));
         Self {
-            client,
+            pool,
             clock,
             stats,
             local_cache,
@@ -283,7 +288,7 @@ impl RateLimitCache for RedisCache {
         }
         let mut counts = vec![Count::After(0); limits.len()];
         if !commands.is_empty() {
-            let replies = send(&self.client, &commands).await?;
+            let replies = send(self.pool.next(), &commands).await?;
             for (index, at) in reply_of {
                 counts[index] = Count::After(commands[at].counter(replies[at].clone())?);
             }
@@ -331,7 +336,7 @@ impl RedisCache {
                 args: vec![c.key.clone()],
             })
             .collect();
-        let replies = send(&self.client, &commands).await?;
+        let replies = send(self.pool.next(), &commands).await?;
         for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
             let before = command.counter(reply)?;
             c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));

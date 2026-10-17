@@ -16,20 +16,20 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `PORT` | `8080` | ⬜ | |
 | `DEBUG_HOST` | `0.0.0.0` | ⬜ | |
 | `DEBUG_PORT` | `6070` | ⬜ | |
-| `GRPC_UDS` | — | ⬜ | |
-| `GRPC_HOST` | `0.0.0.0` | ⬜ | |
-| `GRPC_PORT` | `8081` | ⬜ | |
-| `GRPC_MAX_CONNECTION_AGE` | `24h` | ⬜ | |
-| `GRPC_MAX_CONNECTION_AGE_GRACE` | `1h` | ⬜ | |
+| `GRPC_UDS` | — | ✅ | `the_binary_serves_on_a_unix_socket_like_upstream` in `tests/differential.rs` |
+| `GRPC_HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_binary_*`), listening like Go (dual-stack wildcard, `SO_REUSEPORT`) |
+| `GRPC_PORT` | `8081` | ✅ | `tests/differential.rs` (`the_binary_*`); a busy port fails like upstream |
+| `GRPC_MAX_CONNECTION_AGE` | `24h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
+| `GRPC_MAX_CONNECTION_AGE_GRACE` | `1h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
 | `GRPC_SERVER_USE_TLS` | `false` | ⬜ | |
 | `GRPC_SERVER_TLS_CERT` | — | ⬜ | |
 | `GRPC_SERVER_TLS_KEY` | — | ⬜ | |
 | `GRPC_CLIENT_TLS_CACERT` | — | ⬜ | |
 | `GRPC_CLIENT_TLS_SAN` | — | ⬜ | |
-| `LOG_LEVEL` | `WARN` | ⬜ | |
+| `LOG_LEVEL` | `WARN` | 🚧 | an invalid value fails at startup like upstream (`the_binary_fails_to_start_like_upstream`); logging itself not yet |
 | `LOG_FORMAT` | `text` | ⬜ | |
-| `CONFIG_TYPE` | `FILE` | ⬜ | |
-| `FORCE_START_WITHOUT_INITIAL_CONFIG` | `false` | ⬜ | |
+| `CONFIG_TYPE` | `FILE` | 🚧 | `FILE`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `GRPC_XDS_SOTW` not supported yet |
+| `FORCE_START_WITHOUT_INITIAL_CONFIG` | `false` | ✅ | the service waits for the file provider's first load unless set (the end state is the same, as upstream) |
 | `CONFIG_GRPC_XDS_NODE_ID` | `default` | ⬜ | |
 | `CONFIG_GRPC_XDS_NODE_METADATA` | — | ⬜ | |
 | `CONFIG_GRPC_XDS_SERVER_URL` | `localhost:18000` | ⬜ | |
@@ -45,51 +45,51 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `XDS_CLIENT_BACKOFF_RANDOM_FACTOR` | `0.5` | ⬜ | |
 | `XDS_CLIENT_BACKOFF_JITTER` | `true` | ⬜ | |
 | `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ⬜ | |
-| `USE_DOG_STATSD` | `false` | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
-| `USE_DOG_STATSD_MOGRIFIERS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
-| `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
-| `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`, `DD_ORIGIN_DETECTION_ENABLED` | — (read by datadog-go, not by `settings.go`) | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
-| `USE_STATSD` | `true` | 🚧 | behaviour: `tests/stats.rs` (selection); not wired into the binary yet |
-| `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `EXTRA_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet (a value containing `:` makes upstream panic at startup) |
-| `STATS_FLUSH_INTERVAL` | `10s` | 🚧 | behaviour: `tests/stats.rs`; not wired into the binary yet |
-| `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/stats.rs` (selection); not wired into the binary yet |
-| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; not wired into the binary yet (gostats also accepts `udp4`, `udp6` and any other network name) |
+| `USE_DOG_STATSD` | `false` | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `USE_DOG_STATSD_MOGRIFIERS` | — | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`, `DD_ORIGIN_DETECTION_ENABLED` | — (read by datadog-go, not by `settings.go`) | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `USE_STATSD` | `true` | ✅ | behaviour: `tests/stats.rs` (selection); read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `STATSD_HOST` | `localhost` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `STATSD_PORT` | `8125` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `EXTRA_TAGS` | — | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) (a value containing `:` makes upstream panic at startup) |
+| `STATS_FLUSH_INTERVAL` | `10s` | ✅ | behaviour: `tests/stats.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `DISABLE_STATS` | `false` | ✅ | behaviour: `tests/stats.rs` (selection); read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | ✅ | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) (gostats also accepts `udp4`, `udp6` and any other network name) |
 | `GOSTATS_FLUSH_INTERVAL_SECONDS`, `GOSTATS_LOGGING_SINK_DISABLED` | `5`, `false` (read by gostats, not by `settings.go`) | ✅ | only checked (an invalid value fails when the statsd sink is created), as upstream: `tests/differential.rs` |
-| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `USE_PROMETHEUS` | `false` | 🚧 | behaviour: `tests/stats.rs`, `tests/prometheus.rs` (selection); not wired into the binary yet |
-| `PROMETHEUS_ADDR` | `:9090` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `PROMETHEUS_PATH` | `/metrics` | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
-| `PROMETHEUS_MAPPER_YAML` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
-| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_ROOT` | `/srv/runtime_data/current` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_SUBDIRECTORY` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_APPDIRECTORY` | `config` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_IGNOREDOTFILES` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_WATCH_ROOT` | `true` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `USE_PROMETHEUS` | `false` | ✅ | behaviour: `tests/stats.rs`, `tests/prometheus.rs` (selection); read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `PROMETHEUS_ADDR` | `:9090` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `PROMETHEUS_PATH` | `/metrics` | ✅ | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `PROMETHEUS_MAPPER_YAML` | — | ✅ | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `RUNTIME_ROOT` | `/srv/runtime_data/current` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `RUNTIME_SUBDIRECTORY` | — | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `RUNTIME_APPDIRECTORY` | `config` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `RUNTIME_IGNOREDOTFILES` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `RUNTIME_WATCH_ROOT` | `true` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
-| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not wired into the binary yet |
-| `NEAR_LIMIT_RATIO` | `0.8` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `CACHE_KEY_PREFIX` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `BACKEND_TYPE` | `redis` | ⬜ | |
-| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not wired into the binary yet |
+| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `NEAR_LIMIT_RATIO` | `0.8` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `CACHE_KEY_PREFIX` | — | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `BACKEND_TYPE` | `redis` | 🚧 | `redis`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `memcache` not supported yet |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ⬜ | |
-| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ⬜ | |
-| `REDIS_SOCKET_TYPE` | `unix` | ⬜ | |
-| `REDIS_TYPE` | `SINGLE` | ⬜ | |
-| `REDIS_URL` | `/var/run/nutcracker/ratelimit.sock` | ⬜ | |
-| `REDIS_POOL_SIZE` | `10` | ⬜ | |
-| `REDIS_AUTH` | — | ⬜ | |
+| `REDIS_SOCKET_TYPE` | `unix` | ✅ | `tcp`: `tests/differential.rs`; `unix`: `tests/runner.rs` |
+| `REDIS_TYPE` | `SINGLE` | 🚧 | `SINGLE`, and an invalid value: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream`; `CLUSTER`, `SENTINEL` not supported yet |
+| `REDIS_URL` | `/var/run/nutcracker/ratelimit.sock` | ✅ | `tests/differential.rs`; `redis://` URLs (user, password, database): `tests/runner.rs` |
+| `REDIS_POOL_SIZE` | `10` | ✅ | `tests/runner.rs` (0 is radix's 4) |
+| `REDIS_AUTH` | — | ✅ | `user:password` or a password: `tests/runner.rs` |
 | `REDIS_AUTH_FILE` | — | ⬜ | |
 | `REDIS_AWS_IAM_AUTH` | `false` | ⬜ | |
 | `REDIS_AWS_IAM_CACHE_NAME` | — | ⬜ | |
@@ -124,13 +124,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
 | `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | `false` | ⬜ | |
 | `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR` | `false` | ⬜ | |
-| `REDIS_TIMEOUT` | `10s` | ⬜ | |
+| `REDIS_TIMEOUT` | `10s` | ✅ | the connection timeout, as radix's dialer: `tests/runner.rs` |
 | `REDIS_PERSECOND_TIMEOUT` | `10s` | ⬜ | |
-| `REDIS_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ⬜ | |
+| `REDIS_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ✅ | `CREATE`/`ERROR` refused at startup: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream` |
 | `REDIS_PERSECOND_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ⬜ | |
-| `REDIS_STARTUP_INITIAL_INTERVAL` | `1s` | ⬜ | |
-| `REDIS_STARTUP_MAX_INTERVAL` | `30s` | ⬜ | |
-| `REDIS_STARTUP_MAX_ELAPSED_TIME` | `0` | ⬜ | |
+| `REDIS_STARTUP_INITIAL_INTERVAL` | `1s` | ✅ | `tests/runner.rs` |
+| `REDIS_STARTUP_MAX_INTERVAL` | `30s` | ✅ | `tests/runner.rs` |
+| `REDIS_STARTUP_MAX_ELAPSED_TIME` | `0` | ✅ | `the_binary_fails_to_start_like_upstream` |
 | `MEMCACHE_HOST_PORT` | — | ⬜ | |
 | `MEMCACHE_MAX_IDLE_CONNS` | `2` | ⬜ | |
 | `MEMCACHE_SRV` | — | ⬜ | |
@@ -140,10 +140,10 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `MEMCACHE_TLS_CLIENT_KEY` | — | ⬜ | |
 | `MEMCACHE_TLS_CACERT` | — | ⬜ | |
 | `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
-| `SHADOW_MODE` | `false` | ⬜ | |
-| `QUOTA_MODE` | `false` | ⬜ | |
-| `RESPONSE_DYNAMIC_METADATA` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `MERGE_DOMAIN_CONFIG` | `false` | ⬜ | |
+| `SHADOW_MODE` | `false` | ✅ | `tests/service.rs`, `tests/differential.rs`; read by the binary: `tests/settings.rs` |
+| `QUOTA_MODE` | `false` | ✅ | `tests/service.rs`, `tests/differential.rs`; read by the binary: `tests/settings.rs` |
+| `RESPONSE_DYNAMIC_METADATA` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
+| `MERGE_DOMAIN_CONFIG` | `false` | ✅ | `tests/config.rs`; read by the binary: `tests/settings.rs` |
 | `TRACING_ENABLED` | `false` | ⬜ | |
 | `TRACING_SERVICE_NAME` | `RateLimit` | ⬜ | |
 | `TRACING_SERVICE_NAMESPACE` | — | ⬜ | |
@@ -169,7 +169,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
 | YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL as a line break | ✅ | `tests/differential.rs` |
 | Quoted scalars continued on less indented lines: accepted by yaml.v2, refused by the Rust parser | ⬜ | |
-| Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
+| Startup without a valid config ⇒ gRPC error on every call (no exit) | ✅ | the service answers errors until a config loads: `tests/differential.rs` (a bad file at start) |
 | File provider: goruntime's loader (snapshot keys, dotfiles, symlinks, failures, nil loader), `SymlinkRefresher` / `DirectoryRefresher` on inotify events, reload coalescing, `runtime` scope | ✅ | snapshots and the first load: `tests/differential.rs`; reloads: `tests/differential.rs` on Linux (inotify, as upstream's fsnotify) |
 | xDS SotW provider (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
 
@@ -189,10 +189,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
-| `/healthcheck`: 500 with no body when unhealthy; SIGTERM ⇒ unhealthy + graceful shutdown | ⬜ | |
+| SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
+| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down | ⬜ | |
 | `grpc.health.v1`, service `ratelimit` | ⬜ | |
 | Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
-| `GRPC_UDS`, max connection age, client mTLS + SAN, server certificate hot reload | ⬜ | |
+| `GRPC_UDS` | ✅ | `tests/differential.rs` |
+| Max connection age | ✅ | the gRPC server's keepalive settings |
+| Client mTLS + SAN, server certificate hot reload | ⬜ | |
 
 ## 4. Algorithm and storage
 
@@ -204,7 +207,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Local cache of over-limit keys (set before the shadow check, TTL = unit), freecache's size limits and eviction | ✅ | `tests/differential.rs`, `tests/freecache.rs` |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ✅ | `tests/differential.rs` |
 | `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
-| Redis single / sentinel / cluster, TLS, AUTH (file), AWS IAM, startup retry | ⬜ | |
+| Redis single (TCP or Unix socket, `redis://` URL, AUTH, pool, startup retry with backoff) | ✅ | `tests/runner.rs`, `tests/differential.rs` (`the_binary_*`) |
+| Redis sentinel / cluster, TLS, AUTH file, AWS IAM, close on `READONLY` | ⬜ | |
 | Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
 
 ## 5. Metrics, logs, traces
@@ -265,6 +269,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | U+2028 and U+2029 also break lines in YAML 1.1 (kept as characters in scalars) | characters only | the Rust parser is YAML 1.2; converting them would change scalars |
 | yaml.v2 reads only the first YAML document of a file: a control character or invalid byte after a later `---` (and beyond its 512-byte read-ahead) is not seen; and it decodes as it parses, so a syntax error before a bad byte further on is reported first | the whole file is checked first | rare inputs; the file is refused either way in the second case |
 | A snapshot's files are loaded in Go's random map order (which decides which error is reported, or the merge order) | in key order | one of upstream's orders, deterministic |
+| A startup failure is a logrus `level=fatal` line (exit status 1) or a Go panic with its stack trace (exit status 2) | the message alone on stderr, exit status 1 | the message is the same; the log format comes with `LOG_FORMAT` |
+| radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |
+| Redis connection errors read as Go's `net` errors (`dial tcp 127.0.0.1:1: connect: connection refused`) | as fred's | different libraries; the messages around them are upstream's |
+| `GRPC_MAX_CONNECTION_AGE` gets ±10% of jitter (grpc-go) | applied as it is (tonic) | spreads reconnections only |
+| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info) | masked too | keeps secrets out of logs |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |

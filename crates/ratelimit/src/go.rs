@@ -121,6 +121,94 @@ pub fn dir(path: &str) -> String {
     clean(&path[..i])
 }
 
+/// `time.Duration.String`: `1h2m3.5s`, `1.5s`, `250ms`, `1.5µs`, `0s`.
+pub fn format_duration(nanos: i64) -> String {
+    /// `fmtFrac`: the fraction of `v` (in units of 10^-prec), without trailing zeros.
+    fn fraction(v: u64, prec: u32) -> (String, u64) {
+        let digits = format!("{:0width$}", v % 10u64.pow(prec), width = prec as usize);
+        let digits = digits.trim_end_matches('0');
+        let text = match digits.is_empty() {
+            true => String::new(),
+            false => format!(".{digits}"),
+        };
+        (text, v / 10u64.pow(prec))
+    }
+    let u = nanos.unsigned_abs();
+    let sign = if nanos < 0 { "-" } else { "" };
+    if u == 0 {
+        return "0s".into();
+    }
+    if u < 1_000_000_000 {
+        let (prec, unit) = match u {
+            _ if u < 1_000 => (0, "ns"),
+            _ if u < 1_000_000 => (3, "\u{b5}s"),
+            _ => (6, "ms"),
+        };
+        let (frac, whole) = fraction(u, prec);
+        return format!("{sign}{whole}{frac}{unit}");
+    }
+    let (frac, seconds) = fraction(u, 9);
+    let (minutes, hours) = (seconds / 60, seconds / 3600);
+    match (hours, minutes) {
+        (0, 0) => format!("{sign}{seconds}{frac}s"),
+        (0, _) => format!("{sign}{minutes}m{}{frac}s", seconds % 60),
+        _ => format!("{sign}{hours}h{}m{}{frac}s", minutes % 60, seconds % 60),
+    }
+}
+
+/// `net.SplitHostPort`: the host (without brackets) and port of `host:port`, or Go's error.
+pub fn split_host_port(address: &str) -> Result<(String, String), String> {
+    let error = |reason: &str| format!("address {address}: {reason}");
+    let Some(colon) = address.rfind(':') else {
+        return Err(error("missing port in address"));
+    };
+    let (host, port) = (&address[..colon], &address[colon + 1..]);
+    if let Some(inner) = host.strip_prefix('[') {
+        let inner = inner
+            .strip_suffix(']')
+            .ok_or_else(|| error("missing ']' in address"))?;
+        if inner.contains(['[', ']']) {
+            return Err(error("unexpected '[' in address"));
+        }
+        return Ok((inner.to_string(), port.to_string()));
+    }
+    if host.contains(':') {
+        return Err(error("too many colons in address"));
+    }
+    if host.contains(['[', ']']) {
+        return Err(error("unexpected ']' in address"));
+    }
+    Ok((host.to_string(), port.to_string()))
+}
+
+/// `url.PathUnescape` (or `url.QueryUnescape` with `query`, where `+` is a space): `None` for
+/// a malformed `%` escape, as Go refuses it.
+pub fn unescape(s: &str, query: bool) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match bytes[i] {
+            b'%' => {
+                let high = bytes.get(i + 1).copied().and_then(hex)?;
+                let low = bytes.get(i + 2).copied().and_then(hex)?;
+                out.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            b'+' if query => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// Why a `strconv` parser failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumError {

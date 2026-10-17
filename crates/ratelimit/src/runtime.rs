@@ -353,7 +353,20 @@ impl FileProvider {
         stats: &Stats,
         update: impl Fn(Result<RateLimitConfig, ConfigError>) + Send + 'static,
     ) -> Result<Self, String> {
-        let loader = loader(settings, stats)?;
+        Ok(Self::with_loader(
+            loader(settings, stats)?,
+            settings,
+            update,
+        ))
+    }
+
+    /// [`start`](Self::start) with a [`loader`] set up beforehand (upstream sets it up before
+    /// connecting to Redis, and loads once the service exists).
+    pub fn with_loader(
+        loader: Loader,
+        settings: &Settings,
+        update: impl Fn(Result<RateLimitConfig, ConfigError>) + Send + 'static,
+    ) -> Self {
         let watch_root = settings.runtime_watch_root;
         let app_prefix = format!("{}.", settings.runtime_appdirectory);
         let options = settings.load_options();
@@ -375,7 +388,7 @@ impl FileProvider {
                 send_event();
             }
         });
-        Ok(Self { _loader: loader })
+        Self { _loader: loader }
     }
 }
 

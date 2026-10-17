@@ -227,11 +227,11 @@ impl Redis {
     }
 
     /// A new connection, for the implementation under test.
-    async fn connect(&self) -> fred::clients::Client {
+    async fn connect(&self) -> fred::clients::Pool {
         let config = Config::from_url(&format!("redis://{}", self.address)).unwrap();
-        let client = Builder::from_config(config).build().unwrap();
-        client.init().await.unwrap();
-        client
+        let pool = Builder::from_config(config).build_pool(1).unwrap();
+        pool.init().await.unwrap();
+        pool
     }
 
     /// The data commands received so far from anyone but the harness, in order, as `MONITOR`
@@ -3902,4 +3902,345 @@ async fn the_file_provider_reloads_like_upstream() {
     h.await_config_loads(3).await;
     h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
     h.call(request("other", &[&[("k", "v")]])).await.unwrap();
+}
+
+/// Upstream's own service binary (`src/service_cmd`), built at the pinned commit.
+fn upstream_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let binary = root.join("target/upstream-ratelimit");
+            let status = std::process::Command::new("go")
+                .args(["build", "-o"])
+                .arg(&binary)
+                .arg("./upstream")
+                .current_dir(root.join("tools/oracle"))
+                .status()
+                .expect("run go build");
+            assert!(status.success(), "go build failed");
+            binary
+        })
+        .clone()
+}
+
+/// A service binary running with `environment`, killed when dropped.
+struct Service {
+    _process: Child,
+    grpc: String,
+}
+
+impl Service {
+    async fn start(binary: &std::path::Path, environment: &[(&str, String)]) -> Self {
+        let grpc_port = reserved_port();
+        let mut environment = environment.to_vec();
+        environment.extend([
+            ("GRPC_HOST", "127.0.0.1".to_string()),
+            ("GRPC_PORT", grpc_port.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", reserved_port().to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ]);
+        let process = Command::new(binary)
+            .env_clear()
+            .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the service");
+        Self {
+            _process: process,
+            grpc: format!("http://127.0.0.1:{grpc_port}"),
+        }
+    }
+
+    async fn client(&self) -> RateLimitServiceClient<Channel> {
+        for _ in 0..300 {
+            if let Ok(client) = RateLimitServiceClient::connect(self.grpc.clone()).await {
+                return client;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the service at {} did not start", self.grpc);
+    }
+}
+
+/// What both binaries share: the runtime directory, Redis over TCP, no stats, no jitter.
+fn binary_environment(runtime: &std::path::Path, redis: &Redis) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "RUNTIME_ROOT",
+            runtime.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("REDIS_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_URL", redis.address.clone()),
+        ("DISABLE_STATS", "true".into()),
+        ("EXPIRATION_JITTER_MAX_SECONDS", "0".into()),
+        ("LOG_LEVEL", "error".into()),
+    ]
+}
+
+/// Our binary serves like upstream's: the config from the runtime directory, the limits in
+/// Redis, over gRPC.
+#[tokio::test]
+async fn the_binary_serves_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("binary");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (upstream_redis, our_redis) = (Redis::start().await, Redis::start().await);
+    let upstream = Service::start(
+        &upstream_binary(),
+        &binary_environment(&runtime, &upstream_redis),
+    )
+    .await;
+    let ours = Service::start(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        &binary_environment(&runtime, &our_redis),
+    )
+    .await;
+    let (mut upstream_client, mut our_client) = (upstream.client().await, ours.client().await);
+    for request in [
+        request("llm", &[&[("user", "a")]]),
+        request("llm", &[&[("user", "a")]]),
+        request("llm", &[&[("user", "a")]]),
+        request("unknown", &[&[("k", "v")]]),
+        request("", &[&[("k", "v")]]),
+    ] {
+        let simplify = |r: Result<tonic::Response<RateLimitResponse>, tonic::Status>| {
+            r.map(tonic::Response::into_inner)
+                .map_err(|s| format!("{:?}: {}", s.code(), s.message()))
+        };
+        let expected = simplify(upstream_client.should_rate_limit(request.clone()).await);
+        let mut actual = simplify(our_client.should_rate_limit(request.clone()).await);
+        // Each side reads its own clock: the time to reset may differ by a second.
+        if let (Ok(expected), Ok(actual)) = (&expected, &mut actual) {
+            for (e, a) in expected.statuses.iter().zip(actual.statuses.iter_mut()) {
+                if let (Some(e), Some(a)) = (&e.duration_until_reset, &mut a.duration_until_reset) {
+                    assert!((e.seconds - a.seconds).abs() <= 1, "{e:?} {a:?}");
+                    a.seconds = e.seconds;
+                    a.nanos = e.nanos;
+                }
+            }
+        }
+        assert_eq!(actual, expected, "response to {request:?}");
+    }
+}
+
+/// What a binary prints when it cannot start, after it exits (it must).
+async fn startup_failure(binary: &std::path::Path, environment: &[(&str, String)]) -> String {
+    let child = Command::new(binary)
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the service");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("{} did not exit with {environment:?}", binary.display()))
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{} started with {environment:?}",
+        binary.display()
+    );
+    // logrus quotes its messages.
+    String::from_utf8_lossy(&output.stderr)
+        .replace("\\\"", "\"")
+        .replace("\\n", "\n")
+}
+
+/// Our binary refuses to start where upstream's does (exits or panics), with its message.
+#[tokio::test]
+async fn the_binary_fails_to_start_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("binary");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy_port = busy.local_addr().unwrap().port().to_string();
+    let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
+        (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
+        (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
+        (vec![("DISABLE_STATS", "false".into()), ("USE_DOG_STATSD", "true".into())], "Error: unable to use more than one stats sink at the same time. Set one of USE_DOG_STATSD, USE_STATSD, USE_PROMETHEUS.".into()),
+        (vec![("DISABLE_STATS", "false".into()), ("STATS_FLUSH_INTERVAL", "0".into())], "non-positive interval for NewTicker".into()),
+        (vec![("CONFIG_TYPE", "bogus".into())], "Invalid setting for ConfigType: bogus".into()),
+        (vec![("RUNTIME_WATCH_ROOT", "false".into()), ("RUNTIME_APPDIRECTORY", "missing".into())], format!("unable to watch file ({}/ratelimit/missing)", runtime.join("current").display())),
+        (vec![("BACKEND_TYPE", "bogus".into())], "Invalid setting for BackendType: bogus".into()),
+        (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
+        (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
+        // Redis refuses the database: its error ends the message.
+        (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
+        (vec![("REDIS_URL", "::1:6379".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to ::1:6379 after ".into()),
+        (vec![("REDIS_URL", "127.0.0.1:1".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to 127.0.0.1:1 after ".into()),
+        (vec![("GRPC_PORT_BUSY", busy_port.clone())], format!("Failed to listen for gRPC on '127.0.0.1:{busy_port}': ")),
+    ];
+    for (overrides, message) in cases {
+        let mut environment = binary_environment(&runtime, &redis);
+        environment.extend([("GRPC_HOST", "127.0.0.1".to_string())]);
+        environment.extend([
+            ("PORT", reserved_port().to_string()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ]);
+        for (key, value) in overrides {
+            let key = if key == "GRPC_PORT_BUSY" {
+                "GRPC_PORT"
+            } else {
+                key
+            };
+            environment.retain(|(k, _)| *k != key);
+            environment.push((key, value));
+        }
+        if !environment.iter().any(|(k, _)| *k == "GRPC_PORT") {
+            environment.push(("GRPC_PORT", reserved_port().to_string()));
+        }
+        let upstream = startup_failure(&upstream_binary(), &environment).await;
+        assert!(
+            upstream.contains(&message),
+            "upstream with {environment:?}:\n{upstream}"
+        );
+        let ours = startup_failure(
+            std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+            &environment,
+        )
+        .await;
+        assert!(
+            ours.contains(&message),
+            "ours with {environment:?}:\n{ours}"
+        );
+    }
+    drop(busy);
+}
+
+/// A gRPC client over the Unix socket at `path`.
+async fn unix_client(path: &std::path::Path) -> RateLimitServiceClient<Channel> {
+    for _ in 0..300 {
+        let path = path.to_path_buf();
+        let connector = tower::service_fn(move |_: tonic::transport::Uri| {
+            let path = path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        });
+        let endpoint = tonic::transport::Endpoint::from_static("http://[::]:50051");
+        if let Ok(channel) = endpoint.connect_with_connector(connector).await {
+            return RateLimitServiceClient::new(channel);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no gRPC server on {}", path.display());
+}
+
+/// With `GRPC_UDS`, both binaries serve gRPC on that Unix socket instead.
+#[tokio::test]
+async fn the_binary_serves_on_a_unix_socket_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("uds");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (upstream_redis, our_redis) = (Redis::start().await, Redis::start().await);
+    let mut clients = Vec::new();
+    let mut services = Vec::new();
+    for (binary, redis, socket) in [
+        (
+            upstream_binary(),
+            &upstream_redis,
+            runtime.join("upstream.sock"),
+        ),
+        (
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+            &our_redis,
+            runtime.join("ours.sock"),
+        ),
+    ] {
+        let mut environment = binary_environment(&runtime, redis);
+        environment.push(("GRPC_UDS", socket.to_string_lossy().into_owned()));
+        services.push(Service::start(&binary, &environment).await);
+        clients.push(unix_client(&socket).await);
+    }
+    let request = request("llm", &[&[("user", "a")]]);
+    let expected = clients[0]
+        .should_rate_limit(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let actual = clients[1]
+        .should_rate_limit(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(actual.overall_code, expected.overall_code);
+    assert_eq!(actual.statuses.len(), expected.statuses.len());
+    assert_eq!(
+        actual.statuses[0].limit_remaining,
+        expected.statuses[0].limit_remaining
+    );
+}
+
+/// On SIGTERM both binaries stop serving gracefully and exit successfully.
+#[tokio::test]
+async fn the_binary_stops_on_sigterm_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("sigterm");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let mut service = Service::start(&binary, &binary_environment(&runtime, &redis)).await;
+        let mut client = service.client().await;
+        client
+            .should_rate_limit(request("llm", &[&[("user", "a")]]))
+            .await
+            .unwrap();
+        let pid = service._process.id().unwrap();
+        let killed = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(30), service._process.wait())
+                .await
+                .expect("the service did not stop")
+                .unwrap();
+        assert!(status.success(), "{}: {status}", binary.display());
+    }
 }
