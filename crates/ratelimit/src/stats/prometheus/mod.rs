@@ -221,9 +221,12 @@ impl PrometheusSink {
                 .unwrap_or_default()
         };
         let uri = request.uri();
-        let path = crate::goserver::escaped_path(uri.path()).unwrap_or_default();
-        match self.mux.route(&path, uri.query()) {
+        // A bad escape was refused before routing (`goserver`).
+        let path = crate::goserver::request_path(uri).unwrap_or_default();
+        let connect = request.method() == hyper::Method::CONNECT;
+        match self.mux.route(&path, uri.query(), connect) {
             Route::Handler(()) => self.metrics(&header("accept"), &header("accept-encoding")),
+            Route::BadRequest => Answer::star(request.version()),
             Route::Redirect(location) => Answer::redirect(&location, request.method()),
             Route::NotFound => Answer::error(404, "404 page not found"),
         }

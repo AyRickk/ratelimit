@@ -192,7 +192,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         .add_service(health_service.server())
         .add_service(grpc::server(service.clone()));
     let stop = shutting_down(signals.stop);
-    // Start: the debug port first; upstream only logs a failure to listen there.
+    // Start: the debug port first; a failure to listen there is not fatal (upstream logs it).
     let (grpc_done, grpc_stopped) = tokio::sync::watch::channel(false);
     let debug_address = crate::net::join_host_port(&settings.debug_host, settings.debug_port);
     let debug = match crate::net::listen(&debug_address, true).await {

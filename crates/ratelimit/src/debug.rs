@@ -99,9 +99,12 @@ pub async fn serve<C: RateLimitCache>(
         let (mux, service) = (mux.clone(), service.clone());
         async move {
             let uri = request.uri();
-            let path = crate::goserver::escaped_path(uri.path()).unwrap_or_default();
-            match mux.route(&path, uri.query()) {
+            // A bad escape was refused before routing (`goserver`).
+            let path = crate::goserver::request_path(uri).unwrap_or_default();
+            let connect = request.method() == hyper::Method::CONNECT;
+            match mux.route(&path, uri.query(), connect) {
                 Route::Handler(endpoint) => answer(*endpoint, &service),
+                Route::BadRequest => Answer::star(request.version()),
                 Route::Redirect(location) => Answer::redirect(&location, request.method()),
                 Route::NotFound => Answer::error(404, "404 page not found"),
             }

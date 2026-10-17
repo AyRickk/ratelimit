@@ -14,6 +14,7 @@ use std::sync::Arc;
 /// treat alike, and turned back into its byte when escaped.
 fn respond(health: &HealthChecker, request: &Request) -> Routed {
     let uri = request.uri();
+    // A bad escape was refused before routing (`goserver`).
     let path = crate::go::unescape_bytes(uri.path(), false).unwrap_or_default();
     let path: String = path.into_iter().map(char::from).collect();
     route(health, uri, &path)

@@ -5442,6 +5442,20 @@ descriptors:
         let ours = answer_parts(&send_raw(&services[1].debug, &request).await);
         assert_eq!(ours, upstream, "{method} {target}");
     }
+    for request in [
+        "GET * HTTP/1.0\r\n\r\n",
+        "HEAD * HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET http://h/a/../stats HTTP/1.0\r\n\r\n",
+        "CONNECT h:1 HTTP/1.0\r\n\r\n",
+        "CONNECT /debug/pprof HTTP/1.0\r\n\r\n",
+        "GET /a/../x?q=\u{e9} HTTP/1.0\r\n\r\n",
+        "GET /debug/pprof?\u{e9} HTTP/1.0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n",
+    ] {
+        let upstream = answer_parts(&send_raw(&services[0].debug, request).await);
+        let ours = answer_parts(&send_raw(&services[1].debug, request).await);
+        assert_eq!(ours, upstream, "{request:?}");
+    }
     // The config, in any order.
     for target in ["/rlconfig", "/rlconfi%67"] {
         let request = format!("GET {target} HTTP/1.0\r\nHost: h\r\n\r\n");
@@ -5650,7 +5664,7 @@ fn bodies_are_sniffed_and_strings_quoted_like_go() {
     for (input, upstream) in inputs.iter().zip(&upstream) {
         let ours = format!(
             "{}\t{}",
-            ratelimit::go::detect_content_type(input),
+            ratelimit::goserver::detect_content_type(input),
             ratelimit::go::json_string(input)
         );
         assert_eq!(&ours, upstream, "{input:?}");

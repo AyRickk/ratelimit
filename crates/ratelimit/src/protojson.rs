@@ -698,7 +698,7 @@ fn enum_value(e: &mut Encoder, number: i32, names: &[(&str, i32)]) {
 
 const CODES: &[(&str, i32)] = &[("UNKNOWN", 0), ("OK", 1), ("OVER_LIMIT", 2)];
 /// The response's units (`RateLimitResponse.RateLimit.Unit`), which also have `WEEK`.
-const RESPONSE_UNITS: &[(&str, i32)] = &[
+pub(crate) const RESPONSE_UNITS: &[(&str, i32)] = &[
     ("UNKNOWN", 0),
     ("SECOND", 1),
     ("MINUTE", 2),

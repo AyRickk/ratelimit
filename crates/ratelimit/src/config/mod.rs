@@ -292,17 +292,13 @@ impl RateLimitConfig {
     pub fn dump(&self) -> String {
         fn dump(descriptor: &Descriptor, out: &mut String) {
             if let Some(limit) = &descriptor.limit {
-                let unit = match limit.limit.unit {
-                    0 => "UNKNOWN".to_string(),
-                    1 => "SECOND".into(),
-                    2 => "MINUTE".into(),
-                    3 => "HOUR".into(),
-                    4 => "DAY".into(),
-                    5 => "MONTH".into(),
-                    6 => "YEAR".into(),
-                    7 => "WEEK".into(),
-                    n => n.to_string(),
-                };
+                let unit = crate::protojson::RESPONSE_UNITS
+                    .iter()
+                    .find(|(_, n)| *n == limit.limit.unit)
+                    .map_or_else(
+                        || limit.limit.unit.to_string(),
+                        |(name, _)| name.to_string(),
+                    );
                 out.push_str(&format!(
                     "{}: unit={unit} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
                     limit.full_key,

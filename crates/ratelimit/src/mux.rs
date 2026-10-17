@@ -3,22 +3,21 @@
 //! supported; CONNECT requests are routed like the others.
 
 /// A pattern: its unescaped segments, and whether it is a subtree (`/a/` is `/a/{...}`).
-#[derive(Debug, Clone)]
 struct Pattern {
     segments: Vec<String>,
     subtree: bool,
 }
 
 /// What a request goes to.
-#[derive(Debug, PartialEq)]
 pub enum Route<'a, H> {
     Handler(&'a H),
+    /// `*` as the target (but `OPTIONS *`, which the server answers): an empty 400.
+    BadRequest,
     /// A 307 redirect to this location.
     Redirect(String),
     NotFound,
 }
 
-#[derive(Debug, Clone)]
 pub struct ServeMux<H> {
     patterns: Vec<(Pattern, H)>,
 }
@@ -79,15 +78,22 @@ impl<H> ServeMux<H> {
         }
     }
 
-    /// `findHandler`, for `escaped_path` (`URL.EscapedPath`) and the raw query: a path
-    /// missing its subtree's trailing slash, then an unclean path, is redirected to the clean
-    /// path, still escaped (`urlFromEscaped`).
-    pub fn route(&self, escaped_path: &str, query: Option<&str>) -> Route<'_, H> {
+    /// `ServeHTTP` and `findHandler`, for `escaped_path` (`URL.EscapedPath`) and the raw
+    /// query: a path missing its subtree's trailing slash, then an unclean path (but for
+    /// CONNECT, which is not cleaned), is redirected to the clean path, still escaped
+    /// (`urlFromEscaped`).
+    pub fn route(&self, escaped_path: &str, query: Option<&str>, connect: bool) -> Route<'_, H> {
+        if escaped_path == "*" {
+            return Route::BadRequest;
+        }
         let with_query = |location: String| match query {
             Some(query) if !query.is_empty() => format!("{location}?{query}"),
             _ => location,
         };
-        let path = clean_path(escaped_path);
+        let path = match connect {
+            true => escaped_path.to_string(),
+            false => clean_path(escaped_path),
+        };
         let found = self.find(&path);
         if !Self::exact(found, &path) && !path.ends_with('/') && !path.is_empty() {
             let slashed = format!("{path}/");

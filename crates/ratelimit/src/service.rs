@@ -171,7 +171,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
             !request.descriptors.is_empty(),
             "rate limit descriptor list must not be empty",
         )?;
-        let config = self.config.read().unwrap().clone();
+        let config = self.current_config();
         let config = config
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
         let checks = descriptor_checks(&config, request, &self.stats);
