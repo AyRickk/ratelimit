@@ -110,10 +110,6 @@ pub struct RateLimitConfig {
 
 /// Loads and validates config files, failing on the first invalid one.
 pub fn load(files: &[ConfigFile], options: &LoadOptions) -> Result<RateLimitConfig, ConfigError> {
-    let mut config = RateLimitConfig {
-        domains: HashMap::new(),
-        sanitize_dots: options.sanitize_descriptor_metric_dots,
-    };
     // Like upstream, every file is parsed and key-validated before any domain is loaded.
     let roots = files
         .iter()
@@ -121,21 +117,55 @@ pub fn load(files: &[ConfigFile], options: &LoadOptions) -> Result<RateLimitConf
             schema::parse_config(&file.content).map_err(|e| ConfigError::new(&file.name, e))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (file, root) in files.iter().zip(roots) {
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    load_roots(&names, roots, options)
+}
+
+/// [`load`] for files read from disk (name, bytes): each is decoded as yaml.v2 reads its
+/// input (UTF-8, or UTF-16 with a byte order mark), then parsed, in order; the first failure
+/// is the error.
+pub fn load_bytes(
+    files: &[(String, Vec<u8>)],
+    options: &LoadOptions,
+) -> Result<RateLimitConfig, ConfigError> {
+    let roots = files
+        .iter()
+        .map(|(name, bytes)| {
+            let loading = |e: String| ConfigError::new(name, e);
+            let content = yaml::decode(bytes)
+                .map_err(|e| loading(format!("error loading config file: {e}")))?;
+            schema::parse_config(&content).map_err(loading)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    load_roots(&names, roots, options)
+}
+
+/// The domains of parsed files, in order.
+fn load_roots(
+    names: &[&str],
+    roots: Vec<schema::YamlRoot>,
+    options: &LoadOptions,
+) -> Result<RateLimitConfig, ConfigError> {
+    let mut config = RateLimitConfig {
+        domains: HashMap::new(),
+        sanitize_dots: options.sanitize_descriptor_metric_dots,
+    };
+    for (name, root) in names.iter().zip(roots) {
         if root.domain.is_empty() {
             return Err(ConfigError::new(
-                &file.name,
+                name,
                 "config file cannot have empty domain",
             ));
         }
         if config.domains.contains_key(&root.domain) && !options.merge_domain_configs {
             return Err(ConfigError::new(
-                &file.name,
+                name,
                 format!("duplicate domain '{}' in config file", root.domain),
             ));
         }
         let domain = config.domains.entry(root.domain.clone()).or_default();
-        domain.load_descriptors(&file.name, &format!("{}.", root.domain), &root.descriptors)?;
+        domain.load_descriptors(name, &format!("{}.", root.domain), &root.descriptors)?;
     }
     Ok(config)
 }

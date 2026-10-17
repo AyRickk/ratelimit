@@ -23,6 +23,9 @@ tonic.workspace = true
 xxhash-rust.workspace = true
 yaml-rust2.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

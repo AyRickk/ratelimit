@@ -29,6 +29,13 @@
 //
 // GET /stats and POST /flush answer once the sink's exporter has handled every event.
 //
+// With -runtime-snapshot, the oracle only builds goruntime's loader as upstream's file provider
+// does from the RUNTIME_* variables, then prints its first snapshot ({"snapshot": {key:
+// base64}, "counters": {name: value}}) or its error ({"error": "..."}), and exits.
+//
+// With -file-provider, the service gets its config from upstream's file provider (RUNTIME_*
+// variables) instead of PUT /config.
+//
 // With -settings, the oracle only prints upstream's settings.NewSettings() for its environment
 // as JSON ({"settings": {VARIABLE: value}, "sink": failure}, durations in nanoseconds, floats
 // as strconv.FormatFloat(v, 'g', -1, 64) text, and how creating the stats sink fails, if it
@@ -37,6 +44,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -46,6 +54,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -71,6 +80,7 @@ import (
 	"github.com/envoyproxy/ratelimit/src/stats"
 	"github.com/envoyproxy/ratelimit/src/stats/prom"
 	"github.com/envoyproxy/ratelimit/src/utils"
+	"github.com/lyft/goruntime/loader"
 	"github.com/prometheus/client_golang/prometheus"
 	exporterclock "github.com/prometheus/statsd_exporter/pkg/clock"
 )
@@ -252,6 +262,46 @@ func mapNames(m *mapper.MetricMapper, body string) []mapResult {
 	return results
 }
 
+// printRuntimeSnapshot prints the first snapshot of the loader upstream's file provider builds
+// (FileProvider.setupRuntime), with the counters it leaves, or its error.
+func printRuntimeSnapshot() {
+	encoder := json.NewEncoder(os.Stdout)
+	defer func() {
+		if r := recover(); r != nil {
+			_ = encoder.Encode(map[string]string{"error": fmt.Sprint(r)})
+		}
+	}()
+	s := settings.NewSettings()
+	sink := &countingSink{counters: map[string]uint64{}}
+	store := gostats.NewStore(sink, false)
+	stats.NewStatManager(store, s)
+	opts := []loader.Option{loader.AllowDotFiles}
+	if s.RuntimeIgnoreDotFiles {
+		opts = []loader.Option{loader.IgnoreDotFiles}
+	}
+	var runtime loader.IFace
+	var err error
+	if s.RuntimeWatchRoot {
+		runtime, err = loader.New2(s.RuntimePath, s.RuntimeSubdirectory,
+			store.ScopeWithTags("runtime", s.ExtraTags),
+			&loader.SymlinkRefresher{RuntimePath: s.RuntimePath}, opts...)
+	} else {
+		refresher := &loader.DirectoryRefresher{}
+		refresher.WatchFileSystemOps(loader.Remove, loader.Write, loader.Create, loader.Chmod)
+		runtime, err = loader.New2(filepath.Join(s.RuntimePath, s.RuntimeSubdirectory),
+			s.RuntimeAppDirectory, store.ScopeWithTags("runtime", s.ExtraTags), refresher, opts...)
+	}
+	if err != nil {
+		panic(err)
+	}
+	snapshot := map[string]string{}
+	for _, key := range runtime.Snapshot().Keys() {
+		snapshot[key] = base64.StdEncoding.EncodeToString([]byte(runtime.Snapshot().Get(key)))
+	}
+	store.Flush()
+	_ = encoder.Encode(map[string]any{"snapshot": snapshot, "counters": sink.counters})
+}
+
 // printSettings prints settings.NewSettings() as JSON, or its panic.
 func printSettings() {
 	encoder := json.NewEncoder(os.Stdout)
@@ -333,9 +383,15 @@ func main() {
 	prometheusMapper := flag.String("prometheus-mapper", "", "PROMETHEUS_MAPPER_YAML")
 	prometheusMs := flag.Bool("prometheus-ms", false, "PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS")
 	printSettingsOnly := flag.Bool("settings", false, "print settings.NewSettings() as JSON and exit")
+	printSnapshotOnly := flag.Bool("runtime-snapshot", false, "print the runtime loader's first snapshot as JSON and exit")
+	useFileProvider := flag.Bool("file-provider", false, "load the config with upstream's file provider")
 	flag.Parse()
 	if *printSettingsOnly {
 		printSettings()
+		return
+	}
+	if *printSnapshotOnly {
+		printRuntimeSnapshot()
 		return
 	}
 
@@ -400,7 +456,11 @@ func main() {
 	events := &configEvents{events: make(chan provider.ConfigUpdateEvent)}
 	health := server.NewHealthChecker(health.NewServer(), "ratelimit", false)
 	// forceStart: serve before any config is loaded, like FORCE_START_WITHOUT_INITIAL_CONFIG.
-	svc := ratelimit.NewService(cache, events, statsManager, health, clk, false, true, false)
+	var configProvider provider.RateLimitConfigProvider = events
+	if *useFileProvider {
+		configProvider = provider.NewFileProvider(settings.NewSettings(), statsManager, store)
+	}
+	svc := ratelimit.NewService(cache, configProvider, statsManager, health, clk, false, true, false)
 
 	grpcListener, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
@@ -505,7 +565,7 @@ func main() {
 		defer sink.mu.Unlock()
 		names := make([]string, 0, len(sink.counters))
 		for name := range sink.counters {
-			if strings.HasPrefix(name, "ratelimit.service.") || name == "reserved_tag" {
+			if strings.HasPrefix(name, "ratelimit.service.") || strings.HasPrefix(name, "runtime.") || name == "reserved_tag" {
 				names = append(names, name)
 			}
 		}

@@ -52,6 +52,14 @@ pub struct Stats {
     counters: Mutex<HashMap<String, Counter>>,
     /// `EXTRA_TAGS`, serialized as gostats appends them to every name.
     tags: String,
+    /// How many `EXTRA_TAGS` keys are reserved words.
+    reserved_tags: u64,
+}
+
+/// A scope tagged with `EXTRA_TAGS` (`ScopeWithTags`).
+#[derive(Debug, Clone)]
+pub struct Scope {
+    name: String,
 }
 
 const SERVICE: &str = "ratelimit.service";
@@ -86,12 +94,36 @@ impl Stats {
                 .collect(),
             ..Default::default()
         };
-        for key in extra_tags.keys() {
-            if RESERVED_TAG_WORDS.contains(&key.as_str()) {
-                stats.counter("reserved_tag").inc();
-            }
-        }
+        let reserved_tags = extra_tags
+            .keys()
+            .filter(|key| RESERVED_TAG_WORDS.contains(&key.as_str()))
+            .count() as u64;
+        let stats = Self {
+            reserved_tags,
+            ..stats
+        };
+        stats.count_reserved_tags();
         stats
+    }
+
+    /// gostats checks the tags of each scope it creates: every reserved key counts again.
+    fn count_reserved_tags(&self) {
+        if self.reserved_tags > 0 {
+            self.counter("reserved_tag").add(self.reserved_tags);
+        }
+    }
+
+    /// `ScopeWithTags(name, EXTRA_TAGS)`: a scope whose counters carry the tags.
+    pub fn scope_with_tags(&self, name: &str) -> Scope {
+        self.count_reserved_tags();
+        Scope {
+            name: name.to_string(),
+        }
+    }
+
+    /// The counter `name` of `scope`, with the tags.
+    pub fn scope_counter(&self, scope: &Scope, name: &str) -> Counter {
+        self.counter(&format!("{}.{name}{}", scope.name, self.tags))
     }
 
     /// The counter named `name`, created at 0 the first time.
