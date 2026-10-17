@@ -206,10 +206,12 @@ impl Walk {
     }
 }
 
-/// goruntime's `loaderStats` (`num_values` is a gauge, not kept yet).
+/// goruntime's `loaderStats`.
 struct LoaderStats {
     load_attempts: Counter,
     load_failures: Counter,
+    /// The entries of the last snapshot.
+    num_values: crate::stats::Gauge,
 }
 
 /// What `Loader`'s callbacks and the watcher thread share.
@@ -245,6 +247,7 @@ impl Loader {
         let loader_stats = LoaderStats {
             load_attempts: stats.scope_counter(scope, "load_attempts"),
             load_failures: stats.scope_counter(scope, "load_failures"),
+            num_values: stats.scope_gauge(scope, "num_values"),
         };
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Snapshot::default()),
@@ -258,6 +261,7 @@ impl Loader {
                     load_snapshot(&runtime_path, &subdirectory, ignore_dotfiles);
                 loader_stats.load_failures.add(failures);
                 loader_stats.load_attempts.inc();
+                loader_stats.num_values.set(snapshot.entries.len() as u64);
                 *shared.snapshot.lock().unwrap() = snapshot;
                 for callback in shared.callbacks.lock().unwrap().iter() {
                     let _ = callback.try_send(());

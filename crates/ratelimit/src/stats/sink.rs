@@ -30,6 +30,16 @@ impl Sink {
         }
     }
 
+    pub fn flush_gauge(&self, name: &str, value: u64) {
+        match self {
+            Sink::Null => {}
+            Sink::Logging(sink) => sink.flush_gauge(name, value),
+            Sink::Statsd(sink) => sink.flush_gauge(name, value),
+            Sink::Dogstatsd(sink) => sink.flush_gauge(name, value),
+            Sink::Prometheus(sink) => sink.flush_gauge(name, value),
+        }
+    }
+
     pub fn flush_timer(&self, name: &str, value: f64) {
         match self {
             Sink::Null => {}

@@ -336,6 +336,11 @@ impl DogStatsdSink {
         self.write_line(line.as_bytes());
     }
 
+    /// `Gauge(name, float64(value))`: the value as a float, in its shortest form.
+    pub fn flush_gauge(&self, name: &str, value: u64) {
+        self.write_metric(name, &format!("{}|g", value as f64));
+    }
+
     /// `Timing(name, time.Duration(milliseconds) * time.Millisecond)`: whole milliseconds, with
     /// six decimals.
     pub fn flush_timer(&self, name: &str, milliseconds: f64) {

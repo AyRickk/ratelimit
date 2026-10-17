@@ -94,6 +94,10 @@ impl StatsdSink {
         self.write_line(format!("{name}:{value}|c\n").as_bytes());
     }
 
+    pub fn flush_gauge(&self, name: &str, value: u64) {
+        self.write_line(format!("{name}:{value}|g\n").as_bytes());
+    }
+
     /// A whole value as an integer, any other with six decimals.
     pub fn flush_timer(&self, name: &str, value: f64) {
         let line = match (0.0..u64::MAX as f64).contains(&value) && value.trunc() == value {

@@ -318,3 +318,16 @@ async fn timers_are_whole_milliseconds() {
         "t:2.000000|ms|#env:prod,k:v|c:abc\nu:0.000000|ms|#env:prod|c:abc\n"
     );
 }
+
+/// A gauge is `Gauge(name, float64(value))`: the float's shortest form, never an exponent.
+#[tokio::test]
+async fn gauges_are_floats() {
+    let (socket, port) = server().await;
+    let sink = DogStatsdSink::new("127.0.0.1", port, DogStatsdSettings::default()).unwrap();
+    sink.flush_gauge("small.__k=v", 3);
+    sink.flush_gauge("big", u64::MAX);
+    assert_eq!(
+        datagrams(&socket).await.concat(),
+        "small:3|g|#k:v\nbig:18446744073709552000|g\n"
+    );
+}

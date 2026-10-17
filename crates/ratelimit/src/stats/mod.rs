@@ -1,7 +1,8 @@
-//! Counters, named as envoyproxy/ratelimit names them (`src/stats/manager_impl.go`): one per
-//! name, kept for the life of the process like gostats' store, so a counter recreated by a
-//! config reload or a request keeps its value. Flushing sends each counter's increase since
-//! the previous flush to a [`Sink`]; a timer's values go to it at once, as gostats' do.
+//! Counters and gauges, named as envoyproxy/ratelimit names them (`src/stats/manager_impl.go`):
+//! one per name, kept for the life of the process like gostats' store, so a stat recreated by
+//! a config reload or a request keeps its value. Flushing runs the stat generators, then sends
+//! each counter's increase since the previous flush and every gauge's value to a [`Sink`]; a
+//! timer's values go to it at once, as gostats' do.
 
 mod dogstatsd;
 mod logging;
@@ -46,6 +47,31 @@ impl Counter {
     }
 }
 
+/// A gauge (gostats' `gauge`): a `uint64` set, or moved up and down with wrapping.
+#[derive(Debug, Clone, Default)]
+pub struct Gauge(Arc<AtomicU64>);
+
+impl Gauge {
+    pub fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn sub(&self, n: u64) {
+        self.0.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    pub fn value(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// What a stat generator does before each flush (gostats' `StatGenerator`).
+type Generator = Box<dyn Fn() + Send + Sync>;
+
 /// The sink the store flushes to, once flushing starts.
 #[derive(Clone, Default)]
 struct SinkCell(Arc<OnceLock<Arc<Sink>>>);
@@ -73,9 +99,11 @@ impl Timer {
 }
 
 /// The counters of the service (`ratelimit.service.*`).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Stats {
     counters: Mutex<HashMap<String, Counter>>,
+    gauges: Mutex<HashMap<String, Gauge>>,
+    generators: Mutex<Vec<Generator>>,
     sink: SinkCell,
     /// `EXTRA_TAGS`, serialized as gostats appends them to every name.
     tags: String,
@@ -87,6 +115,16 @@ pub struct Stats {
 #[derive(Debug, Clone)]
 pub struct Scope {
     name: String,
+}
+
+impl Scope {
+    /// `Scope(name)`: a scope within this one; its stats carry the store's tags, which are not
+    /// counted again in `reserved_tag`.
+    pub fn scope(&self, name: &str) -> Scope {
+        Scope {
+            name: format!("{}.{name}", self.name),
+        }
+    }
 }
 
 const SERVICE: &str = "ratelimit.service";
@@ -107,6 +145,12 @@ const RESERVED_TAG_WORDS: &[&str] = &[
     "facet",
     "envoyservice",
 ];
+
+impl std::fmt::Debug for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stats").finish_non_exhaustive()
+    }
+}
 
 impl Stats {
     /// The service's counters, tagged with `EXTRA_TAGS` (`ScopeWithTags`): each reserved key
@@ -140,11 +184,6 @@ impl Stats {
         }
     }
 
-    /// `ScopeWithTags` for a scope that has no stats here yet: only its tags count.
-    pub fn count_tagged_scope(&self) {
-        self.count_reserved_tags();
-    }
-
     /// `ScopeWithTags(name, EXTRA_TAGS)`: a scope whose counters carry the tags.
     pub fn scope_with_tags(&self, name: &str) -> Scope {
         self.count_reserved_tags();
@@ -156,6 +195,18 @@ impl Stats {
     /// The counter `name` of `scope`, with the tags.
     pub fn scope_counter(&self, scope: &Scope, name: &str) -> Counter {
         self.counter(&format!("{}.{name}{}", scope.name, self.tags))
+    }
+
+    /// The gauge `name` of `scope`, with the tags, created at 0 the first time.
+    pub fn scope_gauge(&self, scope: &Scope, name: &str) -> Gauge {
+        let name = format!("{}.{name}{}", scope.name, self.tags);
+        self.gauges.lock().unwrap().entry(name).or_default().clone()
+    }
+
+    /// `AddStatGenerator`: `generate` runs before each flush, the generators locked: it must
+    /// not call back into the store.
+    pub fn add_generator(&self, generate: impl Fn() + Send + Sync + 'static) {
+        self.generators.lock().unwrap().push(Box::new(generate));
     }
 
     /// The timer `name` of `scope`, with the tags.
@@ -181,8 +232,12 @@ impl Stats {
         self.counter(&format!("{SERVICE}.{name}{}", self.tags))
     }
 
-    /// Sends every counter's increase since the previous flush, when not 0, then flushes `sink`.
+    /// Runs the generators, sends every counter's increase since the previous flush (when not
+    /// 0) and every gauge's value, then flushes `sink`.
     pub async fn flush(&self, sink: &Sink) {
+        for generate in self.generators.lock().unwrap().iter() {
+            generate();
+        }
         let counters: Vec<(String, Counter)> = self
             .counters
             .lock()
@@ -196,7 +251,26 @@ impl Stats {
                 sink.flush_counter(&name, value);
             }
         }
+        let gauges: Vec<(String, Gauge)> = self
+            .gauges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, gauge)| (name.clone(), gauge.clone()))
+            .collect();
+        for (name, gauge) in gauges {
+            sink.flush_gauge(&name, gauge.value());
+        }
         sink.flush().await;
+    }
+
+    /// Every gauge, by name, with its value.
+    pub fn gauges(&self) -> BTreeMap<String, u64> {
+        let gauges = self.gauges.lock().unwrap();
+        gauges
+            .iter()
+            .map(|(name, g)| (name.clone(), g.value()))
+            .collect()
     }
 
     /// Every counter above 0, by name: what gostats would have flushed so far.

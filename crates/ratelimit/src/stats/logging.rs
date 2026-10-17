@@ -27,6 +27,10 @@ impl LoggingSink {
         self.log(Some(name), "counter", value as f64);
     }
 
+    pub fn flush_gauge(&self, name: &str, value: u64) {
+        self.log(Some(name), "gauge", value as f64);
+    }
+
     pub fn flush_timer(&self, name: &str, value: f64) {
         self.log(Some(name), "timer", value);
     }

@@ -58,7 +58,7 @@ pub struct RedisCache {
     pool: Pool,
     clock: Arc<dyn Clock>,
     stats: Arc<Stats>,
-    local_cache: Option<LocalCache>,
+    local_cache: Option<Arc<LocalCache>>,
     settings: RedisCacheSettings,
 }
 
@@ -70,7 +70,18 @@ impl RedisCache {
         settings: RedisCacheSettings,
     ) -> Self {
         let local_cache = (settings.local_cache_size_in_bytes > 0)
-            .then(|| LocalCache::new(settings.local_cache_size_in_bytes));
+            .then(|| Arc::new(LocalCache::new(settings.local_cache_size_in_bytes)));
+        Self::with_local_cache(pool, clock, stats, settings, local_cache)
+    }
+
+    /// The cache using `local_cache` (made by the runner, whose stats read it).
+    pub fn with_local_cache(
+        pool: Pool,
+        clock: Arc<dyn Clock>,
+        stats: Arc<Stats>,
+        settings: RedisCacheSettings,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Self {
         Self {
             pool,
             clock,
