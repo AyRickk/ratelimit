@@ -97,7 +97,10 @@ impl RedisConnection {
             "tcp6" => std::net::IpAddr::is_ipv6,
             _ => return Err(format!("dial {network}: unknown network {network}")),
         };
-        let dial_error = |e: String| format!("dial {network}: {e}");
+        // An unparseable redis:// URL is dialled as it is: keep its credentials out of errors.
+        let masked = mask_credentials_in_url(&self.address);
+        let dial_error =
+            |e: String| format!("dial {network}: {}", e.replace(&self.address, &masked));
         let (host, port) = crate::go::split_host_port(&self.address).map_err(dial_error)?;
         let port: u16 = port
             .parse()
@@ -107,12 +110,10 @@ impl RedisConnection {
             .map_err(|e| dial_error(e.to_string()))?
             .map(|a| a.ip())
             .collect();
-        let ip = addresses.iter().find(|ip| family(ip)).ok_or_else(|| {
-            dial_error(format!(
-                "address {}: no suitable address found",
-                self.address
-            ))
-        })?;
+        let ip = addresses
+            .iter()
+            .find(|ip| family(ip))
+            .ok_or_else(|| dial_error(format!("address {masked}: no suitable address found")))?;
         Ok(ServerConfig::Centralized {
             server: Server::new(ip.to_string(), port),
         })
@@ -379,11 +380,14 @@ pub fn mask_credentials_in_url(url: &str) -> String {
             };
             let query: Vec<String> = query
                 .split('&')
-                .map(|pair| match pair.split_once('=') {
-                    Some((key, _)) if matches!(key, "password" | "username") => {
-                        format!("{key}=*****")
+                .map(|pair| {
+                    let (key, _) = pair.split_once('=').unwrap_or((pair, ""));
+                    // Compared as the parser reads keys (decoded).
+                    let decoded = crate::go::unescape(key, true).unwrap_or_default();
+                    match matches!(decoded.as_str(), "password" | "username") {
+                        true => format!("{key}=*****"),
+                        false => pair.to_string(),
                     }
-                    _ => pair.to_string(),
                 })
                 .collect();
             format!("{base}?{}", query.join("&"))

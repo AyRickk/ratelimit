@@ -83,6 +83,10 @@ fn credentials_are_masked_in_each_url() {
         mask_credentials_in_url("redis://h:1?username=u&password=p&db=2"),
         "redis://h:1?username=*****&password=*****&db=2"
     );
+    assert_eq!(
+        mask_credentials_in_url("redis://h:1?pass%77ord=p&db=2"),
+        "redis://h:1?pass%77ord=*****&db=2"
+    );
 }
 
 /// radix's pool size defaults to 4; upstream refuses CREATE and ERROR, and unknown types.
