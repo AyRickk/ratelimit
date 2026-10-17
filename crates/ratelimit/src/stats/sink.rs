@@ -120,29 +120,45 @@ pub fn select_sink(settings: &SinkSettings) -> Result<Sink, String> {
         settings.use_prometheus,
     ];
     if settings.disable_stats {
+        crate::log::info("Stats disabled");
         return Ok(Sink::Null);
     }
     if enabled.iter().filter(|on| **on).count() > 1 {
         return Err(SEVERAL_SINKS.into());
     }
     if settings.use_dog_statsd {
-        return DogStatsdSink::new(
+        let sink = DogStatsdSink::new(
             &settings.statsd_host,
             settings.statsd_port,
             settings.dogstatsd.clone(),
         )
-        .map(Sink::Dogstatsd)
-        .map_err(|e| format!("Failed to create dogstatsd sink: {e}"));
+        .map_err(|e| format!("{DOGSTATSD_FAILED}{e}"))?;
+        crate::log::info("Stats initialized for dogstatsd");
+        return Ok(Sink::Dogstatsd(sink));
     }
     if settings.use_prometheus {
+        crate::log::info("Stats initialized for Prometheus");
         return PrometheusSink::start(&settings.prometheus).map(Sink::Prometheus);
     }
     if settings.use_statsd {
+        crate::log::info("Stats initialized for statsd");
         return Ok(Sink::Statsd(StatsdSink::new(
             &settings.statsd_host,
             settings.statsd_port,
             settings.statsd_protocol,
         )));
     }
+    crate::log::info("Stats initialized for stdout");
     Ok(Sink::Logging(LoggingSink::stderr()))
+}
+
+const DOGSTATSD_FAILED: &str = "Failed to create dogstatsd sink: ";
+
+/// How a `select_sink` error stops the process: the runner's own checks are `logger.Fatal`,
+/// the sinks' failures panics.
+pub fn sink_failure(message: String) -> crate::log::Failure {
+    match message == SEVERAL_SINKS || message.starts_with(DOGSTATSD_FAILED) {
+        true => crate::log::Failure::Fatal(message),
+        false => crate::log::Failure::Panic(message),
+    }
 }

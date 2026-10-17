@@ -89,7 +89,8 @@ fn credentials_are_masked_in_each_url() {
     );
 }
 
-/// radix's pool size defaults to 4; upstream refuses CREATE and ERROR, and unknown types.
+/// radix's pool size defaults to 4; a negative size is refused. The pool behaviour and the
+/// Redis type are checked when connecting, after upstream's first log line.
 #[test]
 fn pool_settings_like_upstream() {
     assert_eq!(
@@ -97,18 +98,10 @@ fn pool_settings_like_upstream() {
         4
     );
     assert!(connection(&[("REDIS_POOL_SIZE", "-1")]).is_err());
-    let error = connection(&[("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error")]).unwrap_err();
-    assert!(
-        error.starts_with("REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported"),
-        "{error}"
-    );
-    assert!(connection(&[("REDIS_POOL_ON_EMPTY_BEHAVIOR", "anything")]).is_ok());
-    assert!(connection(&[("REDIS_TYPE", "Single")]).is_ok());
-    assert_eq!(
-        connection(&[("REDIS_TYPE", "FOO")]).unwrap_err(),
-        "Unrecognized redis type FOO"
-    );
+    assert!(connection(&[("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error")]).is_ok());
+    assert!(connection(&[("REDIS_TYPE", "FOO")]).is_ok());
 }
+
 /// jpillora/backoff: between `min` and `min × 2^attempt`, never beyond `[min, max]`.
 #[test]
 fn startup_retries_back_off_like_upstream() {

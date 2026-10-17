@@ -14,7 +14,7 @@ mod statsd;
 pub use dogstatsd::{DogStatsdSettings, DogStatsdSink, Mogrifier};
 pub use logging::LoggingSink;
 pub use prometheus::{PrometheusSettings, PrometheusSink};
-pub use sink::{Sink, SinkSettings, StatsdProtocol, select_sink};
+pub use sink::{Sink, SinkSettings, StatsdProtocol, select_sink, sink_failure};
 pub use statsd::StatsdSink;
 
 use std::collections::{BTreeMap, HashMap};

@@ -4105,6 +4105,7 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("RUNTIME_WATCH_ROOT", "false".into()), ("RUNTIME_APPDIRECTORY", "missing".into())], format!("unable to watch file ({}/ratelimit/missing)", runtime.join("current").display())),
         (vec![("BACKEND_TYPE", "bogus".into())], "Invalid setting for BackendType: bogus".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
+        (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
         // Redis refuses the database: its error ends the message.
         (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
@@ -4145,6 +4146,12 @@ async fn the_binary_fails_to_start_like_upstream() {
             ours.contains(&message),
             "ours with {environment:?}:\n{ours}"
         );
+        // A `logger.Fatal` upstream: the same logrus lines.
+        let fatal = upstream.contains("level=fatal");
+        if fatal {
+            let lines = |stderr: &str| logrus_lines(&stderr.replace("\n", "\\n"), &[]);
+            assert_eq!(lines(&ours), lines(&upstream), "{environment:?}");
+        }
     }
     drop(busy);
 }
@@ -6312,4 +6319,289 @@ async fn gauges_are_flushed_while_redis_is_unreachable_like_upstream() {
         .iter()
         .filter(|(k, _)| *k != "runtime.num_values|g");
     assert!(zeros.clone().all(|(_, v)| *v == 0), "{:?}", values[0]);
+}
+
+/// Runs `binary` with `environment` until it serves gRPC, sends it one request, stops it
+/// with SIGTERM, and returns what it wrote to stderr.
+async fn logged_run(
+    binary: &std::path::Path,
+    environment: &[(&str, String)],
+    grpc: &str,
+) -> String {
+    let child = Command::new(binary)
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the service");
+    let mut client = None;
+    for _ in 0..300 {
+        if let Ok(c) = RateLimitServiceClient::connect(grpc.to_string()).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut client = client.expect("the service serves");
+    client
+        .should_rate_limit(request("llm", &[&[("user", "a")]]))
+        .await
+        .unwrap();
+    drop(client);
+    let pid = child.id().unwrap().to_string();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("the service stops")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The logrus lines of `stderr` (gostats' own JSON lines left out), sorted, with the time and
+/// what differs between the two runs (`replace`) masked.
+fn logrus_lines(stderr: &str, replace: &[(String, &str)]) -> Vec<String> {
+    let time = regex::Regex::new(r#"(time="|"@timestamp":")[^"]+""#).unwrap();
+    let mut lines: Vec<String> = stderr
+        .lines()
+        .filter(|l| !l.contains("gostats.loggingsink"))
+        .map(|l| {
+            let mut l = time.replace(l, "${1}TIME\"").into_owned();
+            for (from, to) in replace {
+                l = l.replace(from.as_str(), to);
+            }
+            l
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Upstream's log lines, in its text and JSON formats, at the info level: the sink, tracing,
+/// the runtime directory's unreadable entries, Redis, the config, the listeners, and the
+/// shutdown on SIGTERM; and the time's shape in the local time zone.
+#[tokio::test]
+async fn logs_are_written_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("logs");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v1/ratelimit/dangling", b"->missing"),
+            ("v1/ratelimit/linked", b"->config"),
+            ("current", b"->v1"),
+        ],
+    );
+    let time_shape = |stderr: &str, key: &str| -> Vec<String> {
+        let digits = regex::Regex::new(r"\d").unwrap();
+        let time = regex::Regex::new(&format!(r#"{key}"([^"]+)""#)).unwrap();
+        // The fraction's trailing zeros are trimmed: its length varies.
+        let fraction = regex::Regex::new(r"\.N+").unwrap();
+        let mut shapes: Vec<String> = time
+            .captures_iter(stderr)
+            .map(|c| digits.replace_all(&c[1], "N").into_owned())
+            .map(|shape| fraction.replace(&shape, ".F").into_owned())
+            .collect();
+        shapes.sort();
+        shapes.dedup();
+        shapes
+    };
+    for (format, tz, time_key, offset) in [
+        ("text", None, "time=", None),
+        (
+            "json",
+            Some("Asia/Kolkata"),
+            "\"@timestamp\":",
+            Some("+05:30\""),
+        ),
+        ("text", Some(""), "time=", Some("Z\"")),
+    ] {
+        let redis = [Redis::start().await, Redis::start().await];
+        let mut runs = Vec::new();
+        for (binary, redis) in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ]
+        .iter()
+        .zip(&redis)
+        {
+            let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+            let mut environment = binary_environment(&runtime, redis);
+            environment.retain(|(k, _)| *k != "LOG_LEVEL");
+            environment.extend([
+                ("LOG_LEVEL", "info".to_string()),
+                ("LOG_FORMAT", format.into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", debug.to_string()),
+            ]);
+            if let Some(tz) = tz {
+                environment.push(("TZ", tz.into()));
+            }
+            let stderr =
+                logged_run(binary, &environment, &format!("http://127.0.0.1:{grpc}")).await;
+            if let Some(offset) = offset {
+                assert!(stderr.contains(offset), "{offset} in {stderr}");
+            }
+            let replace = [
+                (runtime.display().to_string(), "RUNTIME"),
+                (redis.address.clone(), "REDIS"),
+                (grpc.to_string(), "GRPC"),
+                (http.to_string(), "HTTP"),
+                (debug.to_string(), "DEBUG"),
+            ];
+            runs.push((
+                logrus_lines(&stderr, &replace),
+                time_shape(&stderr, time_key),
+            ));
+        }
+        assert!(runs[0].0.len() > 5, "{:?}", runs[0].0);
+        assert_eq!(runs[1].0, runs[0].0, "{format} {tz:?}");
+        assert_eq!(runs[1].1, runs[0].1, "{format} {tz:?}");
+    }
+}
+
+/// Upstream's Redis startup lines: the pool, the authentication, each retry (its wait and
+/// elapsed time masked: they are random), then the fatal line once it gives up.
+#[tokio::test]
+async fn redis_startup_is_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("redis-logs");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let unreachable = format!("127.0.0.1:{}", reserved_port());
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let after = regex::Regex::new(r"after [^:]+:").unwrap();
+    for (auth, behavior) in [("user:secret", "wait"), ("secret", "other")] {
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", unreachable.clone()),
+            ("REDIS_AUTH", auth.into()),
+            ("REDIS_POOL_SIZE", "3".into()),
+            ("REDIS_POOL_ON_EMPTY_BEHAVIOR", behavior.into()),
+            ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
+            ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
+            ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+            ("DISABLE_STATS", "true".into()),
+            ("LOG_LEVEL", "warn".into()),
+        ];
+        let lines = |stderr: &str| {
+            // The logrus lines: upstream's panic (our fatal line, §7) is compared elsewhere.
+            let mut lines: Vec<String> = logrus_lines(stderr, &[])
+                .into_iter()
+                .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+                .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+                .map(|l| after.replace(&l, "after ELAPSED:").into_owned())
+                .collect();
+            lines.dedup();
+            lines
+        };
+        let upstream = lines(&startup_failure(&upstream_binary(), &environment).await);
+        let ours = lines(
+            &startup_failure(
+                std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+                &environment,
+            )
+            .await,
+        );
+        assert!(
+            upstream.iter().any(|l| l.contains("Retrying")),
+            "{upstream:?}"
+        );
+        assert_eq!(ours, upstream, "{auth} {behavior}");
+    }
+}
+
+/// A Redis that answers only after the first dials fail: each failure, each retry, then the
+/// connection restored, as upstream logs them.
+#[tokio::test]
+async fn a_late_redis_is_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("late-redis");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let port = reserved_port();
+        let grpc = reserved_port();
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", format!("127.0.0.1:{port}")),
+            ("REDIS_STARTUP_INITIAL_INTERVAL", "100ms".into()),
+            ("REDIS_STARTUP_MAX_INTERVAL", "200ms".into()),
+            ("DISABLE_STATS", "true".into()),
+            ("LOG_LEVEL", "info".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", reserved_port().to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            Redis::start_on(port).await.expect("Redis started")
+        });
+        let stderr = logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await;
+        let _redis = late.await.unwrap();
+        let mut lines: Vec<String> = logrus_lines(&stderr, &[(port.to_string(), "REDIS")])
+            .into_iter()
+            .filter(|l| l.contains("redis") || l.contains("Redis"))
+            .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+            .collect();
+        lines.dedup();
+        runs.push(lines);
+    }
+    assert!(
+        runs[0].iter().any(|l| l.contains("re-established")),
+        "{:?}",
+        runs[0]
+    );
+    assert_eq!(runs[1], runs[0]);
 }

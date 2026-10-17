@@ -9,6 +9,7 @@ pub mod health;
 pub mod http;
 pub mod limiter;
 pub mod local_cache;
+pub mod log;
 pub mod mux;
 pub mod net;
 pub mod protojson;

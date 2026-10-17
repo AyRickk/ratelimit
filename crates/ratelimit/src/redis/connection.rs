@@ -25,6 +25,12 @@ pub struct RedisConnection {
     pub timeout: Duration,
     /// `REDIS_URL` with its credentials masked, for messages.
     pub masked_url: String,
+    /// `REDIS_AUTH`, `REDIS_POOL_SIZE`, `REDIS_POOL_ON_EMPTY_BEHAVIOR` and `REDIS_TYPE` as
+    /// given, which `newClientImpl` logs and checks when it starts.
+    pub auth: String,
+    pub pool_size_setting: i64,
+    pub pool_on_empty_behavior: String,
+    pub redis_type: String,
 }
 
 impl RedisConnection {
@@ -41,18 +47,6 @@ impl RedisConnection {
                 "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
             ),
         ])?;
-        match s.redis_pool_on_empty_behavior.to_uppercase().as_str() {
-            "CREATE" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4. Pool will block instead of creating overflow connections. Remove this setting or set to WAIT, and consider increasing REDIS_POOL_SIZE.".into()),
-            "ERROR" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
-            _ => {}
-        }
-        match s.redis_type.to_lowercase().as_str() {
-            "single" => {}
-            "cluster" | "sentinel" => {
-                return Err(format!("REDIS_TYPE={} is not supported yet", s.redis_type));
-            }
-            _ => return Err(format!("Unrecognized redis type {}", s.redis_type)),
-        }
         let pool_size = match s.redis_pool_size {
             0 => 4,
             size => usize::try_from(size).map_err(|_| format!("invalid REDIS_POOL_SIZE {size}"))?,
@@ -79,6 +73,10 @@ impl RedisConnection {
             pool_size,
             timeout: crate::settings::duration(s.redis_timeout),
             masked_url: mask_credentials_in_url(&s.redis_url),
+            auth: s.redis_auth.clone(),
+            pool_size_setting: s.redis_pool_size,
+            pool_on_empty_behavior: s.redis_pool_on_empty_behavior.clone(),
+            redis_type: s.redis_type.clone(),
         })
     }
 
@@ -146,8 +144,66 @@ impl RedisConnection {
 
     /// One attempt of upstream's loop: connect (AUTH, then the URL's database as given, which
     /// Redis may refuse), expect `PONG` to `PING`, then the pool.
-    async fn attempt(&self) -> Result<Pool, String> {
-        let server = self.server().await?;
+    async fn attempt(&self) -> Result<Pool, AttemptError> {
+        // Dialled first, so that a failure has Go's text and is told apart (radix traces it).
+        let dial_error = |message| AttemptError {
+            message,
+            dial: true,
+        };
+        let server = self.server().await.map_err(dial_error)?;
+        self.dial(&server).await.map_err(dial_error)?;
+        self.set_up(server).await.map_err(|message| AttemptError {
+            message,
+            dial: false,
+        })
+    }
+
+    /// Go's dial of the server: `dial <network> <address>: connect: <errno>`, or a timeout.
+    async fn dial(&self, server: &ServerConfig) -> Result<(), String> {
+        let network = &self.network;
+        let (address, connected) = match server {
+            ServerConfig::Unix { path } => {
+                let address = path.display().to_string();
+                let connect = tokio::net::UnixStream::connect(path.clone());
+                (
+                    address,
+                    self.within_timeout(async { connect.await.map(drop) }).await,
+                )
+            }
+            ServerConfig::Centralized { server } => {
+                let address = crate::net::join_host_port(&server.host, server.port.into());
+                let connect =
+                    tokio::net::TcpStream::connect((server.host.to_string(), server.port));
+                (
+                    address,
+                    self.within_timeout(async { connect.await.map(drop) }).await,
+                )
+            }
+            _ => return Ok(()),
+        };
+        match connected {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(format!(
+                "dial {network} {address}: connect: {}",
+                crate::go::errno_text(&e)
+            )),
+            None => Err(format!("dial {network} {address}: i/o timeout")),
+        }
+    }
+
+    /// `connect` within the dial timeout (none for 0); `None` once it has passed.
+    async fn within_timeout(
+        &self,
+        connect: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Option<std::io::Result<()>> {
+        match self.timeout.is_zero() {
+            true => Some(connect.await),
+            false => tokio::time::timeout(self.timeout, connect).await.ok(),
+        }
+    }
+
+    /// The probe's checks, then the pool.
+    async fn set_up(&self, server: ServerConfig) -> Result<Pool, String> {
         // The database is selected by hand on the probe, so a value Redis refuses is its error.
         let probe = self
             .builder(server.clone(), false)
@@ -185,41 +241,92 @@ impl RedisConnection {
         }
         let pool = self
             .builder(server, true)
-            .set_policy(ReconnectPolicy::new_constant(0, 100))
+            .set_policy(radix_reconnects())
             .build_pool(self.pool_size)
             .map_err(|e| e.to_string())?;
         pool.init().await.map_err(|e| e.details().to_string())?;
         Ok(pool)
     }
 
-    /// `newClientImpl`'s startup: retries until Redis answers `PING`, waiting as
-    /// `REDIS_STARTUP_*` say, and gives up after `REDIS_STARTUP_MAX_ELAPSED_TIME` (never for
-    /// 0) or when `cancelled` resolves. Then the pool, which reconnects lost connections and
-    /// pings every `5s / size` like radix's.
+    /// `newClientImpl`'s startup, with its log lines: retries until Redis answers `PING`,
+    /// waiting as `REDIS_STARTUP_*` say, and gives up after `REDIS_STARTUP_MAX_ELAPSED_TIME`
+    /// (never for 0) or when `cancelled` resolves. Then the pool, which reconnects lost
+    /// connections and pings every `5s / size` like radix's, and whether a dial failed first.
     pub async fn connect(
         &self,
         startup: &StartupBackoff,
         cancelled: impl std::future::Future<Output = ()>,
-    ) -> Result<Pool, String> {
+    ) -> Result<(Pool, bool), String> {
+        let masked = &self.masked_url;
+        crate::log::warn(&format!(
+            "connecting to redis on {masked} with pool size {}",
+            self.pool_size_setting
+        ));
+        // createDialer.
+        if !self.auth.is_empty() {
+            match self.auth.split_once(':') {
+                Some((user, _)) => crate::log::warn(&format!(
+                    "enabling authentication to redis {masked} with user {user}"
+                )),
+                None => crate::log::warn(&format!(
+                    "enabling authentication to redis {masked} without user"
+                )),
+            }
+        }
+        match self.pool_on_empty_behavior.to_uppercase().as_str() {
+            "WAIT" => crate::log::warn(&format!(
+                "Redis pool {masked}: WAIT is default in radix v4 (blocks until connection available)"
+            )),
+            "CREATE" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4. Pool will block instead of creating overflow connections. Remove this setting or set to WAIT, and consider increasing REDIS_POOL_SIZE.".into()),
+            "ERROR" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
+            _ => crate::log::warn(&format!(
+                "Redis pool {masked}: using v4 default (fixed size={}, blocks when full)",
+                self.pool_size_setting
+            )),
+        }
         let start = std::time::Instant::now();
         let mut attempt = 0;
+        let mut failed_dial = false;
         tokio::pin!(cancelled);
         let pool = loop {
+            match self.redis_type.to_lowercase().as_str() {
+                // Upstream logs REDIS_URL as given, credentials included (docs/parity.md §7).
+                "single" => crate::log::warn(&format!("Creating single with urls {masked}")),
+                "cluster" | "sentinel" => {
+                    return Err(format!(
+                        "REDIS_TYPE={} is not supported yet",
+                        self.redis_type
+                    ));
+                }
+                _ => return Err(format!("Unrecognized redis type {}", self.redis_type)),
+            }
             let error = match self.attempt().await {
                 Ok(pool) => break pool,
-                Err(error) => error,
+                Err(AttemptError { message, dial }) => {
+                    // radix's trace of the failed dial.
+                    if dial {
+                        failed_dial = true;
+                        crate::log::error(&format!("creating redis connection error : {message}"));
+                    }
+                    message
+                }
             };
             let elapsed = start.elapsed();
+            let rounded = (elapsed.as_nanos() as i64 + 500_000) / 1_000_000 * 1_000_000;
             if !startup.max_elapsed.is_zero() && elapsed >= startup.max_elapsed {
-                let rounded = (elapsed.as_nanos() as i64 + 500_000) / 1_000_000 * 1_000_000;
                 return Err(format!(
-                    "timed out waiting for Redis connection to {} after {}: {error}",
-                    self.masked_url,
+                    "timed out waiting for Redis connection to {masked} after {}: {error}",
                     crate::go::format_duration(rounded)
                 ));
             }
+            let wait = startup.duration(attempt);
+            crate::log::warn(&format!(
+                "Retrying Redis connection to {masked} in {} (elapsed: {}): {error}",
+                crate::go::format_duration(wait.as_nanos() as i64),
+                crate::go::format_duration(rounded)
+            ));
             tokio::select! {
-                () = tokio::time::sleep(startup.duration(attempt)) => {}
+                () = tokio::time::sleep(wait) => {}
                 () = &mut cancelled => {
                     return Err(format!(
                         "context cancelled while waiting for Redis connection to {}: context canceled",
@@ -239,7 +346,7 @@ impl RedisConnection {
                 let _: Result<String, _> = pinger.next().ping(None).await;
             }
         });
-        Ok(pool)
+        Ok((pool, failed_dial))
     }
 }
 
@@ -394,4 +501,17 @@ pub fn mask_credentials_in_url(url: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// radix's reconnection after a lost connection: 125 ms, doubled on each failure up to 4 s.
+fn radix_reconnects() -> ReconnectPolicy {
+    let mut policy = ReconnectPolicy::new_exponential(0, 125, 4000, 2);
+    policy.set_jitter(0);
+    policy
+}
+
+/// Why a startup attempt failed: the message, and whether dialling did.
+struct AttemptError {
+    message: String,
+    dial: bool,
 }

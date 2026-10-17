@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+jiff.workspace = true
 base64.workspace = true
 bytes.workspace = true
 flate2.workspace = true

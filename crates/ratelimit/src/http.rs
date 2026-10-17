@@ -59,13 +59,22 @@ fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Routed {
 /// `NewJsonHandler`: the body as a `RateLimitRequest` in protojson, answered by the service
 /// (400 for any error) in protojson: 429 when over the limit, 500 for an unknown code or a
 /// response protojson cannot write.
-async fn json<C: RateLimitCache>(service: &RateLimitService<C>, body: Option<Bytes>) -> Answer {
-    let bad_request = || Answer::error(400, "Bad Request");
-    let Some(request) = body.and_then(|body| crate::protojson::decode_request(&body).ok()) else {
-        return bad_request();
+async fn json<C: RateLimitCache>(
+    service: &RateLimitService<C>,
+    body: Result<Bytes, String>,
+) -> Answer {
+    // Each failure is logged, then answered alike.
+    let bad_request = |error: String| {
+        crate::log::warn(&format!("error: {error}"));
+        Answer::error(400, "Bad Request")
     };
-    let Ok(response) = service.should_rate_limit(&request).await else {
-        return bad_request();
+    let request = match body.and_then(|body| crate::protojson::decode_request(&body)) {
+        Ok(request) => request,
+        Err(error) => return bad_request(error),
+    };
+    let response = match service.should_rate_limit(&request).await {
+        Ok(response) => response,
+        Err(error) => return bad_request(error.to_string()),
     };
     let Ok(body) = crate::protojson::encode_response(&response) else {
         return Answer::error(500, "Internal Server Error");
@@ -95,7 +104,7 @@ pub async fn serve<C: RateLimitCache>(
                 Routed::Json => {
                     // Upstream reads any length; past the size gRPC refuses, it is refused.
                     let body = http_body_util::Limited::new(request.into_body(), MAX_JSON_BODY);
-                    let body = body.collect().await.ok();
+                    let body = body.collect().await.map_err(|e| e.to_string());
                     json(&service, body.map(|body| body.to_bytes())).await
                 }
             }

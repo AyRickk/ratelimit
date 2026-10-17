@@ -119,7 +119,7 @@ pub fn load_snapshot(
             let name = base_name(&root.to_string_lossy());
             walk.visit(&root, name.as_bytes(), &metadata);
         }
-        Err(_) => walk.failures += 1,
+        Err(e) => walk.failed(&root, &path_error("lstat", &root, &e)),
     }
     (walk.snapshot, walk.failures)
 }
@@ -152,6 +152,15 @@ struct Walk {
 }
 
 impl Walk {
+    /// A failure goruntime counts and logs (the callback's error, `runtime: error processing`).
+    fn failed(&mut self, path: &OsStr, error: &str) {
+        self.failures += 1;
+        crate::log::warn(&format!(
+            "runtime: error processing {}: {error}",
+            path.to_string_lossy()
+        ));
+    }
+
     /// `walk` and goruntime's `walkDirectoryCallback` for one path.
     fn visit(&mut self, path: &OsStr, name: &[u8], metadata: &std::fs::Metadata) {
         let hidden = self.ignore_dotfiles && name.starts_with(b".");
@@ -164,7 +173,19 @@ impl Walk {
                     let key = self.key(path);
                     self.snapshot.entries.insert(key, contents);
                 }
-                Err(_) => self.failures += 1,
+                Err(e) => {
+                    // Opening a directory works; reading it does not.
+                    let op = match e.kind() {
+                        std::io::ErrorKind::IsADirectory => "read",
+                        _ => "open",
+                    };
+                    self.failures += 1;
+                    crate::log::warn(&format!(
+                        "runtime: error reading {}: {}",
+                        path.to_string_lossy(),
+                        path_error(op, path, &e)
+                    ));
+                }
             }
             return;
         }
@@ -177,9 +198,12 @@ impl Walk {
             names
         });
         // The callback sees an unreadable directory once, as an error.
-        let Ok(names) = names else {
-            self.failures += 1;
-            return;
+        let names = match names {
+            Ok(names) => names,
+            Err(e) => {
+                self.failed(path, &path_error("open", path, &e));
+                return;
+            }
         };
         if hidden {
             return;
@@ -188,7 +212,7 @@ impl Walk {
             let child = child_path(path, &name);
             match std::fs::symlink_metadata(&child) {
                 Ok(metadata) => self.visit(&child, name.as_bytes(), &metadata),
-                Err(_) => self.failures += 1,
+                Err(e) => self.failed(&child, &path_error("lstat", &child, &e)),
             }
         }
     }
@@ -240,6 +264,7 @@ impl Loader {
         ignore_dotfiles: bool,
     ) -> Result<Self, String> {
         if runtime_path.is_empty() || subdirectory.is_empty() {
+            crate::log::warn("no runtime configuration. using nil loader.");
             return Ok(Self { shared: None });
         }
         let watched = refresher.watch_directory(runtime_path, subdirectory);
@@ -399,17 +424,16 @@ impl FileProvider {
 /// An error as Go formats `"%s (%T %#v)"` of a `syscall.Errno`.
 fn errno(error: &std::io::Error) -> String {
     let code = error.raw_os_error().unwrap_or(0);
-    let text = std::io::Error::from_raw_os_error(code).to_string();
-    let text = text
-        .strip_suffix(&format!(" (os error {code})"))
-        .unwrap_or(&text);
-    // Go's errno texts are glibc's with a lower-case first letter.
-    let mut chars = text.chars();
-    let text = match chars.next() {
-        Some(first) => first.to_lowercase().chain(chars).collect(),
-        None => String::new(),
-    };
-    format!("{text} (syscall.Errno {code:#x})")
+    format!("{} (syscall.Errno {code:#x})", crate::go::errno_text(error))
+}
+
+/// An `*os.PathError`'s text: the operation, the path, then the errno's text.
+fn path_error(op: &str, path: &OsStr, error: &std::io::Error) -> String {
+    format!(
+        "{op} {}: {}",
+        path.to_string_lossy(),
+        crate::go::errno_text(error)
+    )
 }
 
 #[cfg(target_os = "linux")]

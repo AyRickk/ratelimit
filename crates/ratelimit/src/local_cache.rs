@@ -46,12 +46,12 @@ impl LocalCache {
         self.segment(hash).locate(key.as_bytes(), hash, now as u32)
     }
 
-    /// freecache's `Set` with an empty value, expiring `ttl_seconds` after `now`. Keys too long
-    /// for freecache are not cached, as upstream (which ignores the error).
-    pub fn insert(&self, key: &str, ttl_seconds: i64, now: i64) {
+    /// freecache's `Set` with an empty value, expiring `ttl_seconds` after `now`; false for a
+    /// key freecache refuses (too long), which is not cached.
+    pub fn insert(&self, key: &str, ttl_seconds: i64, now: i64) -> bool {
         let hash = xxh64(key.as_bytes(), 0);
         self.segment(hash)
-            .set(key.as_bytes(), hash, ttl_seconds, now as u32);
+            .set(key.as_bytes(), hash, ttl_seconds, now as u32)
     }
 
     fn segment(&self, hash: u64) -> std::sync::MutexGuard<'_, Segment> {
@@ -209,14 +209,14 @@ impl Segment {
         EntryHeader::decode(&buf)
     }
 
-    /// `seg.set` with an empty value.
-    fn set(&mut self, key: &[u8], hash: u64, expire_seconds: i64, now: u32) {
+    /// `seg.set` with an empty value; false for a key it refuses.
+    fn set(&mut self, key: &[u8], hash: u64, expire_seconds: i64, now: u32) -> bool {
         if key.len() > MAX_KEY_BYTES {
-            return;
+            return false;
         }
         let max_key_val_len = self.rb.size() / 4 - ENTRY_HEADER_BYTES as i64;
         if key.len() as i64 > max_key_val_len {
-            return;
+            return false;
         }
         let expire_at = if expire_seconds > 0 {
             now.wrapping_add(expire_seconds as u32)
@@ -241,7 +241,7 @@ impl Segment {
             self.total_time += i64::from(hdr.access_time) - i64::from(origin_access_time);
             self.rb.write_at(&hdr.encode(), ptr.offset);
             self.counts.overwrites += 1;
-            return;
+            return true;
         }
         hdr = EntryHeader {
             access_time: now,
@@ -267,6 +267,7 @@ impl Segment {
         self.total_time += i64::from(now);
         self.total_count += 1;
         self.vacuum_len -= entry_len;
+        true
     }
 
     /// `seg.evacuate`: frees `entry_len` bytes at the head of the ring buffer, dropping deleted,
