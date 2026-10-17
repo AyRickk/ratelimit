@@ -58,62 +58,49 @@ impl LocalCache {
         self.segments[hash as usize % SEGMENTS].lock().unwrap()
     }
 
-    /// A count summed over the segments.
-    fn sum(&self, count: impl Fn(&Counts) -> i64) -> i64 {
-        self.segments
-            .iter()
-            .map(|s| count(&s.lock().unwrap().counts))
-            .sum()
-    }
-
-    /// `EvacuateCount`: entries dropped or moved to make room.
-    pub fn evacuate_count(&self) -> i64 {
-        self.sum(|c| c.evacuate)
-    }
-
-    /// `ExpiredCount`: expired entries found by a lookup or dropped to make room.
-    pub fn expired_count(&self) -> i64 {
-        self.sum(|c| c.expired)
-    }
-
-    /// `EntryCount`: the entries in the cache.
-    pub fn entry_count(&self) -> i64 {
-        self.sum(|c| c.entries)
-    }
-
-    /// `AverageAccessTime`: the mean access time of the entries in the ring buffers, deleted
-    /// ones included.
-    pub fn average_access_time(&self) -> i64 {
-        let (total_time, total_count) = self.segments.iter().fold((0, 0), |(t, c), s| {
-            let s = s.lock().unwrap();
-            (t + s.total_time, c + s.total_count)
-        });
-        if total_count == 0 {
-            0
-        } else {
-            total_time / total_count
+    /// freecache's counts (`EvacuateCount`, `ExpiredCount`, `EntryCount`, `AverageAccessTime`,
+    /// `HitCount`, `MissCount`, `LookupCount`, `OverwriteCount`), summed over the segments
+    /// with Go's wrapping.
+    pub fn counts(&self) -> CacheCounts {
+        let mut counts = CacheCounts::default();
+        let (mut total_time, mut total_count) = (0i64, 0i64);
+        for segment in &self.segments {
+            let segment = segment.lock().unwrap();
+            let c = &segment.counts;
+            counts.evacuate = counts.evacuate.wrapping_add(c.evacuate);
+            counts.expired = counts.expired.wrapping_add(c.expired);
+            counts.entries = counts.entries.wrapping_add(c.entries);
+            counts.hits = counts.hits.wrapping_add(c.hits);
+            counts.misses = counts.misses.wrapping_add(c.misses);
+            counts.overwrites = counts.overwrites.wrapping_add(c.overwrites);
+            total_time = total_time.wrapping_add(segment.total_time);
+            total_count = total_count.wrapping_add(segment.total_count);
         }
+        counts.lookups = counts.hits.wrapping_add(counts.misses);
+        if total_count != 0 {
+            counts.average_access_time = total_time.wrapping_div(total_count);
+        }
+        counts
     }
+}
 
-    /// `HitCount`.
-    pub fn hit_count(&self) -> i64 {
-        self.sum(|c| c.hits)
-    }
-
-    /// `MissCount`.
-    pub fn miss_count(&self) -> i64 {
-        self.sum(|c| c.misses)
-    }
-
-    /// `LookupCount`: hits and misses.
-    pub fn lookup_count(&self) -> i64 {
-        self.hit_count() + self.miss_count()
-    }
-
-    /// `OverwriteCount`: sets of a key already cached.
-    pub fn overwrite_count(&self) -> i64 {
-        self.sum(|c| c.overwrites)
-    }
+/// The cache's counts, upstream's `localcache.*` gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCounts {
+    /// Entries dropped or moved to make room.
+    pub evacuate: i64,
+    /// Expired entries found by a lookup or dropped to make room.
+    pub expired: i64,
+    /// The entries in the cache.
+    pub entries: i64,
+    /// The mean access time of the entries in the ring buffers, deleted ones included.
+    pub average_access_time: i64,
+    pub hits: i64,
+    pub misses: i64,
+    /// Hits and misses.
+    pub lookups: i64,
+    /// Sets of a key already cached.
+    pub overwrites: i64,
 }
 
 /// A segment's counts (freecache's `missCount`, `hitCount`, `entryCount`, `totalEvacuate`,

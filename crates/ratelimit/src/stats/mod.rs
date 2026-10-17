@@ -118,7 +118,8 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// `Scope(name)`: a scope within this one, with its tags (which are not counted again).
+    /// `Scope(name)`: a scope within this one; its stats carry the store's tags, which are not
+    /// counted again in `reserved_tag`.
     pub fn scope(&self, name: &str) -> Scope {
         Scope {
             name: format!("{}.{name}", self.name),
@@ -202,7 +203,8 @@ impl Stats {
         self.gauges.lock().unwrap().entry(name).or_default().clone()
     }
 
-    /// `AddStatGenerator`: `generate` runs before each flush.
+    /// `AddStatGenerator`: `generate` runs before each flush, the generators locked: it must
+    /// not call back into the store.
     pub fn add_generator(&self, generate: impl Fn() + Send + Sync + 'static) {
         self.generators.lock().unwrap().push(Box::new(generate));
     }

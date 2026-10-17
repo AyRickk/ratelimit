@@ -6160,10 +6160,11 @@ async fn gauges_are_reported_like_upstream() {
         ]);
         services.push(Service::start(binary, &environment).await);
     }
-    // Over the limit (2 a minute): the key goes to the local cache, then hits it.
-    for service in &services {
-        let mut client = service.client().await;
-        for user in ["a", "a", "a", "a", "a", "b"] {
+    // Over the limit (2 a minute): the key goes to the local cache, then hits it. Each call
+    // goes to both sides in turn, so that a minute cannot end between them.
+    let mut clients = [services[0].client().await, services[1].client().await];
+    for user in ["a", "a", "a", "a", "a", "b"] {
+        for client in &mut clients {
             client
                 .should_rate_limit(request("llm", &[&[("user", user)]]))
                 .await
@@ -6171,10 +6172,13 @@ async fn gauges_are_reported_like_upstream() {
         }
     }
     let values = settled_gauges(&servers, |v| {
-        v.get("ratelimit.localcache.hitCount|g") == Some(&3)
+        v.get("ratelimit.localcache.hitCount|g") == Some(&2)
     })
     .await;
     assert_eq!(values[1], values[0]);
+    let hits = values[0].get("ratelimit.localcache.hitCount|g");
+    // The third call over the limit fills the cache, the next two hit it.
+    assert_eq!(hits, Some(&2), "{:?}", values[0]);
     assert_eq!(
         values[0].get("runtime.num_values|g"),
         Some(&3),
@@ -6257,4 +6261,55 @@ async fn settled_gauges(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Before Redis answers, the pool's and the local cache's gauges are already flushed, at 0:
+/// upstream makes them before its startup loop.
+#[tokio::test]
+async fn gauges_are_flushed_while_redis_is_unreachable_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("gauges-no-redis");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let unreachable = format!("127.0.0.1:{}", reserved_port());
+    let servers = [StatsdServer::start().await, StatsdServer::start().await];
+    let mut services = Vec::new();
+    for (binary, server) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&servers)
+    {
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", unreachable.clone()),
+            ("LOG_LEVEL", "error".into()),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+            ("STATSD_HOST", "127.0.0.1".into()),
+            ("STATSD_PORT", server.address.port().to_string()),
+            ("LOCAL_CACHE_SIZE_IN_BYTES", "1048576".into()),
+        ];
+        services.push(Service::start(binary, &environment).await);
+    }
+    // The runtime loader, started before Redis, has its one file.
+    let values = settled_gauges(&servers, |v| v.len() == 10).await;
+    assert_eq!(values[1], values[0]);
+    assert_eq!(values[0].len(), 10, "{:?}", values[0]);
+    let zeros = values[0]
+        .iter()
+        .filter(|(k, _)| *k != "runtime.num_values|g");
+    assert!(zeros.clone().all(|(_, v)| *v == 0), "{:?}", values[0]);
 }

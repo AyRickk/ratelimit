@@ -60,69 +60,82 @@ async fn shutting_down(mut receiver: tokio::sync::watch::Receiver<bool>) {
     let _ = receiver.wait_for(|down| *down).await;
 }
 
-/// `poolStats` and `poolTrace`: `cx_total` counts the connections made (the pool's first ones,
-/// then each reconnection), `cx_local_close` those lost, `cx_active` those open. With
-/// `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, Redis is healthy again on each new connection, and
-/// unhealthy once none is open. Each client's connection is followed from its own events
-/// (all open at first); a failed reconnection, which names no server, changes nothing.
-fn pool_stats(
-    pool: &fred::clients::Pool,
-    stats: &Stats,
-    scope: &crate::stats::Scope,
-    health: Option<Arc<HealthChecker>>,
-) {
-    use fred::interfaces::EventInterface;
-    use tokio::sync::broadcast::error::RecvError;
-    let active = stats.scope_gauge(scope, "cx_active");
-    let total = stats.scope_counter(scope, "cx_total");
-    let local_close = stats.scope_counter(scope, "cx_local_close");
-    let clients = pool.clients().len();
-    total.add(clients as u64);
-    active.add(clients as u64);
-    let connected = Arc::new(Mutex::new(vec![true; clients]));
-    for (index, client) in pool.clients().iter().enumerate() {
-        let (mut reconnected, mut errors) = (client.reconnect_rx(), client.error_rx());
-        let (connected, health) = (connected.clone(), health.clone());
-        let (active, total, local_close) = (active.clone(), total.clone(), local_close.clone());
-        tokio::spawn(async move {
-            loop {
-                let opened = tokio::select! {
-                    event = reconnected.recv() => event.map(|_| true),
-                    event = errors.recv() => match event {
-                        Ok((_, None)) => continue,
-                        event => event.map(|_| false),
-                    },
-                };
-                match opened {
-                    Ok(true) => {
-                        total.inc();
-                        // A connection replaced without its loss seen: that one is closed.
-                        match std::mem::replace(&mut connected.lock().unwrap()[index], true) {
-                            true => local_close.inc(),
-                            false => active.add(1),
+/// `poolStats`: `cx_total` counts the connections made (the pool's first ones, then each
+/// reconnection), `cx_local_close` those lost, `cx_active` those open. Made before the pool,
+/// as upstream makes it before its startup loop, so its gauge is flushed meanwhile.
+struct PoolStats {
+    active: crate::stats::Gauge,
+    total: crate::stats::Counter,
+    local_close: crate::stats::Counter,
+}
+
+impl PoolStats {
+    fn new(stats: &Stats, scope: &crate::stats::Scope) -> Self {
+        Self {
+            active: stats.scope_gauge(scope, "cx_active"),
+            total: stats.scope_counter(scope, "cx_total"),
+            local_close: stats.scope_counter(scope, "cx_local_close"),
+        }
+    }
+
+    /// `poolTrace` for `pool`: each client's connection is followed from its own events (all
+    /// open at first); a failed reconnection, which names no server, changes nothing. With
+    /// `health` (`REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`), Redis is healthy again on each new
+    /// connection, and unhealthy once none is open.
+    fn follow(&self, pool: &fred::clients::Pool, health: Option<Arc<HealthChecker>>) {
+        use fred::interfaces::EventInterface;
+        use tokio::sync::broadcast::error::RecvError;
+        let clients = pool.clients().len();
+        self.total.add(clients as u64);
+        self.active.add(clients as u64);
+        let connected = Arc::new(Mutex::new(vec![true; clients]));
+        for (index, client) in pool.clients().iter().enumerate() {
+            let (mut reconnected, mut errors) = (client.reconnect_rx(), client.error_rx());
+            let (connected, health) = (connected.clone(), health.clone());
+            let (active, total) = (self.active.clone(), self.total.clone());
+            let local_close = self.local_close.clone();
+            tokio::spawn(async move {
+                loop {
+                    let opened = tokio::select! {
+                        event = reconnected.recv() => event.map(|_| true),
+                        event = errors.recv() => match event {
+                            Ok((_, None)) => continue,
+                            event => event.map(|_| false),
+                        },
+                    };
+                    // Counted and reported under the lock, so that health follows the counts.
+                    let mut connected = connected.lock().unwrap();
+                    match opened {
+                        Ok(true) => {
+                            total.inc();
+                            // A connection replaced without its loss seen: that one is closed.
+                            match std::mem::replace(&mut connected[index], true) {
+                                true => local_close.inc(),
+                                false => active.add(1),
+                            }
+                            if let Some(health) = &health {
+                                let _ = health.ok(health::REDIS);
+                            }
                         }
-                        if let Some(health) = &health {
-                            let _ = health.ok(health::REDIS);
+                        Ok(false) => {
+                            if !std::mem::replace(&mut connected[index], false) {
+                                continue;
+                            }
+                            active.sub(1);
+                            local_close.inc();
+                            if let Some(health) = &health
+                                && active.value() == 0
+                            {
+                                let _ = health.fail(health::REDIS);
+                            }
                         }
+                        Err(RecvError::Closed) => return,
+                        // The events missed cannot be told apart.
+                        Err(RecvError::Lagged(_)) => {}
                     }
-                    Ok(false) => {
-                        if !std::mem::replace(&mut connected.lock().unwrap()[index], false) {
-                            continue;
-                        }
-                        active.sub(1);
-                        local_close.inc();
-                        if let Some(health) = &health
-                            && active.value() == 0
-                        {
-                            let _ = health.fail(health::REDIS);
-                        }
-                    }
-                    Err(RecvError::Closed) => return,
-                    // The events missed cannot be told apart.
-                    Err(RecvError::Lagged(_)) => {}
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -163,12 +176,25 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         let _ = sigterm_health.fail(health::SIGTERM);
     });
 
+    // runner.go: the local cache, whose counts NewServer reports as gauges.
+    let local_cache_bytes = settings.redis_cache().local_cache_size_in_bytes;
+    let local_cache = (local_cache_bytes > 0)
+        .then(|| Arc::new(crate::local_cache::LocalCache::new(local_cache_bytes)));
+    if let Some(local_cache) = &local_cache {
+        local_cache_stats(
+            &stats,
+            &server_scope.scope("localcache"),
+            local_cache.clone(),
+        );
+    }
+
     // createLimiter: Redis, healthy once connected.
     let connection = match settings.backend_type.as_str() {
         "redis" | "" => RedisConnection::from_settings(&settings)?,
         "memcache" => return Err("BACKEND_TYPE=memcache is not supported yet".into()),
         other => return Err(format!("Invalid setting for BackendType: {other}")),
     };
+    let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
     let pool = connection
         .connect(
             &StartupBackoff::from_settings(&settings),
@@ -176,14 +202,16 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         )
         .await?;
     let active_health = settings.redis_health_check_active_connection;
-    let scope = server_scope.scope("redis_pool");
-    pool_stats(&pool, &stats, &scope, active_health.then(|| health.clone()));
+    pool_stats.follow(&pool, active_health.then(|| health.clone()));
     let _ = health.ok(health::REDIS);
     let clock = Arc::new(SystemClock);
-    let cache = RedisCache::new(pool, clock.clone(), stats.clone(), settings.redis_cache());
-    if let Some(local_cache) = cache.local_cache() {
-        local_cache_stats(&stats, &server_scope.scope("localcache"), local_cache);
-    }
+    let cache = RedisCache::with_local_cache(
+        pool,
+        clock.clone(),
+        stats.clone(),
+        settings.redis_cache(),
+        local_cache,
+    );
 
     // NewService: loads each config the provider sends (with
     // HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED, healthy only with domains); waits for the first
@@ -308,15 +336,16 @@ fn local_cache_stats(
         gauge("overwriteCount"),
     ];
     stats.add_generator(move || {
+        let c = cache.counts();
         let counts = [
-            cache.evacuate_count(),
-            cache.expired_count(),
-            cache.entry_count(),
-            cache.average_access_time(),
-            cache.hit_count(),
-            cache.miss_count(),
-            cache.lookup_count(),
-            cache.overwrite_count(),
+            c.evacuate,
+            c.expired,
+            c.entries,
+            c.average_access_time,
+            c.hits,
+            c.misses,
+            c.lookups,
+            c.overwrites,
         ];
         // `uint64(...)` of each count.
         for (gauge, count) in gauges.iter().zip(counts) {

@@ -137,17 +137,20 @@ fn replay_in_rust(trace: &Trace) -> Vec<String> {
                 None
             }
             Op::Get { key, now } => Some(if cache.contains(key, *now) { "1" } else { "0" }.into()),
-            Op::Counts => Some(format!(
-                "C {} {} {} {} {} {} {} {}",
-                cache.evacuate_count(),
-                cache.expired_count(),
-                cache.entry_count(),
-                cache.average_access_time(),
-                cache.hit_count(),
-                cache.miss_count(),
-                cache.lookup_count(),
-                cache.overwrite_count()
-            )),
+            Op::Counts => {
+                let c = cache.counts();
+                Some(format!(
+                    "C {} {} {} {} {} {} {} {}",
+                    c.evacuate,
+                    c.expired,
+                    c.entries,
+                    c.average_access_time,
+                    c.hits,
+                    c.misses,
+                    c.lookups,
+                    c.overwrites
+                ))
+            }
         })
         .collect()
 }
