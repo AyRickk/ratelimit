@@ -3,8 +3,6 @@
 //! any Go base, Go booleans, durations and floats parsed by Go's rules; lists split on `,` and
 //! maps on `,` then `:`. The first invalid value, in upstream's field order, is an error with
 //! envconfig's text (upstream panics with it).
-//!
-//! The rows below are upstream's fields, in order: field, kind, variable, default, Go field.
 
 use crate::config::LoadOptions;
 use crate::go;
@@ -14,6 +12,9 @@ use crate::stats::{
     DogStatsdSettings, Mogrifier, PrometheusSettings, SinkSettings, StatsdProtocol,
 };
 use std::collections::BTreeMap;
+
+/// Reads one environment variable; `None` when unset.
+pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// A variable that cannot be read; the text is envconfig's.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -36,8 +37,20 @@ trait Kind {
     type Value: Default;
     /// The Go type, in envconfig's errors.
     const GO_TYPE: &'static str;
+    /// Whether upstream's settings show it (`values`).
+    const SHOWN: bool = true;
     fn parse(text: &str) -> Result<Self::Value, String>;
     fn value(value: &Self::Value) -> Value;
+
+    /// `envconfig.Process` for the field.
+    fn read(
+        lookup: Lookup,
+        key: &str,
+        default: &str,
+        field: &str,
+    ) -> Result<Self::Value, SettingsError> {
+        read::<Self>(lookup, key, default, field)
+    }
 }
 
 struct Str;
@@ -49,6 +62,7 @@ struct Float32;
 struct Float64;
 struct List;
 struct Map;
+struct TlsConfig;
 
 impl Kind for Str {
     type Value = String;
@@ -164,10 +178,59 @@ impl Kind for Map {
     }
 }
 
+/// An untagged `*tls.Config` setting: envconfig still reads `<FIELD>_<TLS FIELD>` for each
+/// field of Go's `tls.Config` it can decode. Upstream overwrites or ignores the values; only an
+/// invalid one matters, as it panics. Checked in `tls.Config`'s field order.
+impl Kind for TlsConfig {
+    type Value = ();
+    const GO_TYPE: &'static str = "*tls.Config";
+    const SHOWN: bool = false;
+    fn parse(_: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn value(_: &()) -> Value {
+        Value::List(Vec::new())
+    }
+    fn read(lookup: Lookup, prefix: &str, _: &str, _: &str) -> Result<(), SettingsError> {
+        let uint16 = |v: &str| go::parse_uint_bits(v, 16).map(|_| ());
+        let int = |v: &str| go::parse_int(v, 64).map(|_| ());
+        let boolean = |v: &str| go::parse_bool(v).map(|_| ());
+        let uint16s = |v: &str| -> Result<(), String> {
+            if v.trim().is_empty() {
+                return Ok(());
+            }
+            v.split(',').try_for_each(uint16)
+        };
+        let map = |v: &str| Map::parse(v).map(|_| ());
+        type Check<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+        let fields: [(&str, &str, Check); 11] = [
+            ("NameToCertificate", "map[string]*tls.Certificate", &map),
+            ("ClientAuth", "tls.ClientAuthType", &int),
+            ("InsecureSkipVerify", "bool", &boolean),
+            ("CipherSuites", "[]uint16", &uint16s),
+            ("PreferServerCipherSuites", "bool", &boolean),
+            ("SessionTicketsDisabled", "bool", &boolean),
+            ("MinVersion", "uint16", &uint16),
+            ("MaxVersion", "uint16", &uint16),
+            ("CurvePreferences", "[]tls.CurveID", &uint16s),
+            ("DynamicRecordSizingDisabled", "bool", &boolean),
+            ("Renegotiation", "tls.RenegotiationSupport", &int),
+        ];
+        for (field, go_type, check) in fields {
+            let key = format!("{prefix}_{}", field.to_uppercase());
+            if let Some(value) = lookup(&key) {
+                check(&value)
+                    .map_err(|e| SettingsError(parse_error(&key, field, &value, go_type, &e)))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `envconfig.Process` for one field: the variable if set (even empty), else the default if
 /// any, else the zero value.
-fn read<K: Kind>(
-    lookup: &dyn Fn(&str) -> Option<String>,
+fn read<K: Kind + ?Sized>(
+    lookup: Lookup,
     key: &str,
     default: &str,
     field: &str,
@@ -177,13 +240,15 @@ fn read<K: Kind>(
         None if !default.is_empty() => default.to_string(),
         None => return Ok(K::Value::default()),
     };
-    K::parse(&value).map_err(|e| {
-        SettingsError(format!(
-            "envconfig.Process: assigning {key} to {field}: converting '{value}' to type {}. \
-             details: {e}",
-            K::GO_TYPE
-        ))
-    })
+    K::parse(&value).map_err(|e| SettingsError(parse_error(key, field, &value, K::GO_TYPE, &e)))
+}
+
+/// envconfig's `ParseError` text.
+fn parse_error(key: &str, field: &str, value: &str, go_type: &str, error: &str) -> String {
+    format!(
+        "envconfig.Process: assigning {key} to {field}: converting '{value}' to type {go_type}. \
+         details: {error}"
+    )
 }
 
 /// The Rust type of a kind of setting.
@@ -197,6 +262,7 @@ macro_rules! rust_type {
     (Float64) => { f64 };
     (List) => { Vec<String> };
     (Map) => { BTreeMap<String, String> };
+    (TlsConfig) => { () };
 }
 
 macro_rules! settings {
@@ -209,22 +275,25 @@ macro_rules! settings {
 
         impl Settings {
             /// The settings `lookup` gives, as `settings.NewSettings` reads them.
-            pub fn from_lookup(
-                lookup: &dyn Fn(&str) -> Option<String>,
-            ) -> Result<Self, SettingsError> {
+            pub fn from_lookup(lookup: Lookup) -> Result<Self, SettingsError> {
                 Ok(Self {
-                    $($field: read::<$kind>(lookup, $key, $default, $go)?,)*
+                    $($field: <$kind as Kind>::read(lookup, $key, $default, $go)?,)*
                 })
             }
 
             /// Each setting by variable, in upstream's order.
             pub fn values(&self) -> Vec<(&'static str, Value)> {
-                vec![$(($key, <$kind as Kind>::value(&self.$field)),)*]
+                let mut values = Vec::new();
+                $(if <$kind as Kind>::SHOWN {
+                    values.push(($key, <$kind as Kind>::value(&self.$field)));
+                })*
+                values
             }
         }
     };
 }
 
+// Upstream's fields, in order: field, kind, variable, default, Go field.
 settings! {
     host: Str = "HOST", "0.0.0.0", "Host";
     port: Int = "PORT", "8080", "Port";
@@ -233,6 +302,7 @@ settings! {
     grpc_uds: Str = "GRPC_UDS", "", "GrpcUds";
     grpc_host: Str = "GRPC_HOST", "0.0.0.0", "GrpcHost";
     grpc_port: Int = "GRPC_PORT", "8081", "GrpcPort";
+    grpc_server_tls_config: TlsConfig = "GRPCSERVERTLSCONFIG", "", "GrpcServerTlsConfig";
     grpc_max_connection_age: Duration = "GRPC_MAX_CONNECTION_AGE", "24h", "GrpcMaxConnectionAge";
     grpc_max_connection_age_grace: Duration = "GRPC_MAX_CONNECTION_AGE_GRACE", "1h", "GrpcMaxConnectionAgeGrace";
     grpc_server_use_tls: Bool = "GRPC_SERVER_USE_TLS", "false", "GrpcServerUseTLS";
@@ -249,6 +319,7 @@ settings! {
     config_grpc_xds_server_url: Str = "CONFIG_GRPC_XDS_SERVER_URL", "localhost:18000", "ConfigGrpcXdsServerUrl";
     config_grpc_xds_server_connect_retry_interval: Duration = "CONFIG_GRPC_XDS_SERVER_CONNECT_RETRY_INTERVAL", "3s", "ConfigGrpcXdsServerConnectRetryInterval";
     config_grpc_xds_client_additional_headers: Map = "CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS", "", "ConfigGrpcXdsClientAdditionalHeaders";
+    config_grpc_xds_tls_config: TlsConfig = "CONFIGGRPCXDSTLSCONFIG", "", "ConfigGrpcXdsTlsConfig";
     config_grpc_xds_server_use_tls: Bool = "CONFIG_GRPC_XDS_SERVER_USE_TLS", "false", "ConfigGrpcXdsServerUseTls";
     config_grpc_xds_client_tls_cert: Str = "CONFIG_GRPC_XDS_CLIENT_TLS_CERT", "", "ConfigGrpcXdsClientTlsCert";
     config_grpc_xds_client_tls_key: Str = "CONFIG_GRPC_XDS_CLIENT_TLS_KEY", "", "ConfigGrpcXdsClientTlsKey";
@@ -307,6 +378,7 @@ settings! {
     redis_aws_iam_serverless: Bool = "REDIS_AWS_IAM_SERVERLESS", "false", "RedisAwsIamServerless";
     redis_aws_iam_region: Str = "REDIS_AWS_IAM_REGION", "", "RedisAwsIamRegion";
     redis_tls: Bool = "REDIS_TLS", "false", "RedisTls";
+    redis_tls_config: TlsConfig = "REDISTLSCONFIG", "", "RedisTlsConfig";
     redis_tls_client_cert: Str = "REDIS_TLS_CLIENT_CERT", "", "RedisTlsClientCert";
     redis_tls_client_key: Str = "REDIS_TLS_CLIENT_KEY", "", "RedisTlsClientKey";
     redis_tls_cacert: Str = "REDIS_TLS_CACERT", "", "RedisTlsCACert";
@@ -346,6 +418,7 @@ settings! {
     memcache_srv: Str = "MEMCACHE_SRV", "", "MemcacheSrv";
     memcache_srv_refresh: Duration = "MEMCACHE_SRV_REFRESH", "0", "MemcacheSrvRefresh";
     memcache_tls: Bool = "MEMCACHE_TLS", "false", "MemcacheTls";
+    memcache_tls_config: TlsConfig = "MEMCACHETLSCONFIG", "", "MemcacheTlsConfig";
     memcache_tls_client_cert: Str = "MEMCACHE_TLS_CLIENT_CERT", "", "MemcacheTlsClientCert";
     memcache_tls_client_key: Str = "MEMCACHE_TLS_CLIENT_KEY", "", "MemcacheTlsClientKey";
     memcache_tls_cacert: Str = "MEMCACHE_TLS_CACERT", "", "MemcacheTlsCACert";
@@ -375,9 +448,6 @@ impl Default for Settings {
         Self::from_lookup(&|_| None).expect("the defaults are valid")
     }
 }
-
-/// Reads one environment variable; `None` when unset.
-pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 impl Settings {
     /// What the Redis cache takes from the settings.
@@ -455,9 +525,10 @@ impl Settings {
         if selected && self.use_statsd {
             gostats_checks(lookup)?;
         }
-        let mogrifiers = match selected && self.use_dog_statsd {
-            true => mogrifiers(&self.use_dog_statsd_mogrifiers, lookup)?,
-            false => Vec::new(),
+        let mogrifiers = if selected && self.use_dog_statsd {
+            mogrifiers(&self.use_dog_statsd_mogrifiers, lookup)?
+        } else {
+            Vec::new()
         };
         if selected && self.use_dog_statsd && u16::try_from(self.statsd_port).is_err() {
             return Err(format!(
@@ -465,10 +536,8 @@ impl Settings {
                 self.statsd_port
             ));
         }
-        let origin_detection = !matches!(
-            get("DD_ORIGIN_DETECTION_ENABLED").as_str(),
-            "0" | "f" | "F" | "FALSE" | "false" | "False"
-        );
+        // Off only for a valid false value.
+        let origin_detection = go::parse_bool(&get("DD_ORIGIN_DETECTION_ENABLED")) != Ok(false);
         // A port Go cannot dial never connects; 0 cannot be dialled either.
         let statsd_port = u16::try_from(self.statsd_port).unwrap_or(0);
         Ok(SinkSettings {
@@ -529,7 +598,7 @@ fn mogrifiers(names: &[String], lookup: Lookup) -> Result<Vec<Mogrifier>, String
     names
         .iter()
         .map(|name| {
-            let prefix = format!("DOG_STATSD_MOGRIFIER_{name}").to_uppercase();
+            let prefix = go::to_upper(&format!("DOG_STATSD_MOGRIFIER_{name}"));
             let field = |suffix: &str| {
                 let key = format!("{prefix}_{suffix}");
                 (lookup(&key).or_else(|| lookup(suffix)), key)
@@ -539,10 +608,8 @@ fn mogrifiers(names: &[String], lookup: Lookup) -> Result<Vec<Mogrifier>, String
             let (template, _) = field("NAME");
             let tags = match tags {
                 Some(value) => Map::parse(&value).map_err(|e| {
-                    format!(
-                        "failed to load mogrifier {name}: envconfig.Process: assigning {tags_key} \
-                         to Tags: converting '{value}' to type map[string]string. details: {e}"
-                    )
+                    let error = parse_error(&tags_key, "Tags", &value, Map::GO_TYPE, &e);
+                    format!("failed to load mogrifier {name}: {error}")
                 })?,
                 None => BTreeMap::new(),
             };

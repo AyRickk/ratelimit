@@ -32,8 +32,7 @@
 // With -settings, the oracle only prints upstream's settings.NewSettings() for its environment
 // as JSON ({"settings": {VARIABLE: value}, "sink": failure}, durations in nanoseconds, floats
 // as strconv.FormatFloat(v, 'g', -1, 64) text, and how creating the stats sink fails, if it
-// does), or the panic it raises
-// ({"error": "..."}), and exits.
+// does), or the panic it raises ({"error": "..."}), and exits.
 package main
 
 import (

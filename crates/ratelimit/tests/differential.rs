@@ -3204,11 +3204,48 @@ async fn settings_are_read_like_upstream() {
         "1_e3",
         "1e_3",
         "0.1_5",
+        "0x1p-1074",
+        "0x0.8p-1022",
+        "0x1.0000000000000801p0",
+        "0x1.0000010000000000001p0",
+        "0x0p999999999999",
+        "0x1p99999999999999999999",
+        "0x1p-99999999999",
+        "0x1.fffffffffffff8p1023",
+        "0x1p-1075",
+        "0x1p-149",
+        "0x_1p0",
+        "0x1p_0",
+        "0x1p0x",
+        "0x1.8",
+        "0x.p1",
+        "0x1p+",
+        "-0x0p0",
     ];
     let lists = ["", " ", "a", "a,b", "a,,b", ",", " a , b "];
     let maps = [
-        "", " ", "a:b", "a:b,c:d", "a:b,a:c", "a", "a:b:c", "a:b,", ":", "a:", ":b", "é", "a\tb",
+        "",
+        " ",
+        "a:b",
+        "a:b,c:d",
+        "a:b,a:c",
+        "a",
+        "a:b:c",
+        "a:b,",
+        ":",
+        "a:",
+        ":b",
+        "é",
+        "a\tb",
         "a\u{1}b",
+        "\u{a0}",
+        "\u{200b}",
+        "\u{feff}",
+        "\u{85}",
+        "\u{2028}",
+        "\u{ad}",
+        "\u{1f600}",
+        "\u{e0001}",
     ];
     let mut cases: Vec<Vec<(&str, &str)>> = vec![vec![]];
     for (variables, values) in [
@@ -3247,6 +3284,10 @@ async fn settings_are_read_like_upstream() {
         vec![("STATSD_PORT", "+8125")],
         vec![("STATSD_PORT", "1_000")],
         vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "x")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "99999999999999999999999x")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "9223372036854775808")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "-9223372036854775808")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "+")],
         vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "")],
         vec![("GOSTATS_LOGGING_SINK_DISABLED", "yes")],
         vec![("GOSTATS_LOGGING_SINK_DISABLED", "yes"), statsd_off],
@@ -3313,10 +3354,42 @@ async fn settings_are_read_like_upstream() {
             ("DOG_STATSD_MOGRIFIER_LOWER_NAME", "y"),
         ],
         vec![dog, statsd_off, ("STATSD_PORT", "70000")],
+        vec![
+            dog,
+            statsd_off,
+            ("USE_DOG_STATSD_MOGRIFIERS", "ß"),
+            ("DOG_STATSD_MOGRIFIER_ß_PATTERN", "x"),
+            ("DOG_STATSD_MOGRIFIER_ß_NAME", "y"),
+        ],
         vec![dog, statsd_off, ("STATSD_HOST", "a:b")],
     ] {
         cases.push(case);
     }
+    // envconfig also reads the fields of the untagged `*tls.Config` settings.
+    for (variable, value) in [
+        ("REDISTLSCONFIG_MINVERSION", "abc"),
+        ("REDISTLSCONFIG_MINVERSION", "70000"),
+        ("REDISTLSCONFIG_MAXVERSION", "0x304"),
+        ("GRPCSERVERTLSCONFIG_INSECURESKIPVERIFY", "x"),
+        ("CONFIGGRPCXDSTLSCONFIG_CLIENTAUTH", "z"),
+        ("MEMCACHETLSCONFIG_CURVEPREFERENCES", "1,x"),
+        ("MEMCACHETLSCONFIG_CURVEPREFERENCES", " "),
+        ("REDISTLSCONFIG_CIPHERSUITES", "+1"),
+        ("REDISTLSCONFIG_NAMETOCERTIFICATE", "a"),
+        ("REDISTLSCONFIG_NAMETOCERTIFICATE", "a:b"),
+        ("REDISTLSCONFIG_RENEGOTIATION", "1_0"),
+        ("REDISTLSCONFIG_SERVERNAME", "anything"),
+        ("REDISTLSCONFIG_SESSIONTICKETKEY", "x"),
+        ("REDISTLSCONFIG_CERTIFICATES", "x,y"),
+        ("REDISTLSCONFIG_ROOTCAS", "x"),
+    ] {
+        cases.push(vec![(variable, value)]);
+    }
+    // In field order: GrpcServerTlsConfig comes before GRPC_MAX_CONNECTION_AGE.
+    cases.push(vec![
+        ("GRPC_MAX_CONNECTION_AGE", "x"),
+        ("GRPCSERVERTLSCONFIG_MINVERSION", "y"),
+    ]);
     // Two invalid values: the first field in upstream's order is reported.
     cases.push(vec![
         ("TRACING_SAMPLING_RATE", "x"),

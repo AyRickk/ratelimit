@@ -8,7 +8,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 ## 1. Environment variables
 
-Reading them (values, defaults, set-but-empty values, the first error and its text) is proven for every variable by `settings_are_read_like_upstream` in `tests/differential.rs`, against upstream's `settings.NewSettings()`. The rows below track what each one does.
+Reading them (values, defaults, set-but-empty values, the first error and its text, including the `<SETTING>_<FIELD>` variables envconfig reads for each untagged `*tls.Config` setting, such as `REDISTLSCONFIG_MINVERSION`) is proven for every variable by `settings_are_read_like_upstream` in `tests/differential.rs`, against upstream's `settings.NewSettings()`. The rows below track what each one does.
 
 | Variable | Upstream default | Status | Test |
 |---|---|---|---|
@@ -241,7 +241,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Client `limit` with `unit: UNKNOWN` ⇒ the process panics | gRPC error `INVALID_ARGUMENT` | D1: crashes are not reproduced |
 | Invalid environment variable re-read on reload ⇒ panic | config error | D1 |
 | An invalid environment variable (or `DOG_STATSD_MOGRIFIER_*`, or gostats' own checks) ⇒ panic at startup | an error with the same text | D1 |
-| envconfig also reads the fields of the untagged `*tls.Config` settings (e.g. `REDISTLSCONFIG_MINVERSION`); an invalid value panics, a valid one is overwritten or unused | ignored | no effect upstream besides the panic |
+| A variable whose value is not valid UTF-8 keeps its bytes (and Go's quoting shows them as `\xNN` in errors) | read with U+FFFD in place of invalid sequences | Rust strings are UTF-8 |
 | `descriptors[].limit` in metadata as Go prototext, one or two spaces between fields depending on the build | the same text, always one space; `unit_multiplier:{value:N}` when set | Go randomises the spacing; `unit_multiplier` is an extension |
 | Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
 | `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
@@ -267,7 +267,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | DogStatsD lines are packed by 32 workers, by name hash | one buffer: the same lines, in other datagrams | datagram boundaries carry no meaning for the agent |
 | Mogrifier `PATTERN`s are Go RE2 | Rust `regex`, with `\d`, `\w`, `\s`, `\b` and their negations made ASCII as in Go; syntax only one of the two accepts (e.g. `\Q…\E`, `\b{start}`) differs | different engine |
 | An invalid mogrifier ⇒ panic at startup | configuration error | D1 |
-| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
+| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve or cannot be dialled (e.g. port 0) | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
 | A `STATSD_HOST` starting with `unix://` sends DogStatsD over a Unix socket | not supported: the address does not resolve | not needed by the targeted deployments; can be added |
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
