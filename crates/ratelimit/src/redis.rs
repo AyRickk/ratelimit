@@ -50,7 +50,8 @@ impl Default for RedisCacheSettings {
 }
 
 pub struct RedisCache {
-    client: Client,
+    /// Connections, each request's pipeline on one of them (radix's pool).
+    pool: Pool,
     clock: Arc<dyn Clock>,
     stats: Arc<Stats>,
     local_cache: Option<LocalCache>,
@@ -59,7 +60,7 @@ pub struct RedisCache {
 
 impl RedisCache {
     pub fn new(
-        client: Client,
+        pool: Pool,
         clock: Arc<dyn Clock>,
         stats: Arc<Stats>,
         settings: RedisCacheSettings,
@@ -67,7 +68,7 @@ impl RedisCache {
         let local_cache = (settings.local_cache_size_in_bytes > 0)
             .then(|| LocalCache::new(settings.local_cache_size_in_bytes));
         Self {
-            client,
+            pool,
             clock,
             stats,
             local_cache,
@@ -283,7 +284,7 @@ impl RateLimitCache for RedisCache {
         }
         let mut counts = vec![Count::After(0); limits.len()];
         if !commands.is_empty() {
-            let replies = send(&self.client, &commands).await?;
+            let replies = send(self.pool.next(), &commands).await?;
             for (index, at) in reply_of {
                 counts[index] = Count::After(commands[at].counter(replies[at].clone())?);
             }
@@ -331,11 +332,354 @@ impl RedisCache {
                 args: vec![c.key.clone()],
             })
             .collect();
-        let replies = send(&self.client, &commands).await?;
+        let replies = send(self.pool.next(), &commands).await?;
         for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
             let before = command.counter(reply)?;
             c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));
         }
         Ok(())
     }
+}
+
+/// How to reach Redis, from the `REDIS_*` settings of upstream's main pool
+/// (`src/redis/driver_impl.go` `newClientImpl`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedisConnection {
+    /// The address (`host:port`) or the Unix socket path.
+    pub address: RedisAddress,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub database: Option<u8>,
+    /// The pool's connections (radix's default for 0: 4).
+    pub pool_size: usize,
+    /// The connection timeout; none for 0.
+    pub timeout: std::time::Duration,
+    /// `MaskCredentialsInUrl` of `REDIS_URL`, for messages.
+    pub masked_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RedisAddress {
+    Tcp { host: String, port: u16 },
+    Unix(String),
+}
+
+impl RedisConnection {
+    /// The main pool's connection, or why upstream refuses to start (or what is not supported
+    /// yet).
+    pub fn from_settings(s: &crate::settings::Settings) -> Result<Self, String> {
+        let unsupported = [
+            (s.redis_tls, "REDIS_TLS"),
+            (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
+            (!s.redis_auth_file.is_empty(), "REDIS_AUTH_FILE"),
+            (s.redis_persecond, "REDIS_PERSECOND"),
+            (
+                s.redis_close_connection_on_readonly_error,
+                "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
+            ),
+        ];
+        if let Some((_, name)) = unsupported.iter().find(|(on, _)| *on) {
+            return Err(format!("{name} is not supported yet"));
+        }
+        match s.redis_pool_on_empty_behavior.to_uppercase().as_str() {
+            "CREATE" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4. Pool will block instead of creating overflow connections. Remove this setting or set to WAIT, and consider increasing REDIS_POOL_SIZE.".into()),
+            "ERROR" => return Err("REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
+            _ => {}
+        }
+        match s.redis_type.to_lowercase().as_str() {
+            "single" => {}
+            "cluster" | "sentinel" => {
+                return Err(format!("REDIS_TYPE={} is not supported yet", s.redis_type));
+            }
+            other => return Err(format!("Unrecognized redis type {other}")),
+        }
+        let pool_size = match s.redis_pool_size {
+            0 => 4,
+            size => usize::try_from(size).map_err(|_| format!("invalid REDIS_POOL_SIZE {size}"))?,
+        };
+        // radix reads credentials and a database from a redis:// URL, after REDIS_AUTH.
+        let (mut username, mut password) = match s.redis_auth.split_once(':') {
+            _ if s.redis_auth.is_empty() => (None, None),
+            Some((user, pass)) => (Some(user.to_string()), Some(pass.to_string())),
+            None => (None, Some(s.redis_auth.clone())),
+        };
+        let (target, url) = parse_redis_url(&s.redis_url);
+        if username.is_none() {
+            username = url.username;
+        }
+        if password.is_none() {
+            password = url.password;
+        }
+        let database = match url.database {
+            None => None,
+            Some(db) => Some(
+                db.parse::<u8>()
+                    .map_err(|_| format!("REDIS_URL database {db:?} is not supported"))?,
+            ),
+        };
+        let address = match s.redis_socket_type.as_str() {
+            "unix" => RedisAddress::Unix(target),
+            "tcp" | "tcp4" | "tcp6" => {
+                let (host, port) = target
+                    .rsplit_once(':')
+                    .and_then(|(h, p)| {
+                        Some((h.trim_matches(['[', ']']).to_string(), p.parse().ok()?))
+                    })
+                    .ok_or_else(|| format!("address {target}: missing port in address"))?;
+                RedisAddress::Tcp { host, port }
+            }
+            other => return Err(format!("REDIS_SOCKET_TYPE={other} is not supported yet")),
+        };
+        Ok(Self {
+            address,
+            username: username.filter(|u| !u.is_empty()),
+            password: password.filter(|p| !p.is_empty()),
+            database,
+            pool_size,
+            timeout: std::time::Duration::from_nanos(u64::try_from(s.redis_timeout).unwrap_or(0)),
+            masked_url: mask_credentials_in_url(&s.redis_url),
+        })
+    }
+
+    fn config(&self) -> Config {
+        let server = match &self.address {
+            RedisAddress::Tcp { host, port } => ServerConfig::Centralized {
+                server: Server::new(host.as_str(), *port),
+            },
+            RedisAddress::Unix(path) => ServerConfig::Unix { path: path.into() },
+        };
+        Config {
+            server,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            database: self.database,
+            fail_fast: true,
+            ..Default::default()
+        }
+    }
+
+    fn builder(&self) -> Builder {
+        let mut builder = Builder::from_config(self.config());
+        let timeout = self.timeout;
+        builder.with_connection_config(|c| c.connection_timeout = timeout);
+        builder
+    }
+
+    /// One attempt: connect and expect `PONG` to `PING`.
+    async fn probe(&self) -> Result<(), String> {
+        let client = self.builder().build().map_err(|e| e.to_string())?;
+        client.init().await.map_err(|e| e.details().to_string())?;
+        let pong: Result<String, _> = client.ping(None).await;
+        let _ = client.quit().await;
+        match pong {
+            Ok(pong) if pong == "PONG" => Ok(()),
+            Ok(pong) => Err(format!(
+                "unexpected PING response: {}",
+                crate::go::quote(&pong)
+            )),
+            Err(e) => Err(e.details().to_string()),
+        }
+    }
+
+    /// `newClientImpl`'s startup: retries until Redis answers `PING`, waiting as
+    /// `REDIS_STARTUP_*` say (exponential with jitter), and gives up after
+    /// `REDIS_STARTUP_MAX_ELAPSED_TIME` (never for 0). Then the pool, which reconnects lost
+    /// connections and pings every `5s / size` like radix's.
+    pub async fn connect(&self, startup: &StartupBackoff) -> Result<Pool, String> {
+        let start = std::time::Instant::now();
+        let mut attempt = 0;
+        while let Err(error) = self.probe().await {
+            let elapsed = start.elapsed();
+            if startup.max_elapsed > std::time::Duration::ZERO && elapsed >= startup.max_elapsed {
+                let rounded = (elapsed.as_nanos() as i64 + 500_000) / 1_000_000 * 1_000_000;
+                return Err(format!(
+                    "timed out waiting for Redis connection to {} after {}: {error}",
+                    self.masked_url,
+                    crate::go::format_duration(rounded)
+                ));
+            }
+            tokio::time::sleep(startup.duration(attempt)).await;
+            attempt += 1;
+        }
+        let pool = self
+            .builder()
+            .set_policy(ReconnectPolicy::new_constant(0, 100))
+            .build_pool(self.pool_size)
+            .map_err(|e| e.to_string())?;
+        pool.init().await.map_err(|e| e.details().to_string())?;
+        let pinger = pool.clone();
+        let interval = std::time::Duration::from_secs(5) / self.pool_size as u32;
+        tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            loop {
+                ticks.tick().await;
+                let _: Result<String, _> = pinger.next().ping(None).await;
+            }
+        });
+        Ok(pool)
+    }
+}
+
+/// `jpillora/backoff` as upstream configures it for Redis startup: `min × 2^attempt`, a random
+/// point between `min` and that, within `[min, max]`.
+#[derive(Debug, Clone)]
+pub struct StartupBackoff {
+    pub min: std::time::Duration,
+    pub max: std::time::Duration,
+    /// Give up after this long; never for 0.
+    pub max_elapsed: std::time::Duration,
+}
+
+impl StartupBackoff {
+    pub fn from_settings(s: &crate::settings::Settings) -> Self {
+        let duration =
+            |nanos: i64| std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(0));
+        Self {
+            min: duration(s.redis_startup_initial_interval),
+            max: duration(s.redis_startup_max_interval),
+            max_elapsed: duration(s.redis_startup_max_elapsed_time),
+        }
+    }
+
+    /// `ForAttempt` with jitter.
+    pub fn duration(&self, attempt: u32) -> std::time::Duration {
+        use std::time::Duration;
+        let min = if self.min.is_zero() {
+            Duration::from_millis(100)
+        } else {
+            self.min
+        };
+        let max = if self.max.is_zero() {
+            Duration::from_secs(10)
+        } else {
+            self.max
+        };
+        if min >= max {
+            return max;
+        }
+        let minf = min.as_nanos() as f64;
+        let durf = minf * 2f64.powi(attempt.min(1000) as i32);
+        let jittered = random_unit() * (durf - minf) + minf;
+        if !jittered.is_finite() || jittered > i64::MAX as f64 {
+            return max;
+        }
+        Duration::from_nanos(jittered as u64).clamp(min, max)
+    }
+}
+
+/// A random number in `[0, 1)` (no cryptographic quality needed for a retry delay).
+fn random_unit() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// What radix reads from a `redis://` URL (`parseRedisURL`): the host, and credentials and a
+/// database from the user info, the path or the query. Any other address is used as it is.
+struct RedisUrl {
+    username: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+}
+
+fn parse_redis_url(url: &str) -> (String, RedisUrl) {
+    let none = RedisUrl {
+        username: None,
+        password: None,
+        database: None,
+    };
+    let Some(rest) = url.strip_prefix("redis://") else {
+        return (url.to_string(), none);
+    };
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, ""),
+    };
+    let (userinfo, host) = match authority.rfind('@') {
+        Some(at) => (Some(&authority[..at]), &authority[at + 1..]),
+        None => (None, authority),
+    };
+    let query_value = |name: &str| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, _)| percent_decode(k, true) == name)
+            .map(|(_, v)| percent_decode(v, true))
+            .filter(|v| !v.is_empty())
+    };
+    let mut parsed = RedisUrl {
+        username: query_value("username"),
+        password: query_value("password"),
+        database: query_value("db"),
+    };
+    if let Some(userinfo) = userinfo {
+        let (user, pass) = match userinfo.split_once(':') {
+            Some((u, p)) => (u, Some(p)),
+            None => (userinfo, None),
+        };
+        if !user.is_empty() {
+            parsed.username = Some(percent_decode(user, false));
+        }
+        if let Some(pass) = pass {
+            parsed.password = Some(percent_decode(pass, false));
+        }
+    }
+    if !path.is_empty() && path != "/" {
+        parsed.database = Some(percent_decode(&path[1..], false));
+    }
+    (host.to_string(), parsed)
+}
+
+/// `%XX` decoded; in a query, `+` is a space too.
+fn percent_decode(s: &str, query: bool) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b'+', _, _) if query => {
+                out.push(b' ');
+                i += 1;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `MaskCredentialsInUrl`: `redis://user:pass@host` becomes `redis://*****@host`, for each
+/// comma-separated URL.
+pub fn mask_credentials_in_url(url: &str) -> String {
+    url.split(',')
+        .map(|u| {
+            let parts: Vec<&str> = u.split('@').collect();
+            match parts[..] {
+                [first, .., last] if first.starts_with("redis://") => {
+                    format!("redis://*****@{last}")
+                }
+                _ => u.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }

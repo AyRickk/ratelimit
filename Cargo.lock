@@ -1155,6 +1155,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "xxhash-rust",
  "yaml-rust2",
 ]

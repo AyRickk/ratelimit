@@ -121,6 +121,41 @@ pub fn dir(path: &str) -> String {
     clean(&path[..i])
 }
 
+/// `time.Duration.String`: `1h2m3.5s`, `1.5s`, `250ms`, `1.5µs`, `0s`.
+pub fn format_duration(nanos: i64) -> String {
+    /// `fmtFrac`: the fraction of `v` (in units of 10^-prec), without trailing zeros.
+    fn fraction(v: u64, prec: u32) -> (String, u64) {
+        let digits = format!("{:0width$}", v % 10u64.pow(prec), width = prec as usize);
+        let digits = digits.trim_end_matches('0');
+        let text = match digits.is_empty() {
+            true => String::new(),
+            false => format!(".{digits}"),
+        };
+        (text, v / 10u64.pow(prec))
+    }
+    let u = nanos.unsigned_abs();
+    let sign = if nanos < 0 { "-" } else { "" };
+    if u == 0 {
+        return "0s".into();
+    }
+    if u < 1_000_000_000 {
+        let (prec, unit) = match u {
+            _ if u < 1_000 => (0, "ns"),
+            _ if u < 1_000_000 => (3, "\u{b5}s"),
+            _ => (6, "ms"),
+        };
+        let (frac, whole) = fraction(u, prec);
+        return format!("{sign}{whole}{frac}{unit}");
+    }
+    let (frac, seconds) = fraction(u, 9);
+    let (minutes, hours) = (seconds / 60, seconds / 3600);
+    match (hours, minutes) {
+        (0, 0) => format!("{sign}{seconds}{frac}s"),
+        (0, _) => format!("{sign}{minutes}m{}{frac}s", seconds % 60),
+        _ => format!("{sign}{hours}h{}m{}{frac}s", minutes % 60, seconds % 60),
+    }
+}
+
 /// Why a `strconv` parser failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumError {

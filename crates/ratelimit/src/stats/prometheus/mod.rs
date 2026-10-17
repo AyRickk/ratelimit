@@ -15,7 +15,6 @@ use bytes::Bytes;
 use exporter::{Event, Exporter};
 use http_body_util::Full;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -163,7 +162,7 @@ impl PrometheusSink {
         let addr = addr.to_string();
         let server = sink.clone();
         tokio::spawn(async move {
-            if let Some(listener) = listen(&addr).await {
+            if let Ok(listener) = crate::net::listen(&addr, false).await {
                 server.serve(listener).await;
             }
         });
@@ -274,47 +273,6 @@ impl PrometheusSink {
             body,
         }
     }
-}
-
-/// Go's `net.Listen("tcp", addr)`: a wildcard host (empty, `0.0.0.0` or `::`) listens on
-/// both IPv4 and IPv6 (IPv4 only when IPv6 is unavailable); a host name on its first IPv4
-/// address, else its first address. `None` when that fails, which upstream ignores.
-async fn listen(addr: &str) -> Option<tokio::net::TcpListener> {
-    let (host, port) = addr.rsplit_once(':')?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let port: u16 = match port {
-        "" => 0,
-        port => port.parse().ok()?,
-    };
-    let bind = |address: SocketAddr| {
-        let domain = socket2::Domain::for_address(address);
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).ok()?;
-        if address.is_ipv6() && address.ip().is_unspecified() {
-            socket.set_only_v6(false).ok()?;
-        }
-        // Like Go on Unix.
-        #[cfg(unix)]
-        socket.set_reuse_address(true).ok()?;
-        socket.bind(&address.into()).ok()?;
-        socket.listen(1024).ok()?;
-        socket.set_nonblocking(true).ok()?;
-        tokio::net::TcpListener::from_std(socket.into()).ok()
-    };
-    let wildcard = matches!(host, "" | "0.0.0.0" | "::");
-    if wildcard {
-        let any6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
-        let any4 = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-        return bind(any6).or_else(|| bind(any4));
-    }
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await.ok()?.collect();
-    let address = addresses
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(addresses.first())?;
-    bind(*address)
 }
 
 struct Response {
