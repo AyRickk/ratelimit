@@ -91,9 +91,7 @@ impl Value {
     fn new(kind: Kind, upper_bounds: &[f64], summary: Option<&SummaryConfig>, wall: i64) -> Self {
         match kind {
             Kind::Summary => {
-                let config = summary
-                    .cloned()
-                    .unwrap_or_else(SummaryConfig::default_config);
+                let config = summary.expect("summary vectors are made with their config");
                 let summary = Summary::new(&config.objectives, config.options, wall);
                 Value::Summary(Box::new(summary), None)
             }
@@ -369,16 +367,16 @@ pub(super) struct Exporter {
     /// The self-metrics, then the exporter's vectors in creation order.
     vectors: Vec<Vector>,
     metrics: HashMap<String, Metric>,
-    /// Go's `time.Now`, which summaries read (statsd_exporter's clock is for TTLs only), in
-    /// nanoseconds.
-    wall: fn() -> i64,
 }
 
-/// The system clock, in nanoseconds since the epoch.
-fn system_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
+/// Go's `time.Now` as summaries compare it (monotonically; statsd_exporter's clock is for
+/// TTLs only), in nanoseconds since the first reading.
+fn monotonic_nanos() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as i64
 }
 
 impl Exporter {
@@ -387,7 +385,6 @@ impl Exporter {
             mapper,
             vectors: fixed_vectors(),
             metrics: HashMap::new(),
-            wall: system_nanos,
         }
     }
 
@@ -474,7 +471,7 @@ impl Exporter {
                     }
                     Some(ObserverType::Summary) | None => {
                         let config = summary_config(&self.mapper, mapped.as_ref());
-                        let wall = (self.wall)();
+                        let wall = monotonic_nanos();
                         match self.get_summary(&series, config, wall) {
                             Some(Value::Summary(summary, _)) => {
                                 summary.observe(value, wall);
@@ -493,16 +490,17 @@ impl Exporter {
         self.metrics.get(name).is_some_and(|m| m.kind != kind)
     }
 
-    /// `GetSummary`: the series, its vector made with `config` (`None` when client_golang
-    /// would panic: a negative `MaxAge`, a `quantile` label), or `None` on a name conflict.
+    /// `GetSummary`: the series, a new vector made with `config` (`None` when client_golang
+    /// would panic or hang: see `summary_config`, or a `quantile` label), or `None` on a name
+    /// conflict.
     fn get_summary(
         &mut self,
         s: &Series,
         config: Option<SummaryConfig>,
         wall: i64,
     ) -> Option<&mut Value> {
-        let invalid = config.is_none() || s.labels.contains_key("quantile");
-        self.register(s, Kind::Summary, &[], config.filter(|_| !invalid), wall)
+        let config = config.filter(|_| !s.labels.contains_key("quantile"));
+        self.register(s, Kind::Summary, &[], config, wall)
     }
 
     /// `GetCounter`, `GetGauge` and `GetHistogram`: the series, registering its vector and
@@ -552,8 +550,9 @@ impl Exporter {
                     || ["_sum", "_count"]
                         .iter()
                         .any(|suffix| self.conflicts(&format!("{name}{suffix}"), kind))
-                    // client_golang panics on these (docs/parity.md §7).
-                    || summary.is_none()
+                    // A new vector client_golang cannot make (docs/parity.md §7); an existing
+                    // one keeps its own options.
+                    || (existing.is_none() && summary.is_none())
             }
             _ => {
                 self.conflicts(name, kind)
@@ -630,15 +629,6 @@ impl Exporter {
     /// (this one included) while gathering, and the scrape is counted by its status.
     pub fn scrape(&mut self, in_flight: u64) -> Result<String, String> {
         self.vectors[IN_FLIGHT].with(&[]).set(in_flight as f64);
-        // Each summary's `Write`, which flushes its buffers.
-        let wall = (self.wall)();
-        for vector in &mut self.vectors {
-            for value in vector.series.values_mut() {
-                if let Value::Summary(summary, written) = value {
-                    *written = Some(summary.write(wall));
-                }
-            }
-        }
         let gathered = self.gather();
         self.vectors[IN_FLIGHT]
             .with(&[])
@@ -649,7 +639,16 @@ impl Exporter {
     }
 
     /// `Registry.Gather` and the text format, or Gather's errors.
-    fn gather(&self) -> Result<String, String> {
+    fn gather(&mut self) -> Result<String, String> {
+        // Each summary's `Write`, which flushes its buffers.
+        let wall = monotonic_nanos();
+        for vector in &mut self.vectors {
+            for value in vector.series.values_mut() {
+                if let Value::Summary(summary, written) = value {
+                    *written = Some(summary.write(wall));
+                }
+            }
+        }
         let mut families: BTreeMap<&str, Family> = BTreeMap::new();
         let mut errors = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -805,13 +804,13 @@ impl Sample<'_> {
             Value::Counter { whole, fraction } => {
                 format!(
                     "counter:{{value:{}}}",
-                    go_float(Value::counter_value(*whole, *fraction))
+                    proto_float(Value::counter_value(*whole, *fraction))
                 )
             }
-            Value::Gauge(v) => format!("gauge:{{value:{}}}", go_float(*v)),
+            Value::Gauge(v) => format!("gauge:{{value:{}}}", proto_float(*v)),
             Value::Histogram { count, sum, .. } => format!(
                 "histogram:{{sample_count:{count} sample_sum:{}}}",
-                go_float(*sum)
+                proto_float(*sum)
             ),
             Value::Summary(_, written) => {
                 let written = written.as_ref().expect("written at Gather");
@@ -821,15 +820,15 @@ impl Sample<'_> {
                     .map(|(q, v)| {
                         format!(
                             " quantile:{{quantile:{} value:{}}}",
-                            go_float(*q),
-                            go_float(*v)
+                            proto_float(*q),
+                            proto_float(*v)
                         )
                     })
                     .collect();
                 format!(
                     "summary:{{sample_count:{} sample_sum:{}{quantiles}}}",
                     written.count,
-                    go_float(written.sum)
+                    proto_float(written.sum)
                 )
             }
         };
@@ -914,13 +913,31 @@ fn write_sample(
         separator = ',';
     }
     if let Some((label, value)) = extra {
-        let _ = write!(out, "{separator}{label}=\"{}\"", go_float(value));
+        let _ = write!(out, "{separator}{label}=\"{}\"", text_float(value));
         separator = ',';
     }
     if separator == ',' {
         out.push('}');
     }
-    let _ = writeln!(out, " {}", go_float(value));
+    let _ = writeln!(out, " {}", text_float(value));
+}
+
+/// expfmt's `writeFloat`: a zero of either sign is `0`.
+fn text_float(value: f64) -> String {
+    match value {
+        0.0 => "0".into(),
+        value => go_float(value),
+    }
+}
+
+/// A float in Go's prototext, as Gather errors print a metric: `nan`, `inf`, `-inf`.
+fn proto_float(value: f64) -> String {
+    match value {
+        v if v.is_nan() => "nan".into(),
+        f64::INFINITY => "inf".into(),
+        f64::NEG_INFINITY => "-inf".into(),
+        v => go_float(v),
+    }
 }
 
 /// `checkSuffixCollisions`, for a new family.
@@ -933,22 +950,19 @@ fn suffix_collision(
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix));
     if let Some(base) = base {
-        match families.get(base).map(|f| f.kind) {
-            Some(Kind::Summary) if !name.ends_with("_bucket") => {
-                return Err(format!(
-                    "collected metric named {} collides with previously collected summary named {}",
-                    crate::go::quote(name),
-                    crate::go::quote(base)
-                ));
-            }
-            Some(Kind::Histogram) => {
-                return Err(format!(
-                    "collected metric named {} collides with previously collected histogram named {}",
-                    crate::go::quote(name),
-                    crate::go::quote(base)
-                ));
-            }
-            _ => {}
+        let other = families.get(base).map(|f| f.kind);
+        let collides = match other {
+            Some(Kind::Summary) => !name.ends_with("_bucket"),
+            Some(Kind::Histogram) => true,
+            _ => false,
+        };
+        if let Some(kind) = other.filter(|_| collides) {
+            return Err(format!(
+                "collected metric named {} collides with previously collected {} named {}",
+                crate::go::quote(name),
+                kind.type_name(),
+                crate::go::quote(base)
+            ));
         }
     }
     if matches!(kind, Kind::Summary | Kind::Histogram) {
@@ -976,7 +990,9 @@ fn suffix_collision(
 
 /// `GetSummary`'s objectives and options: the mapping's quantiles if it has some, else the
 /// defaults' (else 0.5, 0.9 and 0.99); the mapping's options in full if it has any, else the
-/// defaults'; then client_golang's defaults for what is 0. `None` for a negative `MaxAge`.
+/// defaults'; then client_golang's defaults for what is 0. `None` for a negative `MaxAge`
+/// (client_golang panics) or one shorter than a nanosecond per age bucket (its summary would
+/// loop forever on its first expired buffer).
 fn summary_config(
     mapper: &Mapper,
     mapped: Option<&super::mapper::Mapped>,
@@ -1006,17 +1022,21 @@ fn summary_config(
     if options.max_age < 0 {
         return None;
     }
-    let or = |value: i64, default: i64| if value == 0 { default } else { value };
+    let or_default = |value: i64, default: i64| if value == 0 { default } else { value };
+    let options = Options {
+        max_age: or_default(options.max_age, fallback.options.max_age),
+        age_buckets: or_default(
+            options.age_buckets.into(),
+            fallback.options.age_buckets.into(),
+        ) as u32,
+        buf_cap: or_default(options.buf_cap.into(), fallback.options.buf_cap.into()) as u32,
+    };
+    if options.max_age / options.age_buckets as i64 == 0 {
+        return None;
+    }
     Some(SummaryConfig {
         objectives,
-        options: Options {
-            max_age: or(options.max_age, fallback.options.max_age),
-            age_buckets: or(
-                options.age_buckets.into(),
-                fallback.options.age_buckets.into(),
-            ) as u32,
-            buf_cap: or(options.buf_cap.into(), fallback.options.buf_cap.into()) as u32,
-        },
+        options,
     })
 }
 
@@ -1077,5 +1097,33 @@ mappings:
             config.options.buf_cap,
         );
         assert_eq!(options, (3_600_000_000_000, 5, 7));
+    }
+
+    /// Options client_golang cannot use make no summary: a negative `MaxAge` (it panics), or
+    /// one under a nanosecond per age bucket (it loops forever).
+    #[test]
+    fn unusable_summary_options_make_no_summary() {
+        for options in ["{max_age: -1s}", "{max_age: 4ns, age_buckets: 5}"] {
+            let yaml = format!("mappings:\n- {{match: a.*, name: a, summary_options: {options}}}");
+            let mapper = Mapper::from_yaml(&yaml).unwrap();
+            let mapped = mapper.get_mapping("a.x", super::super::MetricType::Observer);
+            assert!(
+                summary_config(&mapper, mapped.as_ref()).is_none(),
+                "{options}"
+            );
+        }
+    }
+
+    /// Gather errors print floats as Go's prototext; the text format prints any zero as `0`.
+    #[test]
+    fn floats_are_printed_like_go() {
+        let printed: Vec<String> = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 1.5]
+            .map(proto_float)
+            .into();
+        assert_eq!(printed, ["nan", "inf", "-inf", "-0", "1.5"]);
+        assert_eq!(
+            (text_float(-0.0), text_float(f64::NAN)),
+            ("0".into(), "NaN".into())
+        );
     }
 }

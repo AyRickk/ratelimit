@@ -73,7 +73,8 @@ impl Stream {
                 i -= 1;
             }
             self.maybe_sort();
-            return self.buffer[i as usize].value;
+            // An objective outside [0, 1] makes Go index out of range (docs/parity.md §7).
+            return self.buffer[i.clamp(0, l as i64 - 1) as usize].value;
         }
         self.flush();
         self.query_list(q)
@@ -191,7 +192,7 @@ impl Stream {
 }
 
 /// The options of a summary, after client_golang's defaults (`MaxAge` 10 minutes, 5 age
-/// buckets, a buffer of 500); `max_age` in nanoseconds.
+/// buckets, a buffer of 500); `max_age` in nanoseconds, at least one per age bucket.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub max_age: i64,
@@ -200,8 +201,8 @@ pub struct Options {
 }
 
 /// A summary with objectives: observations buffered, then inserted into one stream per age
-/// bucket; quantiles come from the oldest stream still in use. Times are wall-clock
-/// nanoseconds (Go's `time.Now`).
+/// bucket; quantiles come from the oldest stream still in use. Times are nanoseconds on a
+/// monotonic clock, as Go's `time.Time` comparisons use.
 #[derive(Debug, Clone)]
 pub struct Summary {
     sorted_objectives: Vec<f64>,
@@ -217,7 +218,7 @@ pub struct Summary {
     hot_buf_exp_time: i64,
 }
 
-/// What `Write` gives: the count, the sum, and each objective's quantile in order.
+/// What `Write` gives: the count, the sum, and each objective's quantile, by objective.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Written {
     pub count: u64,
@@ -233,7 +234,12 @@ impl Summary {
             .map(|_| Stream::new(objectives))
             .collect();
         let mut sorted_objectives: Vec<f64> = objectives.iter().map(|(q, _)| *q).collect();
-        sorted_objectives.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // `sort.Float64s`: NaN first.
+        sorted_objectives.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        });
         let buf_cap = options.buf_cap as usize;
         Self {
             sorted_objectives,
@@ -350,6 +356,18 @@ mod tests {
         let written = summary.write(11 * MINUTE);
         assert!(written.quantiles[0].1.is_nan(), "{written:?}");
         assert_eq!((written.count, written.sum), (1, 3.0));
+    }
+
+    /// An objective outside [0, 1] (Go indexes out of range) gives the nearest observation;
+    /// NaN objectives come first, as `sort.Float64s` puts them.
+    #[test]
+    fn odd_objectives_do_not_panic() {
+        let mut summary = Summary::new(&[(1.5, 0.01), (-1.0, 0.01), (f64::NAN, 0.1)], options(), 0);
+        summary.observe(3.0, 0);
+        summary.observe(5.0, 0);
+        let quantiles = summary.write(0).quantiles;
+        assert!(quantiles[0].0.is_nan());
+        assert_eq!(&quantiles[1..], &[(-1.0, 3.0), (1.5, 5.0)]);
     }
 
     /// A buffer that expires is flushed on the next observation, at its own time.

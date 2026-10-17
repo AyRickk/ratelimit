@@ -5982,6 +5982,20 @@ mappings:
 - match: hist.*
   name: plain_timer_sum
   observer_type: histogram
+- match: na.*
+  name: nm
+  labels: {{lv: $1}}
+- match: nb.*
+  name: nm
+  labels: {{lv: $1}}
+  summary_options: {{max_age: -1s}}
+- match: helpa.*
+  name: helped
+  help: a
+- match: helpb.*
+  name: helped
+  help: b
+  labels: {{lv: $1}}
 ",
         dense.join(", ")
     );
@@ -5990,6 +6004,8 @@ mappings:
         ..Default::default()
     };
     let h = Harness::configured(TOKENS, settings).await;
+    // Each side's age buckets turn every 2 minutes from its series' creation: the test runs
+    // well within one, so that both sides' streams hold the same observations.
     // Values in a shuffled order, with repeats, negatives and large ones.
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
@@ -6040,6 +6056,25 @@ mappings:
     ] {
         assert!(body.contains(series), "{series} in {body}");
     }
+    // Zeros of either sign are `0`; a mapping with a negative `max_age` reuses the vector
+    // another made (only a new vector would panic upstream).
+    let scraped = h
+        .flush_to_prometheus(&[
+            ("timer", "zero.x", -0.0),
+            ("timer", "na.x", 1.0),
+            ("timer", "nb.y", 2.0),
+        ])
+        .await;
+    assert!(
+        scraped.body.contains("zero_x{quantile=\"0.3\"} 0\n"),
+        "{}",
+        scraped.body
+    );
+    assert!(
+        scraped.body.contains("nm{lv=\"y\",quantile=\"0.3\"} 2\n"),
+        "{}",
+        scraped.body
+    );
     // A summary's `_count` taken first, a counter's name taken by a summary.
     h.flush_to_prometheus(&[
         ("counter", "taken", 1.0),
@@ -6048,6 +6083,9 @@ mappings:
         ("timer", "late", 1.0),
     ])
     .await;
+    // The same name with other help (and labels): Gather refuses the second summary.
+    h.flush_to_prometheus(&[("timer", "helpa.x", 1.0), ("timer", "helpb.y", 2.0)])
+        .await;
     // A gauge named like a summary's `_sum` is refused; a histogram is registered, but
     // Gather refuses it.
     h.flush_to_prometheus(&[("gauge", "plain_timer_sum", 1.0)])
