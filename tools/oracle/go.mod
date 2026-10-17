@@ -6,6 +6,7 @@ require (
 	github.com/coocood/freecache v1.2.4
 	github.com/envoyproxy/go-control-plane/envoy v1.37.1-0.20260409083702-98966259b99a
 	github.com/envoyproxy/ratelimit v1.4.1-0.20261006073346-f4e76690d9ce
+	github.com/lyft/goruntime v0.3.0
 	github.com/lyft/gostats v0.4.14
 	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/statsd_exporter v0.26.1
@@ -46,7 +47,6 @@ require (
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/kelseyhightower/envconfig v1.4.0 // indirect
 	github.com/libp2p/go-reuseport v0.4.0 // indirect
-	github.com/lyft/goruntime v0.3.0 // indirect
 	github.com/mediocregopher/radix/v4 v4.1.4 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect

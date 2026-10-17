@@ -102,6 +102,20 @@ async fn free_port() -> u16 {
         .port()
 }
 
+/// A port for a server that cannot report the one it gets (upstream's Prometheus listener):
+/// taken from a range below the ephemeral ports, which this process walks, so that no other
+/// test's ephemeral port can take it between this check and the server's bind.
+fn reserved_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 400) as u16 * 25;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::SeqCst) % 25;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 /// A throwaway Redis server, stopped when dropped.
 struct Redis {
     _process: Child,
@@ -327,6 +341,7 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
         .map(|(key, value)| format!("{key}:{value}"))
         .collect();
     let dogstatsd = settings.dogstatsd.as_ref().map(DogStatsd::environment);
+    let runtime = settings.runtime.clone();
     let settings = &settings.service;
     let mut environment = vec![
         ("EXTRA_TAGS", extra_tags.join(",")),
@@ -368,6 +383,7 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
         ]);
     }
     environment.extend(dogstatsd.into_iter().flatten());
+    environment.extend(runtime.into_iter().flatten());
     environment
 }
 
@@ -394,6 +410,7 @@ impl Oracle {
             .args(statsd.map(|server| format!("-statsd={}", server.address)))
             .args(dogstatsd.map(|server| format!("-dogstatsd={}", server.address)))
             .args(prometheus.map(Prometheus::oracle_args).unwrap_or_default())
+            .args(all.runtime.as_ref().map(|_| "-file-provider"))
             .env_clear()
             .envs(oracle_environment(all))
             .stdout(Stdio::piped())
@@ -474,6 +491,8 @@ struct Subject {
     sink: Option<Sink>,
     /// With `Settings::prometheus`: the sink, its exporter's clock and where it serves.
     prometheus: Option<(PrometheusSink, Arc<AtomicI64>, String)>,
+    /// With `Settings::runtime`, the file provider feeding the service.
+    _provider: Option<ratelimit::runtime::FileProvider>,
 }
 
 impl Subject {
@@ -525,6 +544,21 @@ impl Subject {
             stats.clone(),
             settings.service.clone(),
         ));
+        let provider = settings.runtime.as_ref().map(|runtime| {
+            let lookup = |key: &str| {
+                runtime
+                    .iter()
+                    .chain(&oracle_environment(settings))
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            let all = ratelimit::settings::Settings::from_lookup(&lookup).unwrap();
+            let service = service.clone();
+            ratelimit::runtime::FileProvider::start(&all, &stats, move |config| {
+                service.update_config(config)
+            })
+            .unwrap()
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(
@@ -542,6 +576,7 @@ impl Subject {
             stats,
             sink,
             prometheus,
+            _provider: provider,
         }
     }
 }
@@ -576,6 +611,9 @@ struct Settings {
     dogstatsd: Option<DogStatsd>,
     /// Also send the stats to the Prometheus sink on each side, and compare what they serve.
     prometheus: Option<Prometheus>,
+    /// Load the config with each side's file provider, configured by these `RUNTIME_*`
+    /// variables, instead of pushing it.
+    runtime: Option<Vec<(&'static str, String)>>,
 }
 
 /// The Prometheus sink's configuration, for both sides.
@@ -621,7 +659,7 @@ impl Prometheus {
             path: "/metrics",
             mapper,
             milliseconds: false,
-            oracle_address: format!("127.0.0.1:{}", free_port().await),
+            oracle_address: format!("127.0.0.1:{}", reserved_port()),
         }
     }
 
@@ -1022,6 +1060,7 @@ impl Harness {
             settings.prometheus.as_ref(),
         )
         .await;
+        let runtime = settings.runtime.is_some();
         let mut h = Self {
             oracle,
             oracle_redis,
@@ -1034,8 +1073,33 @@ impl Harness {
             prometheus: settings.prometheus.map(|p| p.oracle_address),
             flushes: Default::default(),
         };
-        h.load_config(config).await.unwrap();
+        match runtime {
+            true => h.await_config_loads(1).await,
+            false => h.load_config(config).await.unwrap(),
+        }
         h
+    }
+
+    /// Waits until each side has loaded a config (or failed to) `count` times in all, then
+    /// compares their stats.
+    async fn await_config_loads(&self, count: u64) {
+        let loads = |stats: &BTreeMap<String, u64>| {
+            stats
+                .iter()
+                .filter(|(name, _)| name.starts_with("ratelimit.service.config_load_"))
+                .map(|(_, value)| value)
+                .sum::<u64>()
+        };
+        for _ in 0..500 {
+            let upstream = loads(&self.oracle.stats().await);
+            let ours = loads(&self.subject.stats.snapshot());
+            if upstream >= count && ours >= count {
+                self.assert_same_stats().await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("config loads did not reach {count}");
     }
 
     /// Loads `config` on both sides, as a reload; returns upstream's error if it does not load,
@@ -3034,6 +3098,16 @@ async fn prometheus_options_like_upstream() {
     h.scrape("GET", "/stats/", &[]).await;
 }
 
+/// Looks variables up in `environment`, as an environment would.
+fn lookup_in<'a>(environment: &'a [(&'a str, String)]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key| {
+        environment
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+}
+
 /// Upstream's `settings.NewSettings()` for `environment`, from the oracle: the settings as JSON,
 /// or the panic's text.
 async fn upstream_settings(environment: &[(&str, &str)]) -> Result<serde_json::Value, String> {
@@ -3420,4 +3494,412 @@ async fn settings_are_read_like_upstream() {
             _ => assert_eq!(ours, upstream, "{environment:?}"),
         }
     }
+}
+
+/// A temporary directory, removed when dropped (even when a test fails).
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fresh temporary directory.
+fn temp_dir(name: &str) -> TempDir {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ratelimit-{name}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
+}
+
+/// Writes `files` (path → contents; a contents of `->target` makes a symlink) under `root`.
+fn write_tree(root: &std::path::Path, files: &[(&str, &[u8])]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        match contents.strip_prefix(b"->") {
+            Some(target) => {
+                std::os::unix::fs::symlink(std::str::from_utf8(target).unwrap(), &path).unwrap()
+            }
+            None if contents == b"/" => std::fs::create_dir_all(&path).unwrap(),
+            None => std::fs::write(&path, contents).unwrap(),
+        }
+    }
+}
+
+/// Upstream's first runtime snapshot for `environment`, from the oracle.
+async fn upstream_snapshot(environment: &[(&str, String)]) -> serde_json::Value {
+    let output = Command::new(oracle_binary())
+        .arg("-runtime-snapshot")
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+        .output()
+        .await
+        .expect("run the oracle");
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("oracle output: {}", String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Ours, shaped like the oracle's JSON.
+fn our_snapshot(environment: &[(&str, String)]) -> serde_json::Value {
+    use base64::Engine;
+    let settings = ratelimit::settings::Settings::from_lookup(&lookup_in(environment)).unwrap();
+    let stats = Stats::new(&settings.extra_tags);
+    match ratelimit::runtime::loader(&settings, &stats) {
+        Err(e) => serde_json::json!({ "error": e }),
+        Ok(loader) => {
+            let snapshot: serde_json::Map<String, serde_json::Value> = loader
+                .snapshot()
+                .entries
+                .into_iter()
+                .map(|(k, v)| {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(v);
+                    (k, serde_json::json!(encoded))
+                })
+                .collect();
+            let counters: serde_json::Map<String, serde_json::Value> = stats
+                .snapshot()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("runtime.") || name == "reserved_tag")
+                .map(|(k, v)| (k, serde_json::json!(v)))
+                .collect();
+            serde_json::json!({ "snapshot": snapshot, "counters": counters })
+        }
+    }
+}
+
+/// goruntime's loader takes the same first snapshot of a directory as upstream: keys from
+/// relative paths, symlinked files read through, symlinked directories and unreadable entries
+/// counted as failures, dotfiles skipped only when asked, the nil loader without a
+/// subdirectory; and fails to start the same way.
+#[tokio::test]
+async fn runtime_snapshots_are_taken_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let tree: &[(&str, &[u8])] = &[
+        ("v1/ratelimit/config/a.yaml", b"domain: a\n"),
+        ("v1/ratelimit/config/b.yml", b"x"),
+        ("v1/ratelimit/config/.hidden", b"h"),
+        ("v1/ratelimit/config/sub/c.yaml", b"c"),
+        ("v1/ratelimit/config/.dotdir/d.yaml", b"d"),
+        ("v1/ratelimit/config/link.yaml", b"->a.yaml"),
+        ("v1/ratelimit/config/dirlink", b"->sub"),
+        ("v1/ratelimit/config/dangling", b"->nowhere"),
+        ("v1/ratelimit/config/latin1", b"caf\xe9"),
+        ("v1/ratelimit/config/empty", b""),
+        ("v1/ratelimit/config.yaml", b"root level"),
+        ("v1/ratelimit/other/e.yaml", b"e"),
+        ("v1/ratelimit/config/..2024_01/k.yaml", b"k"),
+        ("v1/ratelimit/config/..data", b"->..2024_01"),
+        ("v1/ratelimit/config/k.yaml", b"->..data/k.yaml"),
+        ("v1/ratelimit/afile", b"a file as the app directory"),
+        ("v1/ratelimit/.x/y", b"y"),
+        ("current", b"->v1"),
+    ];
+    let root = temp_dir("runtime");
+    write_tree(&root, tree);
+    use std::os::unix::ffi::OsStrExt;
+    let latin1_name = std::ffi::OsStr::from_bytes(b"caf\xe9.yaml");
+    // macOS refuses names that are not UTF-8.
+    if cfg!(target_os = "linux") {
+        std::fs::write(
+            root.join("v1/ratelimit/config").join(latin1_name),
+            b"latin1",
+        )
+        .unwrap();
+    }
+    let unreadable = root.join("v1/ratelimit/config/secret");
+    std::fs::write(&unreadable, b"s").unwrap();
+    let locked = root.join("v1/ratelimit/config/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let path = |p: &str| root.join(p).to_string_lossy().into_owned();
+    let env = |pairs: &[(&'static str, String)]| pairs.to_vec();
+    let mut cases = Vec::new();
+    for ignore in ["false", "true"] {
+        let ignore = ("RUNTIME_IGNOREDOTFILES", ignore.to_string());
+        cases.push(env(&[
+            ("RUNTIME_ROOT", path("current")),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ignore.clone(),
+        ]));
+        for (subdirectory, app) in [
+            ("ratelimit", "config"),
+            ("ratelimit", "afile"),
+            ("ratelimit", ".x"),
+            ("", "ratelimit"),
+        ] {
+            cases.push(env(&[
+                ("RUNTIME_ROOT", path("current")),
+                ("RUNTIME_SUBDIRECTORY", subdirectory.into()),
+                ("RUNTIME_APPDIRECTORY", app.into()),
+                ("RUNTIME_WATCH_ROOT", "false".into()),
+                ignore.clone(),
+            ]));
+        }
+    }
+    // A missing RUNTIME_ROOT is a failure; a missing watched directory, an error.
+    cases.push(env(&[
+        ("RUNTIME_ROOT", path("missing")),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+    ]));
+    cases.push(env(&[
+        ("RUNTIME_ROOT", path("missing/deeper")),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+    ]));
+    cases.push(env(&[
+        ("RUNTIME_ROOT", path("current")),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("RUNTIME_APPDIRECTORY", "missing".into()),
+        ("RUNTIME_WATCH_ROOT", "false".into()),
+    ]));
+    // Relative paths, down to `.` (the test's directory, the same on both sides).
+    cases.push(env(&[
+        ("RUNTIME_ROOT", ".".into()),
+        ("RUNTIME_SUBDIRECTORY", ".".into()),
+        ("RUNTIME_APPDIRECTORY", "src".into()),
+        ("RUNTIME_WATCH_ROOT", "false".into()),
+    ]));
+    cases.push(env(&[
+        ("RUNTIME_ROOT", ".".into()),
+        ("RUNTIME_SUBDIRECTORY", ".".into()),
+        ("RUNTIME_APPDIRECTORY", ".".into()),
+        ("RUNTIME_WATCH_ROOT", "false".into()),
+        ("RUNTIME_IGNOREDOTFILES", "true".into()),
+    ]));
+    // Without a subdirectory: the nil loader; the runtime scope still counts reserved tags.
+    cases.push(env(&[
+        ("RUNTIME_ROOT", path("current")),
+        ("EXTRA_TAGS", "host:h,az:z".into()),
+    ]));
+    cases.push(env(&[
+        ("RUNTIME_ROOT", path("current")),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("EXTRA_TAGS", "host:h.1,app:x".into()),
+    ]));
+    for environment in cases {
+        let (mut ours, mut upstream) = (
+            our_snapshot(&environment),
+            upstream_snapshot(&environment).await,
+        );
+        // Off Linux, upstream's fsnotify uses kqueue, whose errors read differently.
+        if !cfg!(target_os = "linux")
+            && ours.get("error").is_some()
+            && upstream.get("error").is_some()
+        {
+            ours["error"] = serde_json::json!("error");
+            upstream["error"] = serde_json::json!("error");
+        }
+        assert_eq!(ours, upstream, "{environment:?}");
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const LLM_CONFIG: &[u8] = b"domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: minute, requests_per_unit: 2}\n";
+const OTHER_CONFIG: &[u8] = b"domain: other\ndescriptors:\n  - key: k\n    rate_limit: {unit: hour, requests_per_unit: 1}\n";
+
+/// `RUNTIME_*` variables for a runtime directory at `root`, watched as a symlink
+/// (`root/current`) or as a directory.
+fn runtime_environment(root: &std::path::Path, watch_root: bool) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "RUNTIME_ROOT",
+            root.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("RUNTIME_APPDIRECTORY", "config".into()),
+        ("RUNTIME_WATCH_ROOT", watch_root.to_string()),
+        ("RUNTIME_IGNOREDOTFILES", "true".into()),
+    ]
+}
+
+async fn file_provider_harness(root: &std::path::Path, watch_root: bool) -> Harness {
+    let settings = Settings {
+        runtime: Some(runtime_environment(root, watch_root)),
+        extra_tags: [("host", "h")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    Harness::configured("", settings).await
+}
+
+/// The file provider loads the config files of the runtime directory at start, as upstream:
+/// in watch-root mode only those under the app directory; a bad file fails the whole load.
+#[tokio::test]
+async fn the_file_provider_loads_the_runtime_directory_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    for watch_root in [true, false] {
+        let root = temp_dir("provider");
+        let wide: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "domain: wide\ndescriptors:\n  - key: k\n    rate_limit: {unit: second, requests_per_unit: 1}\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        write_tree(
+            &root,
+            &[
+                ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+                ("v1/ratelimit/config/wide.yaml", &wide),
+                ("v1/ratelimit/config/nested/other.yaml", OTHER_CONFIG),
+                ("v1/ratelimit/config/.ignored.yaml", b"not: yaml: at all"),
+                ("v1/ratelimit/elsewhere.yaml", b"domain: elsewhere\n"),
+                ("current", b"->v1"),
+            ],
+        );
+        let mut h = file_provider_harness(&root, watch_root).await;
+        h.at(1_700_000_000).await;
+        for _ in 0..3 {
+            h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+        }
+        h.call(request("other", &[&[("k", "v")]])).await.unwrap();
+        h.call(request("wide", &[&[("k", "v")]])).await.unwrap();
+        h.call(request("elsewhere", &[&[("k", "v")]]))
+            .await
+            .unwrap();
+    }
+    let root = temp_dir("provider");
+    write_tree(
+        &root,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v1/ratelimit/config/zz.yaml", b"domain: [unclosed\n"),
+            ("current", b"->v1"),
+        ],
+    );
+    let mut h = file_provider_harness(&root, true).await;
+    h.at(1_700_000_000).await;
+    let _ = h.call(request("llm", &[&[("user", "a")]])).await;
+    // Bytes yaml.v2 cannot read fail the load too.
+    for bad in [
+        &b"domain: caf\xe9\n"[..],
+        b"domain: a\x01\n",
+        b"\xff\xfed\x00\x00\xdc",
+    ] {
+        let root = temp_dir("provider");
+        write_tree(
+            &root,
+            &[("v1/ratelimit/config/bad.yaml", bad), ("current", b"->v1")],
+        );
+        let mut h = file_provider_harness(&root, true).await;
+        let _ = h.call(request("a", &[&[("k", "v")]])).await;
+    }
+}
+
+/// yaml.v2's reader refuses control characters, and skips a byte order mark.
+#[tokio::test]
+async fn config_characters_are_read_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    for config in [
+        "domain: a\x01",
+        "domain: a\x7f",
+        "# \x0b\ndomain: a",
+        "domain: a\u{fffe}",
+    ] {
+        assert!(h.load_config(config).await.is_err(), "{config:?}");
+    }
+    h.load_config("\u{feff}domain: bom\n").await.unwrap();
+    // NEL breaks lines in YAML 1.1; LS stays a character in a scalar.
+    for config in [
+        "domain: tab\tand\u{a0}\u{85}descriptors: []\n",
+        "domain: \"a\u{2028}b\"\n",
+        "domain: a\u{85}descriptors:\u{85}  - key: k\u{85}    rate_limit: {unit: second, requests_per_unit: 1}\n",
+    ] {
+        let _ = h.load_config(config).await;
+    }
+}
+
+/// Reloads follow the same file system events as upstream's (inotify, so Linux only): an
+/// atomic symlink swap in watch-root mode, a file moved into the directory otherwise.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_file_provider_reloads_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    // Watch root: v2 replaces v1 by renaming a new symlink over `current`.
+    let root = temp_dir("reload");
+    write_tree(
+        &root,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v2/ratelimit/config/other.yaml", OTHER_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let mut h = file_provider_harness(&root, true).await;
+    h.at(1_700_000_000).await;
+    h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+    std::os::unix::fs::symlink("v2", root.join("next")).unwrap();
+    std::fs::rename(root.join("next"), root.join("current")).unwrap();
+    h.await_config_loads(2).await;
+    h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+    h.call(request("other", &[&[("k", "v")]])).await.unwrap();
+    // Edits inside the target do not reload, nor does a change of the symlink's own times
+    // (a chmod event on it).
+    std::fs::write(root.join("v2/ratelimit/config/llm.yaml"), LLM_CONFIG).unwrap();
+    let touched = std::process::Command::new("touch")
+        .arg("-h")
+        .arg(root.join("current"))
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+
+    // Directory: a file moved in reloads; one moved out does not (a rename), a deleted one does.
+    let root = temp_dir("reload");
+    write_tree(
+        &root,
+        &[
+            ("current/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("staging/other.yaml", OTHER_CONFIG),
+        ],
+    );
+    let mut h = file_provider_harness(&root, false).await;
+    h.at(1_700_000_000).await;
+    h.call(request("other", &[&[("k", "v")]])).await.unwrap();
+    std::fs::rename(
+        root.join("staging/other.yaml"),
+        root.join("current/ratelimit/config/other.yaml"),
+    )
+    .unwrap();
+    h.await_config_loads(2).await;
+    h.call(request("other", &[&[("k", "v")]])).await.unwrap();
+    std::fs::rename(
+        root.join("current/ratelimit/config/llm.yaml"),
+        root.join("staging/llm.yaml"),
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+    std::fs::remove_file(root.join("current/ratelimit/config/other.yaml")).unwrap();
+    h.await_config_loads(3).await;
+    h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
+    h.call(request("other", &[&[("k", "v")]])).await.unwrap();
 }

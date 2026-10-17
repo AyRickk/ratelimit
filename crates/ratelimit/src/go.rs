@@ -75,6 +75,52 @@ pub fn format_float(v: f64) -> String {
     format!("{v}")
 }
 
+/// `path.Clean` (and `filepath.Clean` on Unix): the shortest equivalent path, lexically.
+pub fn clean(path: &str) -> String {
+    if path.is_empty() {
+        return ".".into();
+    }
+    let rooted = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != "..") => {
+                parts.pop();
+            }
+            ".." if rooted => {}
+            part => parts.push(part),
+        }
+    }
+    let cleaned = parts.join("/");
+    match (rooted, cleaned.is_empty()) {
+        (true, _) => format!("/{cleaned}"),
+        (false, true) => ".".into(),
+        (false, false) => cleaned,
+    }
+}
+
+/// `filepath.Join` on Unix: the non-empty elements joined with `/`, then cleaned; empty when
+/// all are empty.
+pub fn join(elements: &[&str]) -> String {
+    let joined = elements
+        .iter()
+        .filter(|e| !e.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/");
+    if joined.is_empty() {
+        return String::new();
+    }
+    clean(&joined)
+}
+
+/// `filepath.Dir` on Unix: everything before the last `/`, cleaned.
+pub fn dir(path: &str) -> String {
+    let i = path.rfind('/').map_or(0, |i| i + 1);
+    clean(&path[..i])
+}
+
 /// Why a `strconv` parser failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumError {

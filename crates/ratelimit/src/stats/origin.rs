@@ -116,7 +116,7 @@ fn cgroup_inode(mount: &Path, cgroup: &str) -> Option<String> {
     }
     ["memory", ""].into_iter().find_map(|controller| {
         let node = paths.get(controller)?;
-        let path = go_path_join(&[&mount.to_string_lossy(), controller, node]);
+        let path = crate::go::join(&[&mount.to_string_lossy(), controller, node]);
         inode(Path::new(&path)).map(|inode| format!("in-{inode}"))
     })
 }
@@ -130,35 +130,4 @@ fn inode(path: &Path) -> Option<u64> {
 #[cfg(not(unix))]
 fn inode(_: &Path) -> Option<u64> {
     None
-}
-
-/// Go's `path.Join`: the non-empty elements joined with `/`, then cleaned.
-fn go_path_join(elements: &[&str]) -> String {
-    let joined = elements
-        .iter()
-        .filter(|e| !e.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join("/");
-    if joined.is_empty() {
-        return String::new();
-    }
-    let rooted = joined.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for part in joined.split('/') {
-        match part {
-            "" | "." => {}
-            ".." if parts.last().is_some_and(|p| *p != "..") => {
-                parts.pop();
-            }
-            ".." if rooted => {}
-            part => parts.push(part),
-        }
-    }
-    let cleaned = parts.join("/");
-    match (rooted, cleaned.is_empty()) {
-        (true, _) => format!("/{cleaned}"),
-        (false, true) => ".".into(),
-        (false, false) => cleaned,
-    }
 }

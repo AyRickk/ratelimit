@@ -63,11 +63,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `PROMETHEUS_PATH` | `/metrics` | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
 | `PROMETHEUS_MAPPER_YAML` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
 | `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
-| `RUNTIME_ROOT` | `/srv/runtime_data/current` | ⬜ | |
-| `RUNTIME_SUBDIRECTORY` | — | ⬜ | |
-| `RUNTIME_APPDIRECTORY` | `config` | ⬜ | |
-| `RUNTIME_IGNOREDOTFILES` | `false` | ⬜ | |
-| `RUNTIME_WATCH_ROOT` | `true` | ⬜ | |
+| `RUNTIME_ROOT` | `/srv/runtime_data/current` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `RUNTIME_SUBDIRECTORY` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `RUNTIME_APPDIRECTORY` | `config` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `RUNTIME_IGNOREDOTFILES` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `RUNTIME_WATCH_ROOT` | `true` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
 | `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
 | `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not wired into the binary yet |
 | `NEAR_LIMIT_RATIO` | `0.8` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
@@ -167,8 +167,10 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
 | Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
 | Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
+| YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL as a line break | ✅ | `tests/differential.rs` |
+| Quoted scalars continued on less indented lines: accepted by yaml.v2, refused by the Rust parser | ⬜ | |
 | Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
-| File provider: goruntime, `SymlinkRefresher` / `DirectoryRefresher`, `runtime.*` scope | ⬜ | |
+| File provider: goruntime's loader (snapshot keys, dotfiles, symlinks, failures, nil loader), `SymlinkRefresher` / `DirectoryRefresher` on inotify events, reload coalescing, `runtime` scope | ✅ | snapshots and the first load: `tests/differential.rs`; reloads: `tests/differential.rs` on Linux (inotify, as upstream's fsnotify) |
 | xDS SotW provider (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
 
 ## 3. gRPC and HTTP API
@@ -213,7 +215,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ✅ | `tests/differential.rs` |
 | `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
 | `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
-| `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.*` | ⬜ | |
+| `runtime.load_attempts`, `runtime.load_failures` (with `EXTRA_TAGS`, `reserved_tag` counted again) | ✅ | `tests/differential.rs` |
+| `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.num_values` (gauges) | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
 | DogStatsD (+ mogrifiers, global tags, origin detection) | ✅ | lines and tags: `tests/differential.rs`; datagrams, `int64` values, mogrifier rules and errors, origin detection: `tests/dogstatsd.rs` |
 | Native Prometheus + statsd_exporter mapper: counters, gauges, histograms, TTLs, self-metrics, scrape answers | ✅ | mapper (loading, globs, regexes, templates) against statsd_exporter itself, series, text format, Gather errors, HTTP answers: `tests/differential.rs`; what panics upstream: `tests/prometheus.rs` |
@@ -257,6 +260,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A Prometheus mapper template with `%` directives using flags, widths or precisions (e.g. `%5s`) next to a `$n` is formatted by Go's `fmt` | printed as an unknown verb (`%!5(string=…)`) | not worth porting `fmt`; `%s`, `%v`, `%q`, `%x`, `%X`, `%T`, other verbs, `%%` and missing or extra arguments match |
 | `PROMETHEUS_ADDR` with a service name for its port (`:http`) listens on that port | nothing listens | not needed by the targeted deployments |
 | An `Accept` header with more than 12 clauses of equal weight is ordered by Go's pdqsort | kept in order | the order only matters for the `escaping` parameter |
+| Off Linux, fsnotify watches the runtime directory with kqueue | polled every 100 ms (development only: the image is Linux, where both use inotify) | not a deployment target |
+| A runtime directory that cannot be watched: the error names Go's errno (`no such file or directory (syscall.Errno 0x2)`) | the same form, with the C library's text for the errno | matches glibc's texts for common errors |
+| U+2028 and U+2029 also break lines in YAML 1.1 (kept as characters in scalars) | characters only | the Rust parser is YAML 1.2; converting them would change scalars |
+| yaml.v2 reads only the first YAML document of a file: a control character or invalid byte after a later `---` (and beyond its 512-byte read-ahead) is not seen; and it decodes as it parses, so a syntax error before a bad byte further on is reported first | the whole file is checked first | rare inputs; the file is refused either way in the second case |
+| A snapshot's files are loaded in Go's random map order (which decides which error is reported, or the merge order) | in key order | one of upstream's orders, deterministic |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
