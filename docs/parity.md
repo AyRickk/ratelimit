@@ -188,9 +188,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
-| `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
+| `/json` (any method): protojson, 200 / 429 / 400 / 500 | ⬜ | |
 | SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
-| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
+| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404); what Go's server answers itself (bad escapes, `Host` checks, `OPTIONS *`) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_http_server_reads_requests_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
 | `grpc.health.v1`, service `ratelimit` | ✅ | `tests/differential.rs` (`health_is_reported_like_upstream`, `sigterm_turns_health_off_like_upstream`), `tests/health.rs` |
 | Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
 | `GRPC_UDS` | ✅ | `tests/differential.rs` |
@@ -218,7 +218,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ✅ | `tests/differential.rs` |
 | `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ✅ | `tests/differential.rs` |
 | `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
-| `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
+| `ratelimit_server.<method>.total_requests` / `response_time` (health `Check` and `List` included) | ⬜ | |
 | `runtime.load_attempts`, `runtime.load_failures` (with `EXTRA_TAGS`, `reserved_tag` counted again) | ✅ | `tests/differential.rs` |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.num_values` (gauges) | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
@@ -289,6 +289,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
 | statsd buffers are cut at the same line boundaries as gostats' but are not timed alike (gostats also pushes its buffer every second), so while the server is unreachable which lines are dropped can differ; the queue is bounded alike (about 4 MiB) | buffers pushed only when full or flushed | Not observable while the server is reachable |
-| A request Go's HTTP server cannot parse (e.g. a raw space in the path) gets `400 Bad Request` with a text body | hyper's empty 400 | different HTTP server; both refuse the request |
-| A gRPC health `Watch` stream that falls behind gets only the latest status (grpc-go keeps one pending update) | every change, in order, duplicates skipped | the final status is the same; intermediate ones are not lost |
-| `POST /json` serves the protojson API | 404 until its slice lands | not yet ported (see §3) |
+| Go's server refuses some requests itself with a `400` closed by the connection (no `Content-Length`); among them a request line it cannot parse (e.g. a raw space in the target) or an invalid header name or value | the same answers with a `Content-Length` for a bad `%` escape and a missing or malformed `Host`; hyper's empty `400` for the others | Different HTTP server; both refuse the request, and the bodies read alike |
+| A gRPC health `Watch` stream that falls behind gets only the latest status (grpc-go keeps one pending update) | every change in order, duplicates skipped; past 64 pending changes the oldest are dropped | The final status is the same |
+| A request target with a fragment (`/healthcheck#x`) keeps it in the path, so it is not found | the fragment is dropped (hyper's URI parser) | Clients do not send fragments |
+| With `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, a lost connection is noticed when radix next uses it (a command, or its PING every 5 s / pool size) | as soon as the socket closes | Earlier, not different: the same states in the same order |

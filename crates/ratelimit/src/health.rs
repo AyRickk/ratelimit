@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
-/// Redis: unhealthy until its connection is confirmed at startup.
+/// Redis: unhealthy until its connection is confirmed at startup, and with
+/// `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, whenever no connection is left.
 pub const REDIS: &str = "redis";
 /// The config: with `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED`, unhealthy until a config with
 /// domains loads.
@@ -98,7 +99,8 @@ impl Health for HealthService {
     type WatchStream = WatchStream;
 
     /// The current status (`SERVICE_UNKNOWN` for a service never set), then each change;
-    /// a status equal to the last one sent is skipped.
+    /// a status equal to the last one sent is skipped. The stream ends as soon as its client
+    /// goes away.
     async fn watch(
         &self,
         request: Request<HealthCheckRequest>,
@@ -127,7 +129,11 @@ impl Health for HealthService {
                         return;
                     }
                 }
-                match updates.recv().await {
+                let update = tokio::select! {
+                    update = updates.recv() => update,
+                    () = sender.closed() => return,
+                };
+                match update {
                     Ok((name, status)) if name == service => next = Some(status),
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -204,5 +210,34 @@ impl HealthChecker {
                 .set_serving_status(SERVICE, ServingStatus::Serving);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Watch whose client went away stops listening at once, not at the next change.
+    #[tokio::test]
+    async fn watch_ends_with_its_client() {
+        let service = HealthService::default();
+        let request = Request::new(HealthCheckRequest {
+            service: SERVICE.into(),
+        });
+        let mut stream = service.watch(request).await.unwrap().into_inner();
+        // Once the first status is read, the task waits for the next change.
+        tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.updates.receiver_count(), 1);
+        drop(stream);
+        for _ in 0..100 {
+            if service.updates.receiver_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the Watch task outlived its client");
     }
 }

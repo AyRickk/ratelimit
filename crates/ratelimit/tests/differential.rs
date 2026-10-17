@@ -4390,7 +4390,12 @@ async fn sigterm_turns_health_off_like_upstream() {
             service: "ratelimit".into(),
         };
         let mut watch = client.watch(request).await.unwrap().into_inner();
-        let first = watch.message().await.unwrap().unwrap().status;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), watch.message())
+            .await
+            .expect("no initial health status")
+            .unwrap()
+            .unwrap()
+            .status;
         let pid = service._process.id().unwrap().to_string();
         assert!(
             std::process::Command::new("kill")
@@ -4469,5 +4474,93 @@ async fn redis_connections_drive_health_like_upstream() {
             }
             assert_eq!(status, expected, "{} with active={active}", service.grpc);
         }
+        if !active {
+            continue;
+        }
+        // Redis back on the same port: healthy again once the pool reconnects.
+        let mut restarted = Vec::new();
+        for redis in &redis {
+            let port = redis.address.rsplit_once(':').unwrap().1.parse().unwrap();
+            restarted.push(Redis::start_on(port).await.expect("Redis restarted"));
+        }
+        let mut recovered = Vec::new();
+        for service in &services {
+            let mut status = 0;
+            for _ in 0..150 {
+                status = http_request(&service.http, "GET", "/healthcheck", &[])
+                    .await
+                    .status;
+                if status == 200 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            recovered.push(status);
+        }
+        assert_eq!(recovered, [200, 200]);
+    }
+}
+
+/// Requests Go's HTTP server answers before routing (a bad escape, a missing or malformed
+/// Host, `OPTIONS *`) and the router's redirects for absolute-form targets and non-UTF-8
+/// paths are answered like upstream: the status line's code and reason, the headers but the
+/// date, and the body.
+#[tokio::test]
+async fn the_http_server_reads_requests_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let runtime = temp_dir("http");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (services, _redis) = both_services(|redis| binary_environment(&runtime, redis)).await;
+    for request in [
+        "GET /%zz HTTP/1.0\r\n\r\n",
+        "GET /a/../%zz HTTP/1.0\r\n\r\n",
+        "GET /healthcheck HTTP/1.1\r\nConnection: close\r\n\r\n",
+        "GET /healthcheck HTTP/1.1\r\nHost: a\"b\r\nConnection: close\r\n\r\n",
+        "GET /healthcheck HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        "OPTIONS * HTTP/1.0\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        "GET http://h:1/a/../healthcheck?q HTTP/1.0\r\n\r\n",
+        "GET http://h:1/healthcheck HTTP/1.0\r\n\r\n",
+        "GET /a/../%ff HTTP/1.0\r\n\r\n",
+        "HEAD /healthcheck HTTP/1.0\r\n\r\n",
+        "GET /nothing HTTP/1.0\r\n\r\n",
+    ] {
+        let mut answers = Vec::new();
+        for service in &services {
+            let mut stream = tokio::net::TcpStream::connect(&service.http).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("the connection is closed")
+            .unwrap();
+            let response = String::from_utf8_lossy(&response).into_owned();
+            let (head, body) = response.split_once("\r\n\r\n").expect("an HTTP answer");
+            let mut lines = head.lines();
+            // The code and reason; the version follows the request's in hyper.
+            let status = lines.next().unwrap()[9..].to_string();
+            // Go ends its own 400s by closing the connection; hyper sends a length too.
+            let refused = status.starts_with("400");
+            let mut headers: Vec<String> = lines
+                .map(str::to_ascii_lowercase)
+                .filter(|line| !line.starts_with("date:"))
+                .filter(|line| !(refused && line.starts_with("content-length:")))
+                .collect();
+            headers.sort();
+            answers.push((status, headers, body.to_string()));
+        }
+        assert_eq!(answers[1], answers[0], "{request:?}");
     }
 }

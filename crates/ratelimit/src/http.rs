@@ -9,8 +9,38 @@ use std::sync::Arc;
 /// An answer, before it becomes a hyper response.
 struct Answer {
     status: u16,
+    /// A reason phrase other than the status's own.
+    reason: Option<String>,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
+}
+
+impl Answer {
+    fn new(status: u16, headers: Vec<(&'static str, String)>, body: &[u8]) -> Self {
+        Self {
+            status,
+            reason: None,
+            headers,
+            body: body.to_vec(),
+        }
+    }
+
+    /// Go's server refusing a request before any handler (`conn.serve`): the connection is
+    /// closed, and with a reason, it follows the status in the status line and the body.
+    fn bad_request(reason: Option<&str>) -> Self {
+        let text = match reason {
+            Some(reason) => format!("Bad Request: {reason}"),
+            None => "Bad Request".into(),
+        };
+        let headers = vec![
+            ("content-type", "text/plain; charset=utf-8".into()),
+            ("connection", "close".into()),
+        ];
+        Self {
+            reason: reason.map(|_| text.clone()),
+            ..Self::new(400, headers, format!("400 {text}").as_bytes())
+        }
+    }
 }
 
 /// gorilla/mux's `cleanPath`: `path.Clean` of a rooted path, keeping a trailing slash.
@@ -29,42 +59,67 @@ fn clean_path(path: &str) -> String {
     clean
 }
 
-/// The router: a path that is not clean is redirected (301, no body), then `/healthcheck`
-/// answers, and anything else is not found. Any method is served.
-fn route(health: &HealthChecker, raw_path: &str, query: Option<&str>) -> Answer {
-    // Go matches the decoded path.
-    let path = crate::go::unescape(raw_path, false).unwrap_or_else(|| raw_path.to_string());
-    let clean = clean_path(&path);
+/// What Go's server checks before routing (`conn.readRequest`, `url.ParseRequestURI`), then
+/// `OPTIONS *` (answered by the server itself), then the router.
+fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Answer {
+    let uri = request.uri();
+    // Go's strings hold any bytes: each decoded byte is kept as one char, which `clean` and
+    // matching treat alike, and turned back into its byte when escaped.
+    let Some(path) = crate::go::unescape_bytes(uri.path(), false) else {
+        return Answer::bad_request(None);
+    };
+    let path: String = path.into_iter().map(char::from).collect();
+    let hosts = request.headers().get_all(hyper::header::HOST);
+    let mut hosts = hosts.iter();
+    let (first_host, more_hosts) = (hosts.next(), hosts.next().is_some());
+    if request.version() >= hyper::Version::HTTP_11
+        && first_host.is_none()
+        && request.method() != hyper::Method::CONNECT
+    {
+        return Answer::bad_request(Some("missing required Host header"));
+    }
+    if let Some(host) = first_host
+        && !more_hosts
+        && !host
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"!$%&'()*+,-.:;=[]_~".contains(b))
+    {
+        return Answer::bad_request(Some("malformed Host header"));
+    }
+    if request.method() == hyper::Method::OPTIONS && uri == "*" {
+        return Answer::new(200, Vec::new(), b"");
+    }
+    route(health, uri, &path)
+}
+
+/// The router on the decoded `path`: a path that is not clean is redirected (301, no body)
+/// to the URL with the clean path, then `/healthcheck` answers, and anything else is not
+/// found. Any method is served.
+fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Answer {
+    let clean = clean_path(path);
     if clean != path {
-        let mut location = crate::go::escape_path(&clean);
-        if let Some(query) = query {
+        // `url.URL.String`: the scheme and host of an absolute-form target are kept.
+        let mut location = match (uri.scheme_str(), uri.authority()) {
+            (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+            _ => String::new(),
+        };
+        let bytes: Vec<u8> = clean.chars().map(|c| c as u8).collect();
+        location += &crate::go::escape_path(&bytes);
+        if let Some(query) = uri.query() {
             location = format!("{location}?{query}");
         }
-        return Answer {
-            status: 301,
-            headers: vec![("location", location)],
-            body: Vec::new(),
-        };
+        return Answer::new(301, vec![("location", location)], b"");
     }
-    match path.as_str() {
-        "/healthcheck" if health.is_ok() => Answer {
-            status: 200,
-            headers: vec![("content-type", "text/plain; charset=utf-8".into())],
-            body: b"OK".to_vec(),
-        },
-        "/healthcheck" => Answer {
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-        },
-        _ => Answer {
-            status: 404,
-            headers: vec![
-                ("content-type", "text/plain; charset=utf-8".into()),
-                ("x-content-type-options", "nosniff".into()),
-            ],
-            body: b"404 page not found\n".to_vec(),
-        },
+    let text = || vec![("content-type", "text/plain; charset=utf-8".to_string())];
+    match path {
+        "/healthcheck" if health.is_ok() => Answer::new(200, text(), b"OK"),
+        "/healthcheck" => Answer::new(500, Vec::new(), b""),
+        _ => {
+            let mut headers = text();
+            headers.push(("x-content-type-options", "nosniff".into()));
+            Answer::new(404, headers, b"404 page not found\n")
+        }
     }
 }
 
@@ -80,6 +135,8 @@ pub async fn serve(
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
+            // Finished connections are reaped, or the set would keep each one.
+            Some(_) = connections.join_next() => continue,
             () = &mut stop => break,
         };
         let Ok((stream, _)) = accepted else {
@@ -88,9 +145,12 @@ pub async fn serve(
         let health = health.clone();
         connections.spawn(async move {
             let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
-                let uri = request.uri();
-                let answer = route(&health, uri.path(), uri.query());
+                let answer = respond(&health, &request);
                 let mut response = hyper::Response::builder().status(answer.status);
+                if let Some(reason) = answer.reason {
+                    let reason = hyper::ext::ReasonPhrase::try_from(reason.into_bytes());
+                    response = response.extension(reason.expect("a reason phrase from Go's"));
+                }
                 for (name, value) in answer.headers {
                     response = response.header(name, value);
                 }

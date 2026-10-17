@@ -10,7 +10,7 @@ use crate::runtime::{self, FileProvider};
 use crate::service::RateLimitService;
 use crate::settings::{Lookup, Settings};
 use crate::stats::{self, Stats};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// `logrus.ParseLevel`.
 fn check_log_level(level: &str) -> Result<(), String> {
@@ -61,27 +61,37 @@ async fn shutting_down(mut receiver: tokio::sync::watch::Receiver<bool>) {
 }
 
 /// `poolTrace` with `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`: Redis is healthy again on each new
-/// connection, unhealthy once none is left.
+/// connection, unhealthy once none is left. Like radix's active connection count, each
+/// client's connection is counted from its own events, all connected at first.
 fn follow_connections(pool: &fred::clients::Pool, health: Arc<HealthChecker>) {
-    use fred::interfaces::{ClientLike, EventInterface};
-    for client in pool.clients() {
+    use fred::interfaces::EventInterface;
+    use tokio::sync::broadcast::error::RecvError;
+    let connected = Arc::new(Mutex::new(vec![true; pool.clients().len()]));
+    for (index, client) in pool.clients().iter().enumerate() {
         let (mut reconnected, mut errors) = (client.reconnect_rx(), client.error_rx());
-        let (pool, health) = (pool.clone(), health.clone());
+        let (connected, health) = (connected.clone(), health.clone());
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    event = reconnected.recv() => match event {
-                        Ok(_) => { let _ = health.ok(health::REDIS); }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                        Err(_) => {}
-                    },
-                    event = errors.recv() => match event {
-                        Ok(_) if !pool.clients().iter().any(|c| c.is_connected()) => {
+                let event = tokio::select! {
+                    event = reconnected.recv() => event.map(|_| true),
+                    event = errors.recv() => event.map(|_| false),
+                };
+                match event {
+                    Ok(true) => {
+                        connected.lock().unwrap()[index] = true;
+                        let _ = health.ok(health::REDIS);
+                    }
+                    Ok(false) => {
+                        let mut connected = connected.lock().unwrap();
+                        // A failed reconnection closes nothing.
+                        if std::mem::replace(&mut connected[index], false)
+                            && !connected.contains(&true)
+                        {
                             let _ = health.fail(health::REDIS);
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                        _ => {}
-                    },
+                    }
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(_)) => {}
                 }
             }
         });

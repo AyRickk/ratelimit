@@ -184,6 +184,11 @@ pub fn split_host_port(address: &str) -> Result<(String, String), String> {
 /// `url.PathUnescape` (or `url.QueryUnescape` with `query`, where `+` is a space): `None` for
 /// a malformed `%` escape, as Go refuses it.
 pub fn unescape(s: &str, query: bool) -> Option<String> {
+    unescape_bytes(s, query).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`unescape`], keeping the bytes, which Go's strings need not be UTF-8.
+pub fn unescape_bytes(s: &str, query: bool) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -206,14 +211,14 @@ pub fn unescape(s: &str, query: bool) -> Option<String> {
             }
         }
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    Some(out)
 }
 
 /// `url.URL.EscapedPath` of an unescaped path: bytes outside `[A-Za-z0-9$&+,-./:;=@_~]` as
 /// `%XX`.
-pub fn escape_path(path: &str) -> String {
+pub fn escape_path(path: &[u8]) -> String {
     let mut out = String::with_capacity(path.len());
-    for b in path.bytes() {
+    for &b in path {
         if b.is_ascii_alphanumeric() || b"$&+,-./:;=@_~".contains(&b) {
             out.push(b as char);
         } else {
