@@ -313,3 +313,33 @@ async fn a_dropped_call_is_timed() {
         output.text()
     );
 }
+
+/// Gauges as gostats writes them: `name:value|g`; the logging sink's `"gauge"` line.
+#[tokio::test]
+async fn gauges_are_written_like_gostats() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    let sink = StatsdSink::new("127.0.0.1", port, StatsdProtocol::Udp);
+    sink.flush_gauge("a", 0);
+    sink.flush_gauge("b", u64::MAX);
+    sink.flush().await;
+    let mut buffer = vec![0; 65536];
+    let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buffer))
+        .await
+        .expect("a datagram")
+        .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&buffer[..n]).unwrap(),
+        "a:0|g\nb:18446744073709551615|g\n"
+    );
+
+    let output = Output::default();
+    logging_sink(&output).flush_gauge("g", 7);
+    assert_eq!(
+        output.text(),
+        concat!(
+            r#"{"level":"debug","ts":1700000000.123457,"logger":"gostats.loggingsink","msg":"flushing gauge","json":{"name":"g","type":"gauge","value":"7.000000"}}"#,
+            "\n"
+        )
+    );
+}

@@ -6,6 +6,8 @@
 //	N <size>               start a new cache of <size> bytes
 //	S <key> <ttl> <now>    Set(key, empty value, ttl) at Unix second <now>
 //	G <key> <now>          Get(key) at Unix second <now>; prints 1 (hit) or 0 (miss)
+//	C                      prints C and the cache's counts: evacuate, expired, entry, average
+//	                       access time, hit, miss, lookup, overwrite
 package main
 
 import (
@@ -46,6 +48,10 @@ func main() {
 		case "S":
 			clock.now = uint32(atoi(f[3]))
 			_ = cache.Set([]byte(f[1]), []byte{}, int(atoi(f[2])))
+		case "C":
+			fmt.Fprintln(out, "C", cache.EvacuateCount(), cache.ExpiredCount(), cache.EntryCount(),
+				cache.AverageAccessTime(), cache.HitCount(), cache.MissCount(), cache.LookupCount(),
+				cache.OverwriteCount())
 		case "G":
 			clock.now = uint32(atoi(f[2]))
 			if _, err := cache.Get([]byte(f[1])); err == nil {

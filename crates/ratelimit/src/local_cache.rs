@@ -57,6 +57,75 @@ impl LocalCache {
     fn segment(&self, hash: u64) -> std::sync::MutexGuard<'_, Segment> {
         self.segments[hash as usize % SEGMENTS].lock().unwrap()
     }
+
+    /// A count summed over the segments.
+    fn sum(&self, count: impl Fn(&Counts) -> i64) -> i64 {
+        self.segments
+            .iter()
+            .map(|s| count(&s.lock().unwrap().counts))
+            .sum()
+    }
+
+    /// `EvacuateCount`: entries dropped or moved to make room.
+    pub fn evacuate_count(&self) -> i64 {
+        self.sum(|c| c.evacuate)
+    }
+
+    /// `ExpiredCount`: expired entries found by a lookup or dropped to make room.
+    pub fn expired_count(&self) -> i64 {
+        self.sum(|c| c.expired)
+    }
+
+    /// `EntryCount`: the entries in the cache.
+    pub fn entry_count(&self) -> i64 {
+        self.sum(|c| c.entries)
+    }
+
+    /// `AverageAccessTime`: the mean access time of the entries in the ring buffers, deleted
+    /// ones included.
+    pub fn average_access_time(&self) -> i64 {
+        let (total_time, total_count) = self.segments.iter().fold((0, 0), |(t, c), s| {
+            let s = s.lock().unwrap();
+            (t + s.total_time, c + s.total_count)
+        });
+        if total_count == 0 {
+            0
+        } else {
+            total_time / total_count
+        }
+    }
+
+    /// `HitCount`.
+    pub fn hit_count(&self) -> i64 {
+        self.sum(|c| c.hits)
+    }
+
+    /// `MissCount`.
+    pub fn miss_count(&self) -> i64 {
+        self.sum(|c| c.misses)
+    }
+
+    /// `LookupCount`: hits and misses.
+    pub fn lookup_count(&self) -> i64 {
+        self.hit_count() + self.miss_count()
+    }
+
+    /// `OverwriteCount`: sets of a key already cached.
+    pub fn overwrite_count(&self) -> i64 {
+        self.sum(|c| c.overwrites)
+    }
+}
+
+/// A segment's counts (freecache's `missCount`, `hitCount`, `entryCount`, `totalEvacuate`,
+/// `totalExpired`, `overwrites`).
+#[derive(Debug, Default)]
+struct Counts {
+    misses: i64,
+    hits: i64,
+    entries: i64,
+    evacuate: i64,
+    expired: i64,
+    overwrites: i64,
 }
 
 /// freecache's `entryHdr`, 24 bytes, little-endian like the Go struct in memory.
@@ -125,6 +194,7 @@ struct Segment {
     slot_lens: [i32; SLOTS],
     slot_cap: i32,
     slots_data: Vec<EntryPtr>,
+    counts: Counts,
 }
 
 impl Segment {
@@ -137,6 +207,7 @@ impl Segment {
             slot_lens: [0; SLOTS],
             slot_cap: 1,
             slots_data: vec![EntryPtr::default(); SLOTS],
+            counts: Counts::default(),
         }
     }
 
@@ -182,6 +253,7 @@ impl Segment {
             // An empty value always fits: overwrite in place.
             self.total_time += i64::from(hdr.access_time) - i64::from(origin_access_time);
             self.rb.write_at(&hdr.encode(), ptr.offset);
+            self.counts.overwrites += 1;
             return;
         }
         hdr = EntryHeader {
@@ -239,32 +311,42 @@ impl Segment {
                 self.total_time -= i64::from(old_hdr.access_time);
                 self.total_count -= 1;
                 self.vacuum_len += old_entry_len;
+                if expired {
+                    self.counts.expired += 1;
+                } else {
+                    self.counts.evacuate += 1;
+                }
             } else {
                 let new_off = self.rb.evacuate(old_off, old_entry_len as usize);
                 self.update_entry_ptr(old_hdr.slot_id, old_hdr.hash16, old_off, new_off);
                 consecutive_evacuate += 1;
+                self.counts.evacuate += 1;
             }
         }
         slot_modified
     }
 
-    /// `seg.locate` without peeking: found and not expired. Refreshes the access time, and
-    /// removes an expired entry.
+    /// `seg.get` without peeking: found and not expired (a hit), else a miss. Refreshes the
+    /// access time, and removes an expired entry.
     fn locate(&mut self, key: &[u8], hash: u64, now: u32) -> bool {
         let (slot_id, hash16) = slot_and_hash16(hash);
         let (idx, matched) = self.lookup(slot_id, hash16, key);
         if !matched {
+            self.counts.misses += 1;
             return false;
         }
         let ptr = self.slots_data[self.slot_range(slot_id).start + idx];
         let mut hdr = self.read_header(ptr.offset);
         if is_expired(hdr.expire_at, now) {
             self.del_entry_ptr(slot_id, idx);
+            self.counts.expired += 1;
+            self.counts.misses += 1;
             return false;
         }
         self.total_time += i64::from(now.wrapping_sub(hdr.access_time));
         hdr.access_time = now;
         self.rb.write_at(&hdr.encode(), ptr.offset);
+        self.counts.hits += 1;
         true
     }
 
@@ -300,6 +382,7 @@ impl Segment {
             self.expand();
         }
         self.slot_lens[slot_id as usize] += 1;
+        self.counts.entries += 1;
         let range = self.slot_range(slot_id);
         let slot = &mut self.slots_data[range];
         slot.copy_within(idx..slot.len() - 1, idx + 1);
@@ -326,6 +409,7 @@ impl Segment {
         let slot = &mut self.slots_data[range];
         slot.copy_within(idx + 1.., idx);
         self.slot_lens[slot_id as usize] -= 1;
+        self.counts.entries -= 1;
     }
 
     /// `entryPtrIdx`: the first entry of the slot whose hash16 is not below `hash16`.

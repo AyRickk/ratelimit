@@ -1,5 +1,6 @@
 //! The local cache against the real freecache (`tools/oracle/freecache`): the same random
-//! operations replayed on both, every `Get` compared. Covers eviction paths the service-level
+//! operations replayed on both, every `Get` compared, and the counts upstream reports as
+//! `localcache.*` gauges. Covers eviction paths the service-level
 //! differential tests cannot reach: expired entries, overwrites, crowded segments and slots,
 //! keys around the size limit, and the 32-bit clock wrap.
 //!
@@ -29,8 +30,17 @@ impl Rng {
 }
 
 enum Op {
-    Set { key: String, ttl: i64, now: i64 },
-    Get { key: String, now: i64 },
+    Set {
+        key: String,
+        ttl: i64,
+        now: i64,
+    },
+    Get {
+        key: String,
+        now: i64,
+    },
+    /// The cache's counts.
+    Counts,
 }
 
 struct Trace {
@@ -107,11 +117,16 @@ fn trace(seed: u64, mode: u64) -> Trace {
         } else {
             ops.push(Op::Get { key, now });
         }
+        if ops.len() % 500 == 0 {
+            ops.push(Op::Counts);
+        }
     }
+    ops.push(Op::Counts);
     Trace { size, ops }
 }
 
-fn replay_in_rust(trace: &Trace) -> Vec<bool> {
+/// What each `Get` and `Counts` gives, as the oracle prints it.
+fn replay_in_rust(trace: &Trace) -> Vec<String> {
     let cache = LocalCache::new(trace.size);
     trace
         .ops
@@ -121,12 +136,23 @@ fn replay_in_rust(trace: &Trace) -> Vec<bool> {
                 cache.insert(key, *ttl, *now);
                 None
             }
-            Op::Get { key, now } => Some(cache.contains(key, *now)),
+            Op::Get { key, now } => Some(if cache.contains(key, *now) { "1" } else { "0" }.into()),
+            Op::Counts => Some(format!(
+                "C {} {} {} {} {} {} {} {}",
+                cache.evacuate_count(),
+                cache.expired_count(),
+                cache.entry_count(),
+                cache.average_access_time(),
+                cache.hit_count(),
+                cache.miss_count(),
+                cache.lookup_count(),
+                cache.overwrite_count()
+            )),
         })
         .collect()
 }
 
-fn replay_in_freecache(traces: &[Trace]) -> Vec<bool> {
+fn replay_in_freecache(traces: &[Trace]) -> Vec<String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("target/freecache-oracle");
     let status = Command::new("go")
@@ -145,6 +171,7 @@ fn replay_in_freecache(traces: &[Trace]) -> Vec<bool> {
             match op {
                 Op::Set { key, ttl, now } => input += &format!("S {key} {ttl} {now}\n"),
                 Op::Get { key, now } => input += &format!("G {key} {now}\n"),
+                Op::Counts => input += "C\n",
             }
         }
     }
@@ -161,7 +188,7 @@ fn replay_in_freecache(traces: &[Trace]) -> Vec<bool> {
     String::from_utf8(output.stdout)
         .unwrap()
         .lines()
-        .map(|line| line == "1")
+        .map(String::from)
         .collect()
 }
 
@@ -187,16 +214,16 @@ fn local_cache_matches_freecache_on_random_operations() {
     let mut expected = expected.into_iter();
     for (i, trace) in traces.iter().enumerate() {
         let actual = replay_in_rust(trace);
-        let upstream: Vec<bool> = expected.by_ref().take(actual.len()).collect();
+        let upstream: Vec<String> = expected.by_ref().take(actual.len()).collect();
         let first_difference = actual.iter().zip(&upstream).position(|(a, u)| a != u);
         assert_eq!(
-            first_difference,
+            first_difference.map(|at| (&actual[at], &upstream[at])),
             None,
-            "trace {i} (seed {}, mode {}): first differing Get",
+            "trace {i} (seed {}, mode {}): first differing Get or counts",
             i / 4,
             i % 4
         );
         assert_eq!(actual.len(), upstream.len(), "trace {i}: number of Gets");
     }
-    assert!(expected.next().is_none(), "freecache answered more Gets");
+    assert!(expected.next().is_none(), "freecache answered more");
 }

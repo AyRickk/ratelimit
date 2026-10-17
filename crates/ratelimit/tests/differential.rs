@@ -6092,3 +6092,169 @@ mappings:
         .await;
     h.flush_to_prometheus(&[("timer", "hist.x", 1.0)]).await;
 }
+
+/// The latest value of each gauge and the sum of each counter in statsd `lines`, for the
+/// names `keep` selects.
+fn stat_values(lines: &[String], keep: impl Fn(&str) -> bool) -> BTreeMap<String, u64> {
+    let mut values = BTreeMap::new();
+    for line in lines {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if !keep(name) {
+            continue;
+        }
+        let (value, kind) = rest.split_once('|').unwrap();
+        let value: u64 = value.parse().unwrap();
+        match kind {
+            "g" => {
+                values.insert(format!("{name}|g"), value);
+            }
+            _ => *values.entry(format!("{name}|{kind}")).or_default() += value,
+        }
+    }
+    values
+}
+
+/// The gauges and pool stats upstream flushes like upstream: `runtime.num_values`, the local
+/// cache's counts (`localcache.*`, but its average access time, read from each side's clock),
+/// and the Redis pool's connections at startup and after Redis comes back.
+#[tokio::test]
+async fn gauges_are_reported_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("gauges");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            // Two files with the same key count once; dotfiles are ignored.
+            ("v1/ratelimit/other/b", b"1"),
+            ("v1/ratelimit/other.b", b"2"),
+            ("v1/ratelimit/other/c", b"3"),
+            ("v1/ratelimit/.hidden", b"4"),
+            ("current", b"->v1"),
+        ],
+    );
+    let servers = [StatsdServer::start().await, StatsdServer::start().await];
+    let redis = [Redis::start().await, Redis::start().await];
+    let mut services = Vec::new();
+    for ((binary, redis), server) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&redis)
+    .zip(&servers)
+    {
+        let mut environment = binary_environment(&runtime, redis);
+        environment.extend([
+            ("DISABLE_STATS", "false".to_string()),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+            ("STATSD_HOST", "127.0.0.1".into()),
+            ("STATSD_PORT", server.address.port().to_string()),
+            ("RUNTIME_IGNOREDOTFILES", "true".into()),
+            ("REDIS_POOL_SIZE", "2".into()),
+            ("LOCAL_CACHE_SIZE_IN_BYTES", "1048576".into()),
+        ]);
+        services.push(Service::start(binary, &environment).await);
+    }
+    // Over the limit (2 a minute): the key goes to the local cache, then hits it.
+    for service in &services {
+        let mut client = service.client().await;
+        for user in ["a", "a", "a", "a", "a", "b"] {
+            client
+                .should_rate_limit(request("llm", &[&[("user", user)]]))
+                .await
+                .unwrap();
+        }
+    }
+    let values = settled_gauges(&servers, |v| {
+        v.get("ratelimit.localcache.hitCount|g") == Some(&3)
+    })
+    .await;
+    assert_eq!(values[1], values[0]);
+    assert_eq!(
+        values[0].get("runtime.num_values|g"),
+        Some(&3),
+        "{:?}",
+        values[0]
+    );
+    assert_eq!(
+        values[0].get("ratelimit.redis_pool.cx_active|g"),
+        Some(&2),
+        "{:?}",
+        values[0]
+    );
+
+    // Redis back on the same port: our pool replaces its two connections at once. Radix only
+    // finds a dead connection when it uses it (docs/parity.md §7), so upstream's count is not
+    // compared here.
+    for redis in &redis {
+        let _: Result<(), _> = redis
+            .client
+            .custom(
+                CustomCommand::new_static("SHUTDOWN", ClusterHash::Random, false),
+                vec!["NOSAVE"],
+            )
+            .await;
+    }
+    let mut restarted = Vec::new();
+    for redis in &redis {
+        let port = redis.address.rsplit_once(':').unwrap().1.parse().unwrap();
+        restarted.push(Redis::start_on(port).await.expect("Redis restarted"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let expected = [
+        ("ratelimit.redis_pool.cx_active|g", 2),
+        ("ratelimit.redis_pool.cx_local_close|c", 2),
+        ("ratelimit.redis_pool.cx_total|c", 4),
+    ];
+    let ours = loop {
+        let values = stat_values(&servers[1].lines.lock().unwrap(), |n| {
+            n.starts_with("ratelimit.redis_pool.")
+        });
+        let pool: Vec<(&str, u64)> = expected
+            .iter()
+            .map(|(k, _)| (*k, values.get(*k).copied().unwrap_or(0)))
+            .collect();
+        if pool == expected || std::time::Instant::now() > deadline {
+            break pool;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(ours, expected);
+}
+
+/// The pool, local cache and runtime stats of both statsd servers once they are the same and
+/// `expected` holds, or after 15 s; the local cache's average access time, read from each
+/// side's clock, as 0.
+async fn settled_gauges(
+    servers: &[StatsdServer; 2],
+    expected: impl Fn(&BTreeMap<String, u64>) -> bool,
+) -> Vec<BTreeMap<String, u64>> {
+    let keep = |name: &str| {
+        name.starts_with("ratelimit.redis_pool.")
+            || name.starts_with("ratelimit.localcache.")
+            || name == "runtime.num_values"
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let values: Vec<BTreeMap<String, u64>> = servers
+            .iter()
+            .map(|s| {
+                let mut v = stat_values(&s.lines.lock().unwrap(), keep);
+                if let Some(time) = v.get_mut("ratelimit.localcache.averageAccessTime|g") {
+                    *time = 0;
+                }
+                v
+            })
+            .collect();
+        if (values[0] == values[1] && expected(&values[0])) || std::time::Instant::now() > deadline
+        {
+            return values;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
