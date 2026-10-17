@@ -8,6 +8,7 @@ pub mod http;
 pub mod limiter;
 pub mod local_cache;
 pub mod net;
+pub mod protojson;
 pub mod redis;
 pub mod runner;
 pub mod runtime;

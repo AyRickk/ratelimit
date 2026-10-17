@@ -43,8 +43,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -69,6 +71,8 @@ import (
 	"github.com/prometheus/statsd_exporter/pkg/mapper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/godogstats"
@@ -302,6 +306,54 @@ func printRuntimeSnapshot() {
 	_ = encoder.Encode(map[string]any{"snapshot": snapshot, "counters": sink.counters})
 }
 
+// printProtojson decodes each stdin line, hex-encoded, with protojson.Unmarshal into a
+// RateLimitRequest, as upstream's /json handler does, and prints "ok" and the request's
+// deterministic binary encoding in hex, or "error".
+func printProtojson() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(nil, 1<<24)
+	for scanner.Scan() {
+		input, err := hex.DecodeString(scanner.Text())
+		if err != nil {
+			log.Fatal(err)
+		}
+		var request pb.RateLimitRequest
+		if protojson.Unmarshal(input, &request) != nil {
+			fmt.Println("error")
+			continue
+		}
+		encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(&request)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("ok", hex.EncodeToString(encoded))
+	}
+}
+
+// printProtojsonMarshal reads each stdin line, a RateLimitResponse's binary encoding in hex,
+// and prints "ok" and its protojson.Marshal, as upstream's /json handler writes it, or
+// "error".
+func printProtojsonMarshal() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(nil, 1<<24)
+	for scanner.Scan() {
+		input, err := hex.DecodeString(scanner.Text())
+		if err != nil {
+			log.Fatal(err)
+		}
+		var response pb.RateLimitResponse
+		if err := proto.Unmarshal(input, &response); err != nil {
+			log.Fatal(err)
+		}
+		encoded, err := protojson.Marshal(&response)
+		if err != nil {
+			fmt.Println("error")
+			continue
+		}
+		fmt.Println("ok", string(encoded))
+	}
+}
+
 // printSettings prints settings.NewSettings() as JSON, or its panic.
 func printSettings() {
 	encoder := json.NewEncoder(os.Stdout)
@@ -385,7 +437,17 @@ func main() {
 	printSettingsOnly := flag.Bool("settings", false, "print settings.NewSettings() as JSON and exit")
 	printSnapshotOnly := flag.Bool("runtime-snapshot", false, "print the runtime loader's first snapshot as JSON and exit")
 	useFileProvider := flag.Bool("file-provider", false, "load the config with upstream's file provider")
+	decodeProtojson := flag.Bool("protojson", false, "decode each stdin line (hex) as /json does and exit")
+	encodeProtojson := flag.Bool("protojson-marshal", false, "encode each stdin line (hex) as /json does and exit")
 	flag.Parse()
+	if *decodeProtojson {
+		printProtojson()
+		return
+	}
+	if *encodeProtojson {
+		printProtojsonMarshal()
+		return
+	}
 	if *printSettingsOnly {
 		printSettings()
 		return

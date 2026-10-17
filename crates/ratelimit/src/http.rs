@@ -1,9 +1,12 @@
 //! The service's HTTP server on `HOST:PORT` (`src/server/server_impl.go`): a gorilla/mux
-//! router with `/healthcheck`.
+//! router with `/healthcheck` and `/json`.
 
 use crate::health::HealthChecker;
+use crate::service::{RateLimitCache, RateLimitService};
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use http_body_util::Full;
+use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
 use std::sync::Arc;
 
 /// An answer, before it becomes a hyper response.
@@ -23,6 +26,15 @@ impl Answer {
             headers,
             body: body.to_vec(),
         }
+    }
+
+    /// `http.Error`: the status's text as plain text.
+    fn error(status: u16, text: &str) -> Self {
+        let headers = vec![
+            ("content-type", "text/plain; charset=utf-8".into()),
+            ("x-content-type-options", "nosniff".into()),
+        ];
+        Self::new(status, headers, format!("{text}\n").as_bytes())
     }
 
     /// Go's server refusing a request before any handler (`conn.serve`): the connection is
@@ -61,12 +73,12 @@ fn clean_path(path: &str) -> String {
 
 /// What Go's server checks before routing (`conn.readRequest`, `url.ParseRequestURI`), then
 /// `OPTIONS *` (answered by the server itself), then the router.
-fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Answer {
+fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Routed {
     let uri = request.uri();
     // Go's strings hold any bytes: each decoded byte is kept as one char, which `clean` and
     // matching treat alike, and turned back into its byte when escaped.
     let Some(path) = crate::go::unescape_bytes(uri.path(), false) else {
-        return Answer::bad_request(None);
+        return Routed::Answer(Answer::bad_request(None));
     };
     let path: String = path.into_iter().map(char::from).collect();
     let hosts = request.headers().get_all(hyper::header::HOST);
@@ -76,7 +88,7 @@ fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Answer {
         && first_host.is_none()
         && request.method() != hyper::Method::CONNECT
     {
-        return Answer::bad_request(Some("missing required Host header"));
+        return Routed::Answer(Answer::bad_request(Some("missing required Host header")));
     }
     if let Some(host) = first_host
         && !more_hosts
@@ -85,18 +97,27 @@ fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Answer {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || b"!$%&'()*+,-.:;=[]_~".contains(b))
     {
-        return Answer::bad_request(Some("malformed Host header"));
+        return Routed::Answer(Answer::bad_request(Some("malformed Host header")));
     }
     if request.method() == hyper::Method::OPTIONS && uri == "*" {
-        return Answer::new(200, Vec::new(), b"");
+        return Routed::Answer(Answer::new(200, Vec::new(), b""));
     }
     route(health, uri, &path)
 }
 
+/// The largest `/json` body read: grpc-go's default largest message.
+const MAX_JSON_BODY: usize = 4 << 20;
+
+/// Where a request goes: answered at once, or to `/json`, which reads its body.
+enum Routed {
+    Answer(Answer),
+    Json,
+}
+
 /// The router on the decoded `path`: a path that is not clean is redirected (301, no body)
-/// to the URL with the clean path, then `/healthcheck` answers, and anything else is not
-/// found. Any method is served.
-fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Answer {
+/// to the URL with the clean path, then `/healthcheck` and `/json` answer, and anything else
+/// is not found. Any method is served.
+fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Routed {
     let clean = clean_path(path);
     if clean != path {
         // `url.URL.String`: the scheme and host of an absolute-form target are kept.
@@ -109,25 +130,46 @@ fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Answer {
         if let Some(query) = uri.query() {
             location = format!("{location}?{query}");
         }
-        return Answer::new(301, vec![("location", location)], b"");
+        return Routed::Answer(Answer::new(301, vec![("location", location)], b""));
     }
     let text = || vec![("content-type", "text/plain; charset=utf-8".to_string())];
-    match path {
+    Routed::Answer(match path {
         "/healthcheck" if health.is_ok() => Answer::new(200, text(), b"OK"),
         "/healthcheck" => Answer::new(500, Vec::new(), b""),
-        _ => {
-            let mut headers = text();
-            headers.push(("x-content-type-options", "nosniff".into()));
-            Answer::new(404, headers, b"404 page not found\n")
-        }
-    }
+        "/json" => return Routed::Json,
+        _ => Answer::error(404, "404 page not found"),
+    })
+}
+
+/// `NewJsonHandler`: the body as a `RateLimitRequest` in protojson, answered by the service
+/// (400 for any error) in protojson: 429 when over the limit, 500 for an unknown code or a
+/// response protojson cannot write.
+async fn json<C: RateLimitCache>(service: &RateLimitService<C>, body: Option<Bytes>) -> Answer {
+    let bad_request = || Answer::error(400, "Bad Request");
+    let Some(request) = body.and_then(|body| crate::protojson::decode_request(&body).ok()) else {
+        return bad_request();
+    };
+    let Ok(response) = service.should_rate_limit(&request).await else {
+        return bad_request();
+    };
+    let Ok(body) = crate::protojson::encode_response(&response) else {
+        return Answer::error(500, "Internal Server Error");
+    };
+    let status = match response.overall_code() {
+        Code::Unknown => 500,
+        Code::OverLimit => 429,
+        Code::Ok => 200,
+    };
+    let headers = vec![("content-type", "application/json".to_string())];
+    Answer::new(status, headers, body.as_bytes())
 }
 
 /// Serves HTTP/1 requests from `listener` until `stop` resolves, then closes at once (Go's
 /// `http.Server.Close`).
-pub async fn serve(
+pub async fn serve<C: RateLimitCache>(
     listener: tokio::net::TcpListener,
     health: Arc<HealthChecker>,
+    service: Arc<RateLimitService<C>>,
     stop: impl std::future::Future<Output = ()>,
 ) {
     tokio::pin!(stop);
@@ -142,26 +184,46 @@ pub async fn serve(
         let Ok((stream, _)) = accepted else {
             continue;
         };
-        let health = health.clone();
+        let (health, service) = (health.clone(), service.clone());
         connections.spawn(async move {
-            let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
-                let answer = respond(&health, &request);
-                let mut response = hyper::Response::builder().status(answer.status);
-                if let Some(reason) = answer.reason {
-                    let reason = hyper::ext::ReasonPhrase::try_from(reason.into_bytes());
-                    response = response.extension(reason.expect("a reason phrase from Go's"));
+            let handler = hyper::service::service_fn(move |request| {
+                let (health, service) = (health.clone(), service.clone());
+                async move {
+                    let response = respond_to(&health, &service, request).await;
+                    Ok::<_, std::convert::Infallible>(response)
                 }
-                for (name, value) in answer.headers {
-                    response = response.header(name, value);
-                }
-                let response = response.body(Full::new(Bytes::from(answer.body))).unwrap();
-                async move { Ok::<_, std::convert::Infallible>(response) }
             });
             let io = hyper_util::rt::TokioIo::new(stream);
             let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
+                .serve_connection(io, handler)
                 .await;
         });
     }
     connections.abort_all();
+}
+
+/// The response to `request`.
+async fn respond_to<C: RateLimitCache>(
+    health: &HealthChecker,
+    service: &RateLimitService<C>,
+    request: hyper::Request<hyper::body::Incoming>,
+) -> hyper::Response<Full<Bytes>> {
+    let answer = match respond(health, &request) {
+        Routed::Answer(answer) => answer,
+        Routed::Json => {
+            // Upstream reads any length; past the size gRPC refuses, the body is refused.
+            let body = http_body_util::Limited::new(request.into_body(), MAX_JSON_BODY);
+            let body = body.collect().await.ok();
+            json(service, body.map(|body| body.to_bytes())).await
+        }
+    };
+    let mut response = hyper::Response::builder().status(answer.status);
+    if let Some(reason) = answer.reason {
+        let reason = hyper::ext::ReasonPhrase::try_from(reason.into_bytes());
+        response = response.extension(reason.expect("a reason phrase from Go's"));
+    }
+    for (name, value) in answer.headers {
+        response = response.header(name, value);
+    }
+    response.body(Full::new(Bytes::from(answer.body))).unwrap()
 }

@@ -4564,3 +4564,771 @@ async fn the_http_server_reads_requests_like_upstream() {
         assert_eq!(answers[1], answers[0], "{request:?}");
     }
 }
+
+/// `/json`'s decoding (`protojson.Unmarshal` into a `RateLimitRequest`) accepts and rejects
+/// what upstream's does, into the same request: JSON syntax, field names, `null`, numbers,
+/// enums, strings and their escapes.
+#[test]
+fn json_requests_are_decoded_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut inputs: Vec<Vec<u8>> = [
+        // Syntax.
+        "",
+        " ",
+        "{}",
+        " {} ",
+        "{}\n",
+        "{} {}",
+        "{},",
+        "{}x",
+        "[]",
+        "null",
+        "{",
+        "}",
+        "{\"domain\":\"d\",}",
+        "{,}",
+        "{\"domain\" \"d\"}",
+        "{\"domain\":}",
+        "{\"domain\":\"a\" \"descriptors\":[]}",
+        "\t{\r\n\"domain\"\t:\n\"d\"\r}",
+        "{\"domain\":\"d\"}\u{0}",
+        "\u{feff}{}",
+        "{}\u{b}",
+        // Field names: either form, once; no unknown or extension names.
+        "{\"hitsAddend\":1}",
+        "{\"hits_addend\":1}",
+        "{\"hitsAddend\":1,\"hits_addend\":2}",
+        "{\"domain\":\"a\",\"domain\":\"b\"}",
+        "{\"Domain\":\"a\"}",
+        "{\"other\":1}",
+        "{\"[x.y]\":1}",
+        "{\"hitsaddend\":1}",
+        "{\"dom\\u0061in\":\"a\"}",
+        // null: unset, but the field counts as seen.
+        "{\"domain\":null}",
+        "{\"domain\":null,\"domain\":\"a\"}",
+        "{\"descriptors\":null}",
+        "{\"descriptors\":[null]}",
+        "{\"descriptors\":[{\"limit\":null,\"hitsAddend\":null}]}",
+        "{\"descriptors\":[{\"entries\":[null]}]}",
+        "{\"hitsAddend\":null}",
+        // Lists and messages.
+        "{\"descriptors\":[]}",
+        "{\"descriptors\":[[]]}",
+        "{\"descriptors\":{}}",
+        "{\"descriptors\":[{},{}]}",
+        "{\"descriptors\":[{\"entries\":[{\"key\":\"k\",\"value\":\"v\"},{\"key\":\"k2\"}]}]}",
+        "{\"descriptors\":[{\"entries\":[{\"key\":1}]}]}",
+        "{\"descriptors\":[{\"entries\":[{\"key\":\"k\",\"x\":1}]}]}",
+        "{\"descriptors\":[{\"limit\":{\"requestsPerUnit\":5,\"unit\":\"SECOND\"}}]}",
+        "{\"descriptors\":[{\"limit\":{\"requests_per_unit\":\"5\",\"unit\":2}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":\"second\"}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":\"WEEK\"}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":99}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":-1}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":\"2\"}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":2.0}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":2147483648}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":-2147483648}}]}",
+        "{\"descriptors\":[{\"limit\":{\"unit\":true}}]}",
+        "{\"descriptors\":[{\"limit\":[]}]}",
+        "{\"descriptors\":[{\"isNegativeHits\":true}]}",
+        "{\"descriptors\":[{\"is_negative_hits\":false}]}",
+        "{\"descriptors\":[{\"isNegativeHits\":\"true\"}]}",
+        "{\"descriptors\":[{\"isNegativeHits\":1}]}",
+        "{\"descriptors\":[{\"hitsAddend\":\"18446744073709551615\"}]}",
+        "{\"descriptors\":[{\"hitsAddend\":18446744073709551616}]}",
+        "{\"descriptors\":[{\"hitsAddend\":0}]}",
+        "{\"descriptors\":[{\"hitsAddend\":{\"value\":1}}]}",
+        // Strings: escapes, surrogates, UTF-8, control characters.
+        "{\"domain\":\"a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\"}",
+        "{\"domain\":\"\\u00e9\\u0000\"}",
+        "{\"domain\":\"\\u00E9\"}",
+        "{\"domain\":\"\\ud83d\\ude00\"}",
+        "{\"domain\":\"\\ud83d\"}",
+        "{\"domain\":\"\\ude00\\ud83d\"}",
+        "{\"domain\":\"\\ud83d\\u0041\"}",
+        "{\"domain\":\"\\ud83dx\\ude00\"}",
+        "{\"domain\":\"\\u12\"}",
+        "{\"domain\":\"\\u12g4\"}",
+        "{\"domain\":\"\\x\"}",
+        "{\"domain\":\"\\'\"}",
+        "{\"domain\":\"a\tb\"}",
+        "{\"domain\":\"a\u{7f}b\"}",
+        "{\"domain\":\"é😀\u{fffd}\"}",
+        "{\"domain\":\"a",
+        "{\"domain\":\"a\\",
+        "{\"domain\":\"\\ud83d\\ude0",
+        // Literals.
+        "{\"descriptors\":[{\"isNegativeHits\":truex}]}",
+        "{\"descriptors\":[{\"isNegativeHits\":tru}]}",
+        "{\"domain\":nul}",
+        "{\"domain\":nullx}",
+        "{\"domain\":NULL}",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .collect();
+    inputs.extend([
+        b"{\"domain\":\"\xff\"}".to_vec(),
+        b"{\"domain\":\"\xc3\"}".to_vec(),
+        b"{\"domain\":\"\xed\xa0\x80\"}".to_vec(),
+        b"{\"domain\":\"\xc0\xaf\"}".to_vec(),
+        b"{\"\xff\":1}".to_vec(),
+    ]);
+    // Numbers, bare and in strings, in each kind of numeric field.
+    let numbers = [
+        "0",
+        "-0",
+        "1",
+        "01",
+        "-1",
+        "1.0",
+        "1.5",
+        "1.",
+        ".5",
+        "1e2",
+        "1E2",
+        "1e+2",
+        "1e-2",
+        "10e-1",
+        "100e-2",
+        "1e",
+        "1e+",
+        "1e-",
+        "1ex",
+        "1.0e1",
+        "0.5e1",
+        "0.05e1",
+        "5e-1",
+        "0e5",
+        "-0.0",
+        "1e010",
+        "1e08",
+        "4294967295",
+        "4294967296",
+        "18446744073709551615",
+        "18446744073709551616",
+        "1e19",
+        "1e20",
+        "2e19",
+        "1e99999999999",
+        "15e-1",
+        "-15e-1",
+        "100e-1",
+        "+1",
+        "0x10",
+        "1_000",
+        "Infinity",
+        "NaN",
+        "-",
+    ];
+    for number in numbers {
+        for template in [
+            "{\"hitsAddend\":N}",
+            "{\"hitsAddend\":\"N\"}",
+            "{\"descriptors\":[{\"hitsAddend\":N}]}",
+            "{\"descriptors\":[{\"hitsAddend\":\"N\"}]}",
+            "{\"descriptors\":[{\"limit\":{\"unit\":N}}]}",
+        ] {
+            inputs.push(template.replace('N', number).into_bytes());
+        }
+    }
+    // A number then a delimiter: the tokenizer takes `1e`, `1e+` as numbers.
+    for tail in ["1e,", "1e]", "1e}", "1e ", "1e+,", "1e-}", "1.5e,"] {
+        inputs.push(format!("{{\"hitsAddend\":{tail}\"domain\":\"d\"}}").into_bytes());
+        inputs.push(
+            format!("{{\"descriptors\":[{{\"hitsAddend\":{tail}\"entries\":[]}}]}}").into_bytes(),
+        );
+    }
+    // Strings holding numbers: no space around, only the first token counts.
+    for text in [
+        "\\u0031",
+        "\\u00312",
+        "\\u0020\\u0031",
+        " 1",
+        "1 ",
+        "1 2",
+        "1,2",
+        "1}",
+        "1]",
+        "1\u{b}2",
+        "1\u{a0}",
+        "\u{a0}1",
+        "1\u{2028}",
+        "\"1\"",
+        "[1]",
+        "",
+        "1e,",
+    ] {
+        let text = text.replace('"', "\\\"");
+        inputs.push(format!("{{\"hitsAddend\":\"{text}\"}}").into_bytes());
+    }
+
+    // Generated: fragments of the schema and of JSON put together at random (a fixed seed).
+    let fragments = [
+        "{",
+        "}",
+        "[",
+        "]",
+        ",",
+        ":",
+        " ",
+        "\"domain\"",
+        "\"descriptors\"",
+        "\"entries\"",
+        "\"key\"",
+        "\"value\"",
+        "\"limit\"",
+        "\"unit\"",
+        "\"requestsPerUnit\"",
+        "\"hitsAddend\"",
+        "\"hits_addend\"",
+        "\"isNegativeHits\"",
+        "\"SECOND\"",
+        "\"d\"",
+        "\"\\u00e9\"",
+        "null",
+        "true",
+        "false",
+        "0",
+        "1",
+        "-1",
+        "1e2",
+        "1.5",
+        "\"7\"",
+        "4294967296",
+        "{}",
+        "[]",
+    ];
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    for _ in 0..3000 {
+        let mut input = String::from("{\"descriptors\":[{");
+        for _ in 0..1 + next(12) {
+            input += fragments[next(fragments.len())];
+        }
+        if next(2) == 0 {
+            input += "}]}";
+        }
+        inputs.push(input.into_bytes());
+    }
+    // Generated objects: each field under either name (or an unknown one), any kind of value.
+    let values = [
+        "null",
+        "true",
+        "false",
+        "0",
+        "-0",
+        "7",
+        "1e1",
+        "1.0",
+        "4294967295",
+        "4294967296",
+        "\"3\"",
+        "\" 3\"",
+        "\"SECOND\"",
+        "\"DAY\"",
+        "\"x\"",
+        "\"\\ud83d\\ude00\"",
+        "{}",
+        "[]",
+        "[{}]",
+        "{\"key\":\"k\"}",
+        "[{\"key\":\"k\",\"value\":\"v\"}]",
+        "18446744073709551615",
+    ];
+    let names = [
+        "domain",
+        "descriptors",
+        "hitsAddend",
+        "hits_addend",
+        "entries",
+        "limit",
+        "isNegativeHits",
+        "is_negative_hits",
+        "requestsPerUnit",
+        "requests_per_unit",
+        "unit",
+        "key",
+        "value",
+        "other",
+    ];
+    let object = |next: &mut dyn FnMut(usize) -> usize| {
+        let fields: Vec<String> = (0..next(4))
+            .map(|_| {
+                format!(
+                    "\"{}\":{}",
+                    names[next(names.len())],
+                    values[next(values.len())]
+                )
+            })
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    };
+    for _ in 0..3000 {
+        let descriptors: Vec<String> = (0..next(3)).map(|_| object(&mut next)).collect();
+        let limit = object(&mut next);
+        let input = match next(3) {
+            0 => object(&mut next),
+            1 => format!("{{\"descriptors\":[{}]}}", descriptors.join(",")),
+            _ => format!("{{\"domain\":\"d\",\"descriptors\":[{{\"limit\":{limit}}}]}}"),
+        };
+        inputs.push(input.into_bytes());
+    }
+
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-protojson")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let lines: String = inputs
+        .iter()
+        .map(|input| format!("{}\n", hex(input)))
+        .collect();
+    // Written while the answers are read, so that neither pipe fills up.
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    assert_eq!(upstream.len(), inputs.len());
+    let accepted = upstream
+        .iter()
+        .filter(|line| line.starts_with("ok"))
+        .count();
+    assert!(accepted > 1000, "only {accepted} inputs accepted");
+    for (input, upstream) in inputs.iter().zip(&upstream) {
+        let ours = match ratelimit::protojson::decode_request(input) {
+            Ok(request) => format!("ok {}", hex(&prost::Message::encode_to_vec(&request))),
+            Err(_) => "error".to_string(),
+        };
+        assert_eq!(&ours, upstream, "{:?}", String::from_utf8_lossy(input));
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `/json` answers like upstream's: statuses (200, 429, 400, 500), headers and the protojson
+/// body, with metadata, response headers and every method. Go adds a space after every comma
+/// or after none, depending on its build: those spaces are left out of the comparison.
+#[tokio::test]
+async fn json_is_served_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let runtime = temp_dir("json");
+    let metadata = "domain: meta
+descriptors:
+  - key: a
+    rate_limit: {unit: hour, requests_per_unit: 10, name: named}
+    metadata: {s: \"q\\\"b\\\\<>&\\u2028\\x01\\t\", n: 3, f: 1.5, tiny: 0.0000001, big: 1.0e+21, neg: -0.0, l: [1, two, {x: null}], t: true}
+  - key: nan
+    rate_limit: {unit: hour, requests_per_unit: 10}
+    metadata: {bad: .nan}
+";
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v1/ratelimit/config/meta.yaml", metadata.as_bytes()),
+            ("current", b"->v1"),
+        ],
+    );
+    let (services, _redis) = both_services(|redis| {
+        let mut environment = binary_environment(&runtime, redis);
+        environment.push(("RESPONSE_DYNAMIC_METADATA", "true".into()));
+        environment.push(("LIMIT_RESPONSE_HEADERS_ENABLED", "true".into()));
+        environment
+    })
+    .await;
+    let send = |address: String, method: &'static str, target: &'static str, body: String| async move {
+        let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let request = format!(
+            "{method} {target} HTTP/1.0\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("the connection is closed")
+        .unwrap();
+        String::from_utf8(response).unwrap()
+    };
+    // The status, the headers but the date and framing, and the body without Go's spaces.
+    let simplify = |response: &str| -> (String, Vec<String>, String) {
+        let (head, body) = response.split_once("\r\n\r\n").expect("an HTTP answer");
+        let mut lines = head.lines();
+        let status = lines.next().unwrap()[9..].to_string();
+        let mut headers: Vec<String> = lines
+            .map(str::to_ascii_lowercase)
+            .filter(|l| !l.starts_with("date:") && !l.starts_with("content-length:"))
+            .collect();
+        headers.sort();
+        let text = without_go_spaces(body);
+        (status, headers, text)
+    };
+    let user = r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"a"}]}]}"#;
+    let cases = [
+        ("POST", "/json", user.to_string()),
+        ("POST", "/json", user.to_string()),
+        ("POST", "/json", user.to_string()),
+        ("GET", "/json", r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"b"}]}],"hitsAddend":2}"#.into()),
+        ("PUT", "/json", r#"{"domain":"meta","descriptors":[{"entries":[{"key":"a"}]}]}"#.into()),
+        ("POST", "/json", r#"{"domain":"meta","descriptors":[{"entries":[{"key":"nan"}]}]}"#.into()),
+        ("POST", "/json", r#"{"domain":"unknown","descriptors":[{"entries":[{"key":"k"}]}]}"#.into()),
+        ("POST", "/json", r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"c"}],"limit":{"requestsPerUnit":5,"unit":"HOUR"}}]}"#.into()),
+        ("POST", "/json", r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"d"}],"hitsAddend":0}]}"#.into()),
+        ("POST", "/json", "{}".into()),
+        ("POST", "/json", r#"{"domain":"llm"}"#.into()),
+        ("POST", "/json", "not json".into()),
+        ("POST", "/json", String::new()),
+        ("DELETE", "/json?x=1", user.to_string()),
+        (
+            "HEAD",
+            "/json",
+            r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"h"}]}]}"#.into(),
+        ),
+        ("POST", "/json/", user.to_string()),
+    ];
+    let reset = regex::Regex::new(r#""durationUntilReset":"(\d+)s""#).unwrap();
+    for (method, target, body) in cases {
+        let upstream = send(services[0].http.clone(), method, target, body.clone()).await;
+        let ours = send(services[1].http.clone(), method, target, body.clone()).await;
+        let (mut upstream, mut ours) = (simplify(&upstream), simplify(&ours));
+        // The metadata's prototext limits: one or two spaces between fields in Go (§7).
+        upstream.2 = upstream.2.replace("  unit:", " unit:");
+        // Each side reads its own clock: the time to reset may differ by a second.
+        let resets = |text: &str| -> Vec<i64> {
+            reset
+                .captures_iter(text)
+                .map(|c| c[1].parse().unwrap())
+                .collect()
+        };
+        let (expected, actual) = (resets(&upstream.2), resets(&ours.2));
+        assert_eq!(expected.len(), actual.len(), "{method} {target} {body}");
+        for (e, a) in expected.iter().zip(&actual) {
+            assert!((e - a).abs() <= 1, "{e} {a}");
+        }
+        let mut times = expected.iter();
+        ours.2 = reset
+            .replace_all(&ours.2, |_: &regex::Captures| {
+                format!("\"durationUntilReset\":\"{}s\"", times.next().unwrap())
+            })
+            .into_owned();
+        assert_eq!(ours, upstream, "{method} {target} {body}");
+    }
+    // A client limit with an unknown unit makes upstream panic, which closes the connection
+    // with no answer; it is a bad request here. `unitMultiplier` is unknown to upstream.
+    for unit in ["", r#","unit":-1"#, r#","unit":8"#] {
+        let request = format!(
+            r#"{{"domain":"llm","descriptors":[{{"entries":[{{"key":"user","value":"e"}}],"limit":{{"requestsPerUnit":5{unit}}}}}]}}"#
+        );
+        let upstream = send(services[0].http.clone(), "POST", "/json", request.clone()).await;
+        assert_eq!(upstream, "", "{request}");
+        let ours = send(services[1].http.clone(), "POST", "/json", request.clone()).await;
+        assert_eq!(simplify(&ours).0, "400 Bad Request", "{request}");
+    }
+    let multiplier = r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"f"}],"limit":{"requestsPerUnit":5,"unit":"HOUR","unitMultiplier":2}}]}"#;
+    let upstream = send(services[0].http.clone(), "POST", "/json", multiplier.into()).await;
+    assert_eq!(simplify(&upstream).0, "400 Bad Request");
+    let ours = simplify(&send(services[1].http.clone(), "POST", "/json", multiplier.into()).await);
+    assert_eq!(ours.0, "200 OK");
+    assert!(
+        ours.2.contains("unit:HOUR unit_multiplier:{value:2}"),
+        "{}",
+        ours.2
+    );
+    // Bodies up to gRPC's largest message (4 MiB) are read, larger ones refused.
+    let request = r#"{"domain":"d","descriptors":[{"entries":[{"key":"k"}]}]}"#;
+    for (size, status) in [(4 << 20, "200 OK"), ((4 << 20) + 1, "400 Bad Request")] {
+        let body = format!("{request}{}", " ".repeat(size - request.len()));
+        let ours = simplify(&send(services[1].http.clone(), "POST", "/json", body).await);
+        assert_eq!(ours.0, status, "{size}");
+    }
+}
+
+/// `/json`'s encoding writes responses like `protojson.Marshal` (Go's spaces after commas
+/// left out), and refuses the same ones: every field, enum numbers with no name, Duration and
+/// Timestamp fractions and ranges, base64 padding, numbers in the metadata.
+#[test]
+fn json_responses_are_encoded_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use prost_types::{ListValue, Struct, Timestamp, Value, value::Kind};
+    use ratelimit_proto::envoy::config::core::v3::HeaderValue;
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::{
+        DescriptorStatus, Quota, RateLimit, quota::ExpirationSpecifier,
+    };
+    let number = |n: f64| Value {
+        kind: Some(Kind::NumberValue(n)),
+    };
+    let metadata = |values: Vec<(&str, Value)>| Struct {
+        fields: values
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    };
+    let with_metadata = |values: Vec<(&str, Value)>| RateLimitResponse {
+        dynamic_metadata: Some(metadata(values)),
+        ..Default::default()
+    };
+    let with_reset = |seconds: i64, nanos: i32| RateLimitResponse {
+        statuses: vec![DescriptorStatus {
+            duration_until_reset: Some(prost_types::Duration { seconds, nanos }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let with_time = |seconds: i64, nanos: i32| RateLimitResponse {
+        quota: Some(Quota {
+            expiration_specifier: Some(ExpirationSpecifier::ValidUntil(Timestamp {
+                seconds,
+                nanos,
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let header = |raw: &[u8]| HeaderValue {
+        key: "k".into(),
+        value: String::new(),
+        raw_value: raw.to_vec(),
+    };
+    let mut responses = vec![
+        RateLimitResponse::default(),
+        RateLimitResponse {
+            overall_code: 1,
+            statuses: vec![
+                DescriptorStatus {
+                    code: 2,
+                    current_limit: Some(RateLimit {
+                        name: "n\"\\\u{1}\u{1f}\u{7f}é\u{2028}<>&".into(),
+                        requests_per_unit: 5,
+                        unit: 7,
+                        unit_multiplier: None,
+                    }),
+                    limit_remaining: 3,
+                    duration_until_reset: Some(prost_types::Duration {
+                        seconds: 5,
+                        nanos: 0,
+                    }),
+                    quota: Some(Quota {
+                        requests: 2,
+                        expiration_specifier: None,
+                        id: "q".into(),
+                    }),
+                },
+                DescriptorStatus::default(),
+                DescriptorStatus {
+                    current_limit: Some(RateLimit::default()),
+                    ..Default::default()
+                },
+            ],
+            response_headers_to_add: vec![
+                header(&[]),
+                header(&[1]),
+                header(&[1, 2]),
+                header(&[0, 1, 2, 255]),
+            ],
+            request_headers_to_add: vec![HeaderValue {
+                key: String::new(),
+                value: "v".into(),
+                raw_value: vec![],
+            }],
+            raw_body: b"body\xff".to_vec(),
+            dynamic_metadata: Some(Struct::default()),
+            quota: Some(Quota::default()),
+        },
+        // Enum numbers with no name.
+        RateLimitResponse {
+            overall_code: 9,
+            statuses: vec![DescriptorStatus {
+                code: -3,
+                current_limit: Some(RateLimit {
+                    unit: 42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        with_metadata(vec![
+            (
+                "null",
+                Value {
+                    kind: Some(Kind::NullValue(0)),
+                },
+            ),
+            (
+                "b",
+                Value {
+                    kind: Some(Kind::BoolValue(false)),
+                },
+            ),
+            (
+                "s",
+                Value {
+                    kind: Some(Kind::StringValue("x\ty".into())),
+                },
+            ),
+            ("é", number(1.0)),
+            ("B", number(-0.0)),
+            (
+                "",
+                Value {
+                    kind: Some(Kind::ListValue(ListValue { values: vec![] })),
+                },
+            ),
+            (
+                "nested",
+                Value {
+                    kind: Some(Kind::StructValue(metadata(vec![(
+                        "l",
+                        Value {
+                            kind: Some(Kind::ListValue(ListValue {
+                                values: vec![
+                                    number(2.5),
+                                    Value {
+                                        kind: Some(Kind::StructValue(Struct::default())),
+                                    },
+                                ],
+                            })),
+                        },
+                    )]))),
+                },
+            ),
+        ]),
+    ];
+    for n in [
+        1e-10,
+        1.5e-100,
+        1e100,
+        1e21,
+        1e20,
+        999999999999999999999.0,
+        123456789.123,
+        -2.5e-7,
+        1e-6,
+        9.99e-7,
+        5e-324,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        0.1,
+        1.0 / 3.0,
+        1e15,
+        1e16,
+        1e-5,
+        123e300,
+    ] {
+        responses.push(with_metadata(vec![("n", number(n))]));
+    }
+    for (seconds, nanos) in [
+        (0, 0),
+        (1, 500_000_000),
+        (0, 1),
+        (0, 1_000),
+        (0, 1_000_000),
+        (0, -1_000),
+        (-1, -500_000_000),
+        (315_576_000_000, 999_999_999),
+        (-315_576_000_000, -999_999_999),
+        (315_576_000_001, 0),
+        (0, 1_000_000_000),
+        (0, -1_000_000_000),
+        (1, -1),
+        (-1, 1),
+    ] {
+        responses.push(with_reset(seconds, nanos));
+    }
+    for (seconds, nanos) in [
+        (0, 0),
+        (-1, 0),
+        (951_782_400, 0),
+        (1_700_000_000, 120_000_000),
+        (253_402_300_799, 999_999_999),
+        (-62_135_596_800, 0),
+        (-62_135_596_801, 0),
+        (253_402_300_800, 0),
+        (0, -1),
+        (0, 1_000_000_000),
+        (68_256_000, 7),
+        (-2_208_988_800, 0),
+    ] {
+        responses.push(with_time(seconds, nanos));
+    }
+    // What protojson refuses to write.
+    responses.push(with_metadata(vec![("unset", Value { kind: None })]));
+    for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        responses.push(with_metadata(vec![("n", number(n))]));
+    }
+
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-protojson-marshal")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let lines: String = responses
+        .iter()
+        .map(|response| format!("{}\n", hex(&prost::Message::encode_to_vec(response))))
+        .collect();
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(without_go_spaces)
+        .collect();
+    assert_eq!(upstream.len(), responses.len());
+    for (response, upstream) in responses.iter().zip(&upstream) {
+        let ours = match ratelimit::protojson::encode_response(response) {
+            Ok(json) => format!("ok {json}"),
+            Err(_) => "error".to_string(),
+        };
+        assert_eq!(&ours, upstream, "{response:?}");
+    }
+}
+
+/// `text` without the spaces Go's protojson may put after commas, outside strings.
+fn without_go_spaces(text: &str) -> String {
+    let (mut out, mut in_string, mut escaped, mut after_comma) =
+        (String::new(), false, false, false);
+    for c in text.chars() {
+        if !(after_comma && c == ' ') {
+            out.push(c);
+        }
+        after_comma = !in_string && c == ',';
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+    out
+}
