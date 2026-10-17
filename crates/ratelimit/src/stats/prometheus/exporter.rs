@@ -5,7 +5,8 @@
 
 use super::MetricType;
 use super::mapper::{Action, DEFAULT_BUCKETS, Mapper, ObserverType};
-use crate::config::yaml::go_format_float as go_float;
+use crate::go::format_float as go_float;
+use crate::go::quote as go_quote;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
@@ -839,30 +840,5 @@ pub(super) fn escape_metric_name(name: &str) -> String {
         }
         previous = Some(c);
     }
-    out
-}
-
-/// Go's `%q` of a string, for error messages: ASCII control characters escaped, other
-/// characters as they are.
-pub(super) fn go_quote(s: &str) -> String {
-    let mut out = String::from('"');
-    for c in s.chars() {
-        match c {
-            '"' => out += "\\\"",
-            '\\' => out += "\\\\",
-            '\x07' => out += "\\a",
-            '\x08' => out += "\\b",
-            '\x0c' => out += "\\f",
-            '\n' => out += "\\n",
-            '\r' => out += "\\r",
-            '\t' => out += "\\t",
-            '\x0b' => out += "\\v",
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }

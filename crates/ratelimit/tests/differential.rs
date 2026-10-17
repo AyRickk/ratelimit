@@ -3033,3 +3033,318 @@ async fn prometheus_options_like_upstream() {
         .flush_timer(time, 7.0);
     h.scrape("GET", "/stats/", &[]).await;
 }
+
+/// Upstream's `settings.NewSettings()` for `environment`, from the oracle: the settings as JSON,
+/// or the panic's text.
+async fn upstream_settings(environment: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    let output = Command::new(oracle_binary())
+        .arg("-settings")
+        .env_clear()
+        .envs(environment.iter().copied())
+        .output()
+        .await
+        .expect("run the oracle");
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("oracle output: {}", String::from_utf8_lossy(&output.stdout)));
+    match printed.get("error") {
+        Some(error) => Err(error.as_str().unwrap().to_string()),
+        None => Ok(serde_json::json!({"settings": printed["settings"], "sink": printed["sink"]})),
+    }
+}
+
+/// How selecting our stats sink fails for `settings`, or "" (the Prometheus sink, which would
+/// listen, is left out as on the oracle).
+fn sink_failure(
+    settings: &ratelimit::settings::Settings,
+    lookup: ratelimit::settings::Lookup,
+) -> String {
+    let sinks = match settings.sinks(lookup) {
+        Ok(sinks) => sinks,
+        Err(e) => return e,
+    };
+    if !sinks.disable_stats && !sinks.use_dog_statsd && !sinks.use_statsd && sinks.use_prometheus {
+        return String::new();
+    }
+    match ratelimit::stats::select_sink(&sinks) {
+        Ok(_) => String::new(),
+        Err(e) => e,
+    }
+}
+
+/// Our settings, shaped like the oracle's JSON.
+fn settings_json(settings: &ratelimit::settings::Settings) -> serde_json::Value {
+    use ratelimit::settings::Value;
+    let values = settings.values().into_iter().map(|(key, value)| {
+        let json = match value {
+            Value::Str(s) => serde_json::json!(s),
+            Value::Int(i) => serde_json::json!(i),
+            Value::Bool(b) => serde_json::json!(b),
+            Value::Float(f) => serde_json::json!(ratelimit::go::format_float(f)),
+            Value::List(l) => serde_json::json!(l),
+            Value::Map(m) => serde_json::json!(m),
+        };
+        (key.to_string(), json)
+    });
+    serde_json::Value::Object(values.collect())
+}
+
+/// Every variable is read as envconfig reads it: same values, or the same first error.
+#[tokio::test]
+async fn settings_are_read_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let ints = [
+        "",
+        "0",
+        "00",
+        "-1",
+        "+7",
+        "0x1F",
+        "0X1f",
+        "0o17",
+        "0O17",
+        "017",
+        "08",
+        "0b101",
+        "1_000",
+        "0x_1f",
+        "0_7",
+        "_1",
+        "1_",
+        "1__0",
+        "0x",
+        "0b",
+        "0o",
+        "1.0",
+        " 1",
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "99999999999999999999x",
+        "0xFFFFFFFFFFFFFFFF",
+        "-0x8000000000000000",
+    ];
+    let bools = [
+        "", "1", "t", "T", "TRUE", "true", "True", "0", "f", "F", "FALSE", "false", "False", "yes",
+        "tRue", " true",
+    ];
+    let durations = [
+        "",
+        "0",
+        "-0",
+        "+0",
+        "1s",
+        "1.5h",
+        "1h2m3.5s",
+        "-1m",
+        ".5s",
+        "5.s",
+        "1",
+        "1x",
+        "1µs",
+        "1μs",
+        "1us",
+        "9223372036854775807ns",
+        "9223372036854775808ns",
+        "-9223372036854775808ns",
+        "2562047h",
+        "2562048h",
+        "0.0000000001s",
+        "1.123456789123s",
+        "s",
+        ".s",
+        "1ss",
+        "1s2",
+        "3m.5s",
+        "-",
+        "1e3s",
+        "1é",
+        "é",
+        "1\"s\\",
+        "1\t",
+    ];
+    let floats = [
+        "",
+        "0.8",
+        "1e39",
+        "-1e39",
+        "3.4028235e38",
+        "3.4028236e38",
+        "1e309",
+        "1.7976931348623157e308",
+        "1e-50",
+        "inf",
+        "+Inf",
+        "-infinity",
+        "INFINITY",
+        "infinit",
+        "nan",
+        "NaN",
+        "+nan",
+        "-NaN",
+        "0x1p-2",
+        "0x1.8p1",
+        "0X1P3",
+        "0x1p",
+        "0x.8p1",
+        "0xp1",
+        "1_000.5",
+        "1__0",
+        "_1",
+        "1e",
+        ".5",
+        "5.",
+        ".",
+        "1E+3",
+        "1e-3",
+        "0x10",
+        " 1",
+        "1_e3",
+        "1e_3",
+        "0.1_5",
+    ];
+    let lists = ["", " ", "a", "a,b", "a,,b", ",", " a , b "];
+    let maps = [
+        "", " ", "a:b", "a:b,c:d", "a:b,a:c", "a", "a:b:c", "a:b,", ":", "a:", ":b", "é", "a\tb",
+        "a\u{1}b",
+    ];
+    let mut cases: Vec<Vec<(&str, &str)>> = vec![vec![]];
+    for (variables, values) in [
+        (
+            &[
+                "PORT",
+                "XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES",
+                "EXPIRATION_JITTER_MAX_SECONDS",
+            ][..],
+            &ints[..],
+        ),
+        (&["USE_STATSD", "RUNTIME_WATCH_ROOT"], &bools),
+        (&["REDIS_TIMEOUT", "RUNTIME_SUBDIRECTORY"], &durations),
+        (
+            &["NEAR_LIMIT_RATIO", "XDS_CLIENT_BACKOFF_RANDOM_FACTOR"],
+            &floats,
+        ),
+        (&["USE_DOG_STATSD_MOGRIFIERS", "MEMCACHE_HOST_PORT"], &lists),
+        (
+            &["EXTRA_TAGS", "CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS"],
+            &maps,
+        ),
+    ] {
+        for variable in variables {
+            for value in values {
+                cases.push(vec![(variable, value)]);
+            }
+        }
+    }
+    // The sinks: selection, gostats' own checks, DogStatsD mogrifiers from the environment.
+    let statsd_off = ("USE_STATSD", "false");
+    let dog = ("USE_DOG_STATSD", "true");
+    let mogrifiers = ("USE_DOG_STATSD_MOGRIFIERS", "a,b");
+    for case in [
+        vec![("STATSD_PORT", "0x1F")],
+        vec![("STATSD_PORT", "+8125")],
+        vec![("STATSD_PORT", "1_000")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "x")],
+        vec![("GOSTATS_FLUSH_INTERVAL_SECONDS", "")],
+        vec![("GOSTATS_LOGGING_SINK_DISABLED", "yes")],
+        vec![("GOSTATS_LOGGING_SINK_DISABLED", "yes"), statsd_off],
+        vec![dog],
+        vec![
+            dog,
+            statsd_off,
+            ("STATSD_PORT", "0x1F"),
+            ("GOSTATS_FLUSH_INTERVAL_SECONDS", "x"),
+        ],
+        vec![dog, statsd_off, ("USE_PROMETHEUS", "true")],
+        vec![("DISABLE_STATS", "true"), dog, ("STATSD_PORT", "x1")],
+        vec![dog, statsd_off, mogrifiers],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("DOG_STATSD_MOGRIFIER_A_PATTERN", "^a"),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("PATTERN", "^x"),
+            ("NAME", "n"),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("PATTERN", "^x"),
+            ("NAME", "n"),
+            ("TAGS", "t"),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("PATTERN", "^x"),
+            ("NAME", "n"),
+            ("TAGS", "t:"),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("PATTERN", "^x"),
+            ("NAME", "n"),
+            ("TAGS", ":v"),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            mogrifiers,
+            ("PATTERN", "^x"),
+            ("NAME", "n"),
+            ("DOG_STATSD_MOGRIFIER_B_PATTERN", ""),
+        ],
+        vec![
+            dog,
+            statsd_off,
+            ("USE_DOG_STATSD_MOGRIFIERS", "lower"),
+            ("DOG_STATSD_MOGRIFIER_LOWER_PATTERN", "x"),
+            ("DOG_STATSD_MOGRIFIER_LOWER_NAME", "y"),
+        ],
+        vec![dog, statsd_off, ("STATSD_PORT", "70000")],
+        vec![dog, statsd_off, ("STATSD_HOST", "a:b")],
+    ] {
+        cases.push(case);
+    }
+    // Two invalid values: the first field in upstream's order is reported.
+    cases.push(vec![
+        ("TRACING_SAMPLING_RATE", "x"),
+        ("HOST", "h"),
+        ("PORT", "y"),
+    ]);
+    cases.push(vec![
+        ("REDIS_URL", ""),
+        ("PROMETHEUS_ADDR", ""),
+        ("LOG_LEVEL", "debug"),
+    ]);
+    for environment in cases {
+        let lookup = |key: &str| {
+            environment
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        };
+        let ours = ratelimit::settings::Settings::from_lookup(&lookup)
+            .map(|s| serde_json::json!({"settings": settings_json(&s), "sink": sink_failure(&s, &lookup)}))
+            .map_err(|e| e.to_string());
+        let upstream = upstream_settings(&environment).await;
+        match (&ours, &upstream) {
+            (Ok(ours), Ok(upstream)) => {
+                assert_eq!(ours["settings"], upstream["settings"], "{environment:?}");
+                assert_eq!(ours["sink"], upstream["sink"], "sink for {environment:?}");
+            }
+            _ => assert_eq!(ours, upstream, "{environment:?}"),
+        }
+    }
+}

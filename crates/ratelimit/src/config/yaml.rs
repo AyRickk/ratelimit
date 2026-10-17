@@ -313,32 +313,9 @@ pub(crate) fn go_format(value: &Resolved) -> String {
         Resolved::Bool(b) => b.to_string(),
         Resolved::Int(v) => v.to_string(),
         Resolved::Uint(v) => v.to_string(),
-        Resolved::Float(v) => go_format_float(*v),
+        Resolved::Float(v) => crate::go::format_float(*v),
         Resolved::Str(s) => s.clone(),
     }
-}
-
-/// `strconv.FormatFloat(v, 'g', -1, 64)` as used by `%v`, with `+Inf`/`-Inf`.
-pub(crate) fn go_format_float(v: f64) -> String {
-    if v.is_nan() {
-        return "NaN".to_string();
-    }
-    if v.is_infinite() {
-        return if v > 0.0 { "+Inf" } else { "-Inf" }.to_string();
-    }
-    if v == 0.0 {
-        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
-    }
-    // Shortest round-trip digits and decimal exponent, from Rust's `{:e}` formatting.
-    let sci = format!("{v:e}");
-    let (mantissa, exp) = sci.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    // With the shortest representation, Go switches to %e at exponent 6.
-    if !(-4..6).contains(&exp) {
-        let exp_sign = if exp < 0 { '-' } else { '+' };
-        return format!("{mantissa}e{exp_sign}{:02}", exp.abs());
-    }
-    format!("{v}")
 }
 
 struct Builder {
