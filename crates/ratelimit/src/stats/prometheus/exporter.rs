@@ -5,6 +5,7 @@
 
 use super::MetricType;
 use super::mapper::{Action, DEFAULT_BUCKETS, Mapper, ObserverType};
+use super::summary::{Options, Summary, Written};
 use crate::go::format_float as go_float;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
@@ -20,6 +21,7 @@ enum Kind {
     Counter,
     Gauge,
     Histogram,
+    Summary,
 }
 
 impl Kind {
@@ -28,6 +30,7 @@ impl Kind {
             Kind::Counter => "counter",
             Kind::Gauge => "gauge",
             Kind::Histogram => "histogram",
+            Kind::Summary => "summary",
         }
     }
 
@@ -37,6 +40,7 @@ impl Kind {
             Kind::Counter => "a Counter",
             Kind::Gauge => "a Gauge",
             Kind::Histogram => "a Histogram",
+            Kind::Summary => "a Summary",
         }
     }
 }
@@ -56,11 +60,41 @@ enum Value {
         sum: f64,
         count: u64,
     },
+    /// A summary, and what it gave at the last Gather.
+    Summary(Box<Summary>, Option<Written>),
+}
+
+/// What a summary vector's series are made with: the objectives (quantile, error) and the
+/// options, client_golang's defaults applied.
+#[derive(Debug, Clone)]
+struct SummaryConfig {
+    objectives: Vec<(f64, f64)>,
+    options: Options,
+}
+
+impl SummaryConfig {
+    /// statsd_exporter's quantiles and client_golang's options.
+    fn default_config() -> Self {
+        Self {
+            objectives: vec![(0.5, 0.05), (0.9, 0.01), (0.99, 0.001)],
+            options: Options {
+                max_age: 600_000_000_000,
+                age_buckets: 5,
+                buf_cap: 500,
+            },
+        }
+    }
 }
 
 impl Value {
-    fn new(kind: Kind, upper_bounds: &[f64]) -> Self {
+    /// A new series of `kind`; a summary is made with `summary` at `wall` time.
+    fn new(kind: Kind, upper_bounds: &[f64], summary: Option<&SummaryConfig>, wall: i64) -> Self {
         match kind {
+            Kind::Summary => {
+                let config = summary.expect("summary vectors are made with their config");
+                let summary = Summary::new(&config.objectives, config.options, wall);
+                Value::Summary(Box::new(summary), None)
+            }
             Kind::Counter => Value::Counter {
                 whole: 0,
                 fraction: 0.0,
@@ -87,7 +121,7 @@ impl Value {
                 }
             }
             Value::Gauge(value) => *value += v,
-            Value::Histogram { .. } => {}
+            Value::Histogram { .. } | Value::Summary(..) => {}
         }
     }
 
@@ -136,6 +170,7 @@ struct Vector {
     /// `NewDesc`'s error, reported for each series at Gather.
     desc_error: Option<String>,
     upper_bounds: Vec<f64>,
+    summary: Option<SummaryConfig>,
     series: BTreeMap<Vec<String>, Value>,
 }
 
@@ -149,16 +184,22 @@ impl Vector {
             label_names,
             desc_error,
             upper_bounds: Vec::new(),
+            summary: None,
             series: BTreeMap::new(),
         }
     }
 
     /// The series with these label values, created at zero.
     fn with(&mut self, values: &[&str]) -> &mut Value {
-        let (kind, bounds) = (self.kind, &self.upper_bounds);
+        self.with_at(values, 0)
+    }
+
+    /// The series with these label values, created at zero, a summary at `wall` time.
+    fn with_at(&mut self, values: &[&str], wall: i64) -> &mut Value {
+        let (kind, bounds, summary) = (self.kind, &self.upper_bounds, &self.summary);
         self.series
             .entry(values.iter().map(|v| v.to_string()).collect())
-            .or_insert_with(|| Value::new(kind, bounds))
+            .or_insert_with(|| Value::new(kind, bounds, summary.as_ref(), wall))
     }
 }
 
@@ -328,6 +369,16 @@ pub(super) struct Exporter {
     metrics: HashMap<String, Metric>,
 }
 
+/// Go's `time.Now` as summaries compare it (monotonically; statsd_exporter's clock is for
+/// TTLs only), in nanoseconds since the first reading.
+fn monotonic_nanos() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as i64
+}
+
 impl Exporter {
     pub fn new(mapper: Mapper) -> Self {
         Self {
@@ -418,8 +469,17 @@ impl Exporter {
                             None => self.inc(EVENTS_CONFLICT, &["observer"]),
                         }
                     }
-                    // Summaries are not supported yet (docs/parity.md).
-                    Some(ObserverType::Summary) | None => {}
+                    Some(ObserverType::Summary) | None => {
+                        let config = summary_config(&self.mapper, mapped.as_ref());
+                        let wall = monotonic_nanos();
+                        match self.get_summary(&series, config, wall) {
+                            Some(Value::Summary(summary, _)) => {
+                                summary.observe(value, wall);
+                                self.inc(EVENTS, &["observer"]);
+                            }
+                            _ => self.inc(EVENTS_CONFLICT, &["observer"]),
+                        }
+                    }
                 }
             }
         }
@@ -430,9 +490,34 @@ impl Exporter {
         self.metrics.get(name).is_some_and(|m| m.kind != kind)
     }
 
+    /// `GetSummary`: the series, a new vector made with `config` (`None` when client_golang
+    /// would panic or hang: see `summary_config`, or a `quantile` label), or `None` on a name
+    /// conflict.
+    fn get_summary(
+        &mut self,
+        s: &Series,
+        config: Option<SummaryConfig>,
+        wall: i64,
+    ) -> Option<&mut Value> {
+        let config = config.filter(|_| !s.labels.contains_key("quantile"));
+        self.register(s, Kind::Summary, &[], config, wall)
+    }
+
     /// `GetCounter`, `GetGauge` and `GetHistogram`: the series, registering its vector and
     /// itself as needed, or `None` on a name conflict.
     fn get(&mut self, s: &Series, kind: Kind, upper_bounds: &[f64]) -> Option<&mut Value> {
+        self.register(s, kind, upper_bounds, None, 0)
+    }
+
+    /// The series of `kind`, registered as needed; a summary's needs its `config`.
+    fn register(
+        &mut self,
+        s: &Series,
+        kind: Kind,
+        upper_bounds: &[f64],
+        summary: Option<SummaryConfig>,
+        wall: i64,
+    ) -> Option<&mut Value> {
         let names: Vec<String> = s.labels.keys().cloned().collect();
         let values: Vec<String> = s.labels.values().cloned().collect();
         let key = (names.clone(), values.clone());
@@ -450,7 +535,7 @@ impl Exporter {
             });
         if let Some((vector, true)) = existing {
             let values: Vec<&str> = values.iter().map(String::as_str).collect();
-            return Some(self.vectors[vector].with(&values));
+            return Some(self.vectors[vector].with_at(&values, wall));
         }
         let name = s.name;
         let conflict = match kind {
@@ -459,6 +544,15 @@ impl Exporter {
                     || HISTOGRAM_SUFFIXES
                         .iter()
                         .any(|suffix| self.conflicts(&format!("{name}{suffix}"), kind))
+            }
+            Kind::Summary => {
+                self.conflicts(name, kind)
+                    || ["_sum", "_count"]
+                        .iter()
+                        .any(|suffix| self.conflicts(&format!("{name}{suffix}"), kind))
+                    // A new vector client_golang cannot make (docs/parity.md §7); an existing
+                    // one keeps its own options.
+                    || (existing.is_none() && summary.is_none())
             }
             _ => {
                 self.conflicts(name, kind)
@@ -481,6 +575,7 @@ impl Exporter {
                 self.inc(METRICS_COUNT, &[kind.type_name()]);
                 let mut vector = Vector::new(name, s.help, kind, names.clone());
                 vector.upper_bounds = upper_bounds.to_vec();
+                vector.summary = summary;
                 self.vectors.push(vector);
                 self.vectors.len() - 1
             }
@@ -512,7 +607,7 @@ impl Exporter {
             }
         }
         let values: Vec<&str> = values.iter().map(String::as_str).collect();
-        Some(self.vectors[vector].with(&values))
+        Some(self.vectors[vector].with_at(&values, wall))
     }
 
     /// `RemoveStaleMetrics`: deletes the series not updated for longer than their TTL. Their
@@ -544,7 +639,16 @@ impl Exporter {
     }
 
     /// `Registry.Gather` and the text format, or Gather's errors.
-    fn gather(&self) -> Result<String, String> {
+    fn gather(&mut self) -> Result<String, String> {
+        // Each summary's `Write`, which flushes its buffers.
+        let wall = monotonic_nanos();
+        for vector in &mut self.vectors {
+            for value in vector.series.values_mut() {
+                if let Value::Summary(summary, written) = value {
+                    *written = Some(summary.write(wall));
+                }
+            }
+        }
         let mut families: BTreeMap<&str, Family> = BTreeMap::new();
         let mut errors = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -700,14 +804,33 @@ impl Sample<'_> {
             Value::Counter { whole, fraction } => {
                 format!(
                     "counter:{{value:{}}}",
-                    go_float(Value::counter_value(*whole, *fraction))
+                    proto_float(Value::counter_value(*whole, *fraction))
                 )
             }
-            Value::Gauge(v) => format!("gauge:{{value:{}}}", go_float(*v)),
+            Value::Gauge(v) => format!("gauge:{{value:{}}}", proto_float(*v)),
             Value::Histogram { count, sum, .. } => format!(
                 "histogram:{{sample_count:{count} sample_sum:{}}}",
-                go_float(*sum)
+                proto_float(*sum)
             ),
+            Value::Summary(_, written) => {
+                let written = written.as_ref().expect("written at Gather");
+                let quantiles: String = written
+                    .quantiles
+                    .iter()
+                    .map(|(q, v)| {
+                        format!(
+                            " quantile:{{quantile:{} value:{}}}",
+                            proto_float(*q),
+                            proto_float(*v)
+                        )
+                    })
+                    .collect();
+                format!(
+                    "summary:{{sample_count:{} sample_sum:{}{quantiles}}}",
+                    written.count,
+                    proto_float(written.sum)
+                )
+            }
         };
         out.push(value);
         out.join(" ")
@@ -731,6 +854,16 @@ impl Family<'_> {
                         *fraction + *whole as f64,
                     );
                 }
+                Value::Summary(_, written) => {
+                    let written = written.as_ref().expect("written at Gather");
+                    for (q, v) in &written.quantiles {
+                        let quantile = Some(("quantile", *q));
+                        write_sample(out, name, "", &sample.labels, quantile, *v);
+                    }
+                    write_sample(out, name, "_sum", &sample.labels, None, written.sum);
+                    let count = written.count as f64;
+                    write_sample(out, name, "_count", &sample.labels, None, count);
+                }
                 Value::Gauge(v) => write_sample(out, name, "", &sample.labels, None, *v),
                 Value::Histogram {
                     upper_bounds,
@@ -746,11 +879,11 @@ impl Family<'_> {
                             name,
                             "_bucket",
                             &sample.labels,
-                            Some(*bound),
+                            Some(("le", *bound)),
                             cumulative as f64,
                         );
                     }
-                    let inf = Some(f64::INFINITY);
+                    let inf = Some(("le", f64::INFINITY));
                     write_sample(out, name, "_bucket", &sample.labels, inf, *count as f64);
                     write_sample(out, name, "_sum", &sample.labels, None, *sum);
                     write_sample(out, name, "_count", &sample.labels, None, *count as f64);
@@ -765,7 +898,7 @@ fn write_sample(
     name: &str,
     suffix: &str,
     labels: &[(&str, &str)],
-    le: Option<f64>,
+    extra: Option<(&str, f64)>,
     value: f64,
 ) {
     out.push_str(name);
@@ -779,14 +912,32 @@ fn write_sample(
         let _ = write!(out, "{separator}{label}=\"{escaped}\"");
         separator = ',';
     }
-    if let Some(le) = le {
-        let _ = write!(out, "{separator}le=\"{}\"", go_float(le));
+    if let Some((label, value)) = extra {
+        let _ = write!(out, "{separator}{label}=\"{}\"", text_float(value));
         separator = ',';
     }
     if separator == ',' {
         out.push('}');
     }
-    let _ = writeln!(out, " {}", go_float(value));
+    let _ = writeln!(out, " {}", text_float(value));
+}
+
+/// expfmt's `writeFloat`: a zero of either sign is `0`.
+fn text_float(value: f64) -> String {
+    match value {
+        0.0 => "0".into(),
+        value => go_float(value),
+    }
+}
+
+/// A float in Go's prototext, as Gather errors print a metric: `nan`, `inf`, `-inf`.
+fn proto_float(value: f64) -> String {
+    match value {
+        v if v.is_nan() => "nan".into(),
+        f64::INFINITY => "inf".into(),
+        f64::NEG_INFINITY => "-inf".into(),
+        v => go_float(v),
+    }
 }
 
 /// `checkSuffixCollisions`, for a new family.
@@ -798,35 +949,95 @@ fn suffix_collision(
     let base = HISTOGRAM_SUFFIXES
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix));
-    if let Some(base) = base
-        && families
-            .get(base)
-            .is_some_and(|f| f.kind == Kind::Histogram)
-    {
-        return Err(format!(
-            "collected metric named {} collides with previously collected histogram named {}",
-            crate::go::quote(name),
-            crate::go::quote(base)
-        ));
+    if let Some(base) = base {
+        let other = families.get(base).map(|f| f.kind);
+        let collides = match other {
+            Some(Kind::Summary) => !name.ends_with("_bucket"),
+            Some(Kind::Histogram) => true,
+            _ => false,
+        };
+        if let Some(kind) = other.filter(|_| collides) {
+            return Err(format!(
+                "collected metric named {} collides with previously collected {} named {}",
+                crate::go::quote(name),
+                kind.type_name(),
+                crate::go::quote(base)
+            ));
+        }
     }
-    if kind == Kind::Histogram {
-        for suffix in ["_count", "_sum", "_bucket"] {
+    if matches!(kind, Kind::Summary | Kind::Histogram) {
+        for suffix in ["_count", "_sum"] {
             let other = format!("{name}{suffix}");
             if families.contains_key(other.as_str()) {
-                let what = if suffix == "_bucket" {
-                    "histogram"
-                } else {
-                    "histogram or summary"
-                };
                 return Err(format!(
-                    "collected {what} named {} collides with previously collected metric named {}",
+                    "collected histogram or summary named {} collides with previously collected metric named {}",
                     crate::go::quote(name),
                     crate::go::quote(&other)
                 ));
             }
         }
     }
+    let bucket = format!("{name}_bucket");
+    if kind == Kind::Histogram && families.contains_key(bucket.as_str()) {
+        return Err(format!(
+            "collected histogram named {} collides with previously collected metric named {}",
+            crate::go::quote(name),
+            crate::go::quote(&bucket)
+        ));
+    }
     Ok(())
+}
+
+/// `GetSummary`'s objectives and options: the mapping's quantiles if it has some, else the
+/// defaults' (else 0.5, 0.9 and 0.99); the mapping's options in full if it has any, else the
+/// defaults'; then client_golang's defaults for what is 0. `None` for a negative `MaxAge`
+/// (client_golang panics) or one shorter than a nanosecond per age bucket (its summary would
+/// loop forever on its first expired buffer).
+fn summary_config(
+    mapper: &Mapper,
+    mapped: Option<&super::mapper::Mapped>,
+) -> Option<SummaryConfig> {
+    let defaults = mapper.default_summary_options();
+    let mapping = mapped.and_then(|m| m.summary_options.as_ref());
+    let quantiles = mapping
+        .and_then(|o| o.quantiles.as_ref())
+        .filter(|q| !q.is_empty())
+        .or(defaults.quantiles.as_ref());
+    let options = mapping.unwrap_or(defaults);
+    // A Go map: a quantile given twice keeps its last error.
+    let mut objectives: Vec<(f64, f64)> = Vec::new();
+    for objective in quantiles.into_iter().flatten() {
+        match objectives
+            .iter_mut()
+            .find(|(q, _)| *q == objective.quantile)
+        {
+            Some(existing) => existing.1 = objective.error,
+            None => objectives.push((objective.quantile, objective.error)),
+        }
+    }
+    let fallback = SummaryConfig::default_config();
+    if objectives.is_empty() {
+        objectives = fallback.objectives;
+    }
+    if options.max_age < 0 {
+        return None;
+    }
+    let or_default = |value: i64, default: i64| if value == 0 { default } else { value };
+    let options = Options {
+        max_age: or_default(options.max_age, fallback.options.max_age),
+        age_buckets: or_default(
+            options.age_buckets.into(),
+            fallback.options.age_buckets.into(),
+        ) as u32,
+        buf_cap: or_default(options.buf_cap.into(), fallback.options.buf_cap.into()) as u32,
+    };
+    if options.max_age / options.age_buckets as i64 == 0 {
+        return None;
+    }
+    Some(SummaryConfig {
+        objectives,
+        options,
+    })
 }
 
 /// statsd_exporter's `EscapeMetricName`: a leading digit gets a `_` before it, and each
@@ -849,4 +1060,70 @@ pub(super) fn escape_metric_name(name: &str) -> String {
         previous = Some(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `GetSummary`: a mapping's options replace the defaults' in full, then client_golang's
+    /// defaults fill what is 0; its quantiles only when it has some.
+    #[test]
+    fn a_mapping_s_summary_options_replace_the_defaults() {
+        let mapper = Mapper::from_yaml(
+            "
+defaults:
+  summary_options: {max_age: 1h, buf_cap: 7, quantiles: [{quantile: 0.3, error: 0.03}]}
+mappings:
+- match: a.*
+  name: a
+  summary_options: {max_age: 1m, age_buckets: 2}
+",
+        )
+        .unwrap();
+        let mapped = mapper.get_mapping("a.x", super::super::MetricType::Observer);
+        let config = summary_config(&mapper, mapped.as_ref()).unwrap();
+        assert_eq!(config.objectives, vec![(0.3, 0.03)]);
+        let options = (
+            config.options.max_age,
+            config.options.age_buckets,
+            config.options.buf_cap,
+        );
+        assert_eq!(options, (60_000_000_000, 2, 500));
+        let config = summary_config(&mapper, None).unwrap();
+        let options = (
+            config.options.max_age,
+            config.options.age_buckets,
+            config.options.buf_cap,
+        );
+        assert_eq!(options, (3_600_000_000_000, 5, 7));
+    }
+
+    /// Options client_golang cannot use make no summary: a negative `MaxAge` (it panics), or
+    /// one under a nanosecond per age bucket (it loops forever).
+    #[test]
+    fn unusable_summary_options_make_no_summary() {
+        for options in ["{max_age: -1s}", "{max_age: 4ns, age_buckets: 5}"] {
+            let yaml = format!("mappings:\n- {{match: a.*, name: a, summary_options: {options}}}");
+            let mapper = Mapper::from_yaml(&yaml).unwrap();
+            let mapped = mapper.get_mapping("a.x", super::super::MetricType::Observer);
+            assert!(
+                summary_config(&mapper, mapped.as_ref()).is_none(),
+                "{options}"
+            );
+        }
+    }
+
+    /// Gather errors print floats as Go's prototext; the text format prints any zero as `0`.
+    #[test]
+    fn floats_are_printed_like_go() {
+        let printed: Vec<String> = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 1.5]
+            .map(proto_float)
+            .into();
+        assert_eq!(printed, ["nan", "inf", "-inf", "-0", "1.5"]);
+        assert_eq!(
+            (text_float(-0.0), text_float(f64::NAN)),
+            ("0".into(), "NaN".into())
+        );
+    }
 }

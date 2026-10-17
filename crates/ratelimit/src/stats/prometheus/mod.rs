@@ -5,6 +5,7 @@
 mod exporter;
 mod fsm;
 mod mapper;
+mod summary;
 
 pub use mapper::{
     Action, HistogramOptions, Mapped, Mapper, MapperError, MatchType, Objective, ObserverType,

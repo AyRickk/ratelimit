@@ -274,6 +274,11 @@ impl Mapper {
             .native_histogram_bucket_factor
     }
 
+    /// The default summary options.
+    pub fn default_summary_options(&self) -> &SummaryOptions {
+        &self.defaults.summary_options
+    }
+
     /// `defaults.ttl`, in nanoseconds.
     pub fn default_ttl(&self) -> i64 {
         self.defaults.ttl
