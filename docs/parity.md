@@ -188,7 +188,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
-| `/json` (any method): protojson, 200 / 429 / 400 / 500 | ⬜ | |
+| `/json` (any method): protojson, 200 / 429 / 400 / 500 | ✅ | `tests/differential.rs` (`json_requests_are_decoded_like_upstream` against `protojson.Unmarshal`, `json_is_served_like_upstream`) |
 | SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
 | `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404); what Go's server answers itself (bad escapes, `Host` checks, `OPTIONS *`) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_http_server_reads_requests_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
 | `grpc.health.v1`, service `ratelimit` | ✅ | `tests/differential.rs` (`health_is_reported_like_upstream`, `sigterm_turns_health_off_like_upstream`), `tests/health.rs` |
@@ -293,3 +293,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A gRPC health `Watch` stream that falls behind gets only the latest status (grpc-go keeps one pending update) | every change in order, duplicates skipped; past 64 pending changes the oldest are dropped | The final status is the same |
 | A request target with a fragment (`/healthcheck#x`) keeps it in the path, so it is not found | the fragment is dropped (hyper's URI parser) | Clients do not send fragments |
 | With `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, a lost connection is noticed when radix next uses it (a command, or its PING every 5 s / pool size) | as soon as the socket closes | Earlier, not different: the same states in the same order |
+| `/json` refuses `unitMultiplier` (or `unit_multiplier`, even `null`) in a client limit with `400`: Go's type has no such field | read and applied as over gRPC, echoed in the metadata's limit | Extension (see `unit_multiplier` above): requests upstream refuses, none it accepts |
+| On `/json`, a client limit with an unknown unit (`0`, `{}`, or a number above `7`) makes the service panic, and Go's server closes the connection with no answer | `400 Bad Request` | D1 |
+| `/json` bodies over 2048 bytes are chunked (HTTP/1.1) or ended by closing the connection (HTTP/1.0), with no `Content-Length` | always a `Content-Length` | Different HTTP server; the bodies read alike |
+| `/json` answers with a space after every comma, or after none, depending on the build (protojson's `detrand`) | never | Go randomises it on purpose |

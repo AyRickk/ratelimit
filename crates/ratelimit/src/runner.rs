@@ -190,7 +190,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
     }
     let server = builder
         .add_service(health_service.server())
-        .add_service(grpc::server(service));
+        .add_service(grpc::server(service.clone()));
     let stop = shutting_down(signals.stop);
     let grpc_served: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
@@ -223,9 +223,14 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to open HTTP listener: '{e}'"))?;
     let (grpc_done, grpc_stopped) = tokio::sync::oneshot::channel::<()>();
-    let http = tokio::spawn(crate::http::serve(http_listener, health, async move {
-        let _ = grpc_stopped.await;
-    }));
+    let http = tokio::spawn(crate::http::serve(
+        http_listener,
+        health,
+        service,
+        async move {
+            let _ = grpc_stopped.await;
+        },
+    ));
     let served = grpc_served.await;
     let _ = grpc_done.send(());
     let _ = http.await;

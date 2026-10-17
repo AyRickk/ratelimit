@@ -1146,6 +1146,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "inotify",
+ "prost",
  "prost-types",
  "ratelimit-proto",
  "regex",
