@@ -682,3 +682,204 @@ pub fn parse_duration(text: &str) -> Result<i64, String> {
     }
     i64::try_from(total).map_err(|_| invalid())
 }
+
+/// `http.DetectContentType`: the content type Go's server gives a response that sets none,
+/// from its first 512 bytes (the WHATWG sniffing algorithm).
+pub fn detect_content_type(data: &[u8]) -> &'static str {
+    let data = &data[..data.len().min(512)];
+    let is_ws = |b: u8| matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ');
+    let first_non_ws = data.iter().position(|&b| !is_ws(b)).unwrap_or(data.len());
+    let trimmed = &data[first_non_ws..];
+    for tag in [
+        &b"<!DOCTYPE HTML"[..],
+        b"<HTML",
+        b"<HEAD",
+        b"<SCRIPT",
+        b"<IFRAME",
+        b"<H1",
+        b"<DIV",
+        b"<FONT",
+        b"<TABLE",
+        b"<A",
+        b"<STYLE",
+        b"<TITLE",
+        b"<B",
+        b"<BODY",
+        b"<BR",
+        b"<P",
+        b"<!--",
+    ] {
+        // Letters match either case; a space or `>` must follow.
+        let matches = trimmed.len() > tag.len()
+            && tag.iter().zip(trimmed).all(|(&t, &d)| {
+                let d = if t.is_ascii_uppercase() { d & 0xDF } else { d };
+                t == d
+            })
+            && matches!(trimmed[tag.len()], b' ' | b'>');
+        if matches {
+            return "text/html; charset=utf-8";
+        }
+    }
+    let masked = |data: &[u8], mask: &[u8], pattern: &[u8]| {
+        data.len() >= pattern.len()
+            && pattern
+                .iter()
+                .zip(mask)
+                .zip(data)
+                .all(|((&p, &m), &d)| d & m == p)
+    };
+    if masked(trimmed, b"\xFF\xFF\xFF\xFF\xFF", b"<?xml") {
+        return "text/xml; charset=utf-8";
+    }
+    let signatures: &[(&[u8], &[u8], &str)] = &[
+        (b"\xFF\xFF\xFF\xFF\xFF", b"%PDF-", "application/pdf"),
+        (
+            b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+            b"%!PS-Adobe-",
+            "application/postscript",
+        ),
+        (
+            b"\xFF\xFF\x00\x00",
+            b"\xFE\xFF\x00\x00",
+            "text/plain; charset=utf-16be",
+        ),
+        (
+            b"\xFF\xFF\x00\x00",
+            b"\xFF\xFE\x00\x00",
+            "text/plain; charset=utf-16le",
+        ),
+        (
+            b"\xFF\xFF\xFF\x00",
+            b"\xEF\xBB\xBF\x00",
+            "text/plain; charset=utf-8",
+        ),
+        (b"\xFF\xFF\xFF\xFF", b"\x00\x00\x01\x00", "image/x-icon"),
+        (b"\xFF\xFF\xFF\xFF", b"\x00\x00\x02\x00", "image/x-icon"),
+        (b"\xFF\xFF", b"BM", "image/bmp"),
+        (b"\xFF\xFF\xFF\xFF\xFF\xFF", b"GIF87a", "image/gif"),
+        (b"\xFF\xFF\xFF\xFF\xFF\xFF", b"GIF89a", "image/gif"),
+        (
+            b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF",
+            b"RIFF\x00\x00\x00\x00WEBPVP",
+            "image/webp",
+        ),
+        (
+            b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+            b"\x89PNG\x0D\x0A\x1A\x0A",
+            "image/png",
+        ),
+        (b"\xFF\xFF\xFF", b"\xFF\xD8\xFF", "image/jpeg"),
+        (
+            b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF",
+            b"FORM\x00\x00\x00\x00AIFF",
+            "audio/aiff",
+        ),
+        (b"\xFF\xFF\xFF", b"ID3", "audio/mpeg"),
+        (b"\xFF\xFF\xFF\xFF\xFF", b"OggS\x00", "application/ogg"),
+        (
+            b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+            b"MThd\x00\x00\x00\x06",
+            "audio/midi",
+        ),
+        (
+            b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF",
+            b"RIFF\x00\x00\x00\x00AVI ",
+            "video/avi",
+        ),
+        (
+            b"\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF",
+            b"RIFF\x00\x00\x00\x00WAVE",
+            "audio/wave",
+        ),
+    ];
+    for (mask, pattern, content_type) in signatures {
+        if masked(data, mask, pattern) {
+            return content_type;
+        }
+    }
+    if data.len() >= 12 {
+        // An MP4 `ftyp` box naming an `mp4` brand.
+        let size = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+        if data.len() >= size
+            && size.is_multiple_of(4)
+            && &data[4..8] == b"ftyp"
+            && (8..size)
+                .step_by(4)
+                .any(|at| at != 12 && &data[at..at + 3] == b"mp4")
+        {
+            return "video/mp4";
+        }
+    }
+    if data.starts_with(b"\x1A\x45\xDF\xA3") {
+        return "video/webm";
+    }
+    let mut font = [0u8; 36];
+    font[34..].copy_from_slice(b"\xFF\xFF");
+    let mut font_pattern = [0u8; 36];
+    font_pattern[34..].copy_from_slice(b"LP");
+    if masked(data, &font, &font_pattern) {
+        return "application/vnd.ms-fontobject";
+    }
+    for (prefix, content_type) in [
+        (&b"\x00\x01\x00\x00"[..], "font/ttf"),
+        (b"OTTO", "font/otf"),
+        (b"ttcf", "font/collection"),
+        (b"wOFF", "font/woff"),
+        (b"wOF2", "font/woff2"),
+        (b"\x1F\x8B\x08", "application/x-gzip"),
+        (b"PK\x03\x04", "application/zip"),
+        (b"Rar!\x1A\x07\x00", "application/x-rar-compressed"),
+        (b"Rar!\x1A\x07\x01\x00", "application/x-rar-compressed"),
+        (b"\x00\x61\x73\x6D", "application/wasm"),
+    ] {
+        if data.starts_with(prefix) {
+            return content_type;
+        }
+    }
+    let binary = |b: u8| matches!(b, 0x00..=0x08 | 0x0B | 0x0E..=0x1A | 0x1C..=0x1F);
+    match trimmed.iter().any(|&b| binary(b)) {
+        true => "application/octet-stream",
+        false => "text/plain; charset=utf-8",
+    }
+}
+
+/// `json.Marshal` of a string of any bytes (Go 1.27): `<`, `>`, `&`, U+2028, U+2029 and
+/// control characters escaped, each invalid UTF-8 byte replaced with U+FFFD.
+pub fn json_string(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (valid, invalid) = match std::str::from_utf8(rest) {
+            Ok(text) => (text, 0),
+            Err(e) => {
+                let invalid = e.error_len().unwrap_or(rest.len() - e.valid_up_to());
+                (
+                    std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap(),
+                    invalid,
+                )
+            }
+        };
+        for c in valid.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c < ' ' || matches!(c, '<' | '>' | '&' | '\u{2028}' | '\u{2029}') => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        // Go replaces each byte of an invalid sequence.
+        for _ in 0..invalid {
+            out.push('\u{fffd}');
+        }
+        rest = &rest[valid.len() + invalid..];
+    }
+    out.push('"');
+    out
+}

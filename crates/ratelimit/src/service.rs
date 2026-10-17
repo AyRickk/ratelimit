@@ -132,6 +132,11 @@ impl<C: RateLimitCache> RateLimitService<C> {
         self.update_config(Ok(config));
     }
 
+    /// `GetCurrentConfig`: the configuration in use, if one loaded.
+    pub fn current_config(&self) -> Option<Arc<RateLimitConfig>> {
+        self.config.read().unwrap().clone()
+    }
+
     /// `SetConfig`: uses a configuration that loaded; one that did not leaves the current one
     /// in place.
     pub fn update_config(&self, update: Result<RateLimitConfig, ConfigError>) {

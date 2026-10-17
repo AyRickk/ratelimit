@@ -14,8 +14,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 |---|---|---|---|
 | `HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`), listening like `GRPC_HOST` |
 | `PORT` | `8080` | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_binary_*`) |
-| `DEBUG_HOST` | `0.0.0.0` | ⬜ | |
-| `DEBUG_PORT` | `6070` | ⬜ | |
+| `DEBUG_HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_debug_port_answers_like_upstream`) |
+| `DEBUG_PORT` | `6070` | ✅ | `tests/differential.rs` (`the_debug_port_answers_like_upstream`, `a_busy_debug_port_is_ignored_like_upstream`) |
 | `GRPC_UDS` | — | ✅ | `the_binary_serves_on_a_unix_socket_like_upstream` in `tests/differential.rs` |
 | `GRPC_HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_binary_*`), listening like Go (dual-stack wildcard, `SO_REUSEPORT`) |
 | `GRPC_PORT` | `8081` | ✅ | `tests/differential.rs` (`the_binary_*`); a busy port fails like upstream |
@@ -192,7 +192,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
 | `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404); what Go's server answers itself (bad escapes, `Host` checks, `OPTIONS *`) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_http_server_reads_requests_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
 | `grpc.health.v1`, service `ratelimit` | ✅ | `tests/differential.rs` (`health_is_reported_like_upstream`, `sigterm_turns_health_off_like_upstream`), `tests/health.rs` |
-| Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
+| Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*`; Go's `ServeMux` (307 redirects, escaped paths), sniffed content types; a port it cannot listen on is not fatal | ✅ | `tests/differential.rs` (`the_debug_port_answers_like_upstream`, `bodies_are_sniffed_and_strings_quoted_like_go`, `a_busy_debug_port_is_ignored_like_upstream`) |
 | `GRPC_UDS` | ✅ | `tests/differential.rs` |
 | Max connection age | ✅ | the gRPC server's keepalive settings |
 | Client mTLS + SAN, server certificate hot reload | ⬜ | |
@@ -252,7 +252,10 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `descriptors[].limit` in metadata as Go prototext, one or two spaces between fields depending on the build | the same text, always one space; `unit_multiplier:{value:N}` when set | Go randomises the spacing; `unit_multiplier` is an extension |
 | Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
 | `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
-| Go stats (`go.*`), `/stats` expvar, pprof | Rust process stats, documented equivalents | no Rust equivalent |
+| Go stats (`go.*`) | Rust process stats, documented equivalents | no Rust equivalent |
+| The debug port's `/stats` prints expvar's `cmdline` and `memstats` (Go's `runtime.MemStats`) | `cmdline` only | No Rust equivalent; zeros or other figures under that name would mislead its readers |
+| pprof serves the Go runtime's profiles (`goroutine`, `heap`, `allocs`, `block`, `mutex`, `threadcreate`, `goroutineleak`) and an HTML index at `/debug/pprof/`, CPU profiles and traces at `/debug/pprof/profile` and `/debug/pprof/trace` | `404 Unknown profile` for those names and the index (pprof's answer for any other name); `500 Could not enable CPU profiling: not available` and `500 Could not enable tracing: not available` | No Go runtime to profile; pprof's own error answers |
+| `/rlconfig` lists domains and descriptors in Go's random map order | sorted by domain, then by key at each level | Deterministic |
 | The Prometheus registry also holds Go's `go_*` and `process_*` collectors (a mapped name colliding with them makes scrapes fail) | not exposed | no Rust equivalent; see the row above |
 | Go's default mux also serves `/debug/pprof/*` and `/debug/vars` on `PROMETHEUS_ADDR` (405 for other methods) | 404 | the same pprof and expvar question as above |
 | A `PROMETHEUS_PATH` Go's mux panics on (not a clean absolute path), or reads as a method, a host or wildcards | error at startup; method, host and wildcard patterns are not supported | D1; not needed by the targeted deployments |

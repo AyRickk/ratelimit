@@ -281,12 +281,52 @@ impl Descriptor {
 }
 
 impl RateLimitConfig {
-    /// `GetLimit`: the limit that applies to `descriptor` in `domain`.
     /// `IsEmptyDomains`: whether the config has no domain.
     pub fn is_empty_domains(&self) -> bool {
         self.domains.is_empty()
     }
 
+    /// `Dump`: a line per limit, `<full key>: unit=<UNIT> requests_per_unit=<n>, shadow_mode:
+    /// <bool>, quota_mode: <bool>`, each descriptor before those under it. Upstream walks Go
+    /// maps, in a random order; domains and descriptors are sorted here.
+    pub fn dump(&self) -> String {
+        fn dump(descriptor: &Descriptor, out: &mut String) {
+            if let Some(limit) = &descriptor.limit {
+                let unit = match limit.limit.unit {
+                    0 => "UNKNOWN".to_string(),
+                    1 => "SECOND".into(),
+                    2 => "MINUTE".into(),
+                    3 => "HOUR".into(),
+                    4 => "DAY".into(),
+                    5 => "MONTH".into(),
+                    6 => "YEAR".into(),
+                    7 => "WEEK".into(),
+                    n => n.to_string(),
+                };
+                out.push_str(&format!(
+                    "{}: unit={unit} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
+                    limit.full_key,
+                    limit.limit.requests_per_unit,
+                    limit.shadow_mode,
+                    limit.quota_mode
+                ));
+            }
+            let mut children: Vec<_> = descriptor.descriptors.iter().collect();
+            children.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, child) in children {
+                dump(child, out);
+            }
+        }
+        let mut domains: Vec<_> = self.domains.iter().collect();
+        domains.sort_by(|a, b| a.0.cmp(b.0));
+        let mut out = String::new();
+        for (_, domain) in domains {
+            dump(domain, &mut out);
+        }
+        out
+    }
+
+    /// `GetLimit`: the limit that applies to `descriptor` in `domain`.
     pub fn get_limit<'a>(&'a self, domain: &str, descriptor: &RateLimitDescriptor) -> LimitLookup {
         let Some(mut current) = self.domains.get(domain) else {
             return LimitLookup::UnknownDomain;

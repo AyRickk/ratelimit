@@ -11,9 +11,9 @@ pub use mapper::{
     SummaryOptions,
 };
 
-use bytes::Bytes;
+use crate::goserver::{Answer, Request};
+use crate::mux::{Route, ServeMux};
 use exporter::{Event, Exporter};
-use http_body_util::Full;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,7 +124,8 @@ pub fn system_clock() -> Clock {
 pub struct PrometheusSink {
     exporter: Arc<Mutex<Exporter>>,
     clock: Clock,
-    path: MetricsPath,
+    /// `PROMETHEUS_PATH`, the default mux's only pattern here.
+    mux: Arc<ServeMux<()>>,
     /// The scrapes being served.
     in_flight: Arc<AtomicU64>,
 }
@@ -141,7 +142,7 @@ impl PrometheusSink {
         Ok(Self {
             exporter: Arc::new(Mutex::new(Exporter::new(mapper))),
             clock,
-            path: MetricsPath::parse(path)?,
+            mux: Arc::new(metrics_mux(path)?),
             in_flight: Arc::default(),
         })
     }
@@ -203,25 +204,15 @@ impl PrometheusSink {
 
     /// Serves HTTP/1 requests from `listener`, as Go's `http.Serve` with the default mux.
     pub async fn serve(&self, listener: tokio::net::TcpListener) {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let sink = self.clone();
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |request| {
-                    let response = sink.respond(&request);
-                    async move { Ok::<_, std::convert::Infallible>(response) }
-                });
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-            });
-        }
+        let sink = self.clone();
+        let handler = move |request: Request| {
+            let sink = sink.clone();
+            async move { sink.respond(&request) }
+        };
+        crate::goserver::serve(listener, handler, std::future::pending()).await;
     }
 
-    fn respond<B>(&self, request: &hyper::Request<B>) -> hyper::Response<Full<Bytes>> {
+    fn respond(&self, request: &Request) -> Answer {
         let header = |name| {
             request
                 .headers()
@@ -230,28 +221,23 @@ impl PrometheusSink {
                 .unwrap_or_default()
         };
         let uri = request.uri();
-        let route = self.path.route(uri.path(), uri.query());
-        let response = match route {
-            Route::Metrics => self.metrics(&header("accept"), &header("accept-encoding")),
-            Route::Redirect(location) => redirect(&location, request.method()),
-            Route::NotFound => text_error(404, "404 page not found"),
-        };
-        let mut builder = hyper::Response::builder().status(response.status);
-        for (name, value) in response.headers {
-            builder = builder.header(name, value);
+        let path = crate::goserver::escaped_path(uri.path()).unwrap_or_default();
+        match self.mux.route(&path, uri.query()) {
+            Route::Handler(()) => self.metrics(&header("accept"), &header("accept-encoding")),
+            Route::Redirect(location) => Answer::redirect(&location, request.method()),
+            Route::NotFound => Answer::error(404, "404 page not found"),
         }
-        builder.body(Full::new(Bytes::from(response.body))).unwrap()
     }
 
     /// promhttp's handler for the default registry.
-    fn metrics(&self, accept: &str, accept_encoding: &str) -> Response {
+    fn metrics(&self, accept: &str, accept_encoding: &str) -> Answer {
         let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let scraped = self.exporter.lock().unwrap().scrape(in_flight);
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         let text = match scraped {
             Ok(text) => text,
             Err(e) => {
-                return text_error(
+                return Answer::error(
                     500,
                     &format!("An error has occurred while serving metrics:\n\n{e}"),
                 );
@@ -267,52 +253,7 @@ impl PrometheusSink {
         } else {
             text.into_bytes()
         };
-        Response {
-            status: 200,
-            headers,
-            body,
-        }
-    }
-}
-
-struct Response {
-    status: u16,
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
-}
-
-/// `http.Error`.
-fn text_error(status: u16, message: &str) -> Response {
-    Response {
-        status,
-        headers: vec![
-            ("content-type", "text/plain; charset=utf-8".into()),
-            ("x-content-type-options", "nosniff".into()),
-        ],
-        body: format!("{message}\n").into_bytes(),
-    }
-}
-
-/// `http.Redirect` with 307 (Go 1.27's mux), for a location that is already a clean absolute path.
-fn redirect(location: &str, method: &hyper::Method) -> Response {
-    let mut headers = vec![("location", location.to_string())];
-    let mut body = Vec::new();
-    if matches!(*method, hyper::Method::GET | hyper::Method::HEAD) {
-        headers.push(("content-type", "text/html; charset=utf-8".into()));
-    }
-    if *method == hyper::Method::GET {
-        let escaped = location
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&#34;")
-            .replace('\'', "&#39;");
-        body = format!("<a href=\"{escaped}\">Temporary Redirect</a>.\n\n").into_bytes();
-    }
-    Response {
-        status: 307,
-        headers,
-        body,
+        Answer::new(200, headers, &body)
     }
 }
 
@@ -413,103 +354,11 @@ fn parse_accept(header: &str) -> Vec<AcceptClause> {
     clauses
 }
 
-/// `PROMETHEUS_PATH` as a Go `ServeMux` pattern: an exact path, or a subtree when it ends
-/// with `/`. Patterns with a method, a host or wildcards are not supported (§7).
-#[derive(Debug, Clone)]
-struct MetricsPath {
-    /// The unescaped segments before the trailing slash, if any.
-    segments: Vec<String>,
-    subtree: bool,
-}
-
-enum Route {
-    Metrics,
-    Redirect(String),
-    NotFound,
-}
-
-impl MetricsPath {
-    fn parse(path: &str) -> Result<Self, String> {
-        let unsupported = !path.starts_with('/')
-            || path.contains([' ', '\t', '{', '}'])
-            || clean_path(path) != path;
-        if unsupported {
-            return Err(format!("unsupported PROMETHEUS_PATH {path:?}"));
-        }
-        let subtree = path.ends_with('/');
-        let mut segments = unescaped_segments(path);
-        if subtree {
-            segments.pop();
-        }
-        Ok(Self { segments, subtree })
-    }
-
-    /// Go's routing, segment by segment once unescaped.
-    fn matches(&self, segments: &[String]) -> bool {
-        if self.subtree {
-            // The path without its trailing slash was redirected.
-            segments.starts_with(&self.segments)
-        } else {
-            segments == self.segments
-        }
-    }
-
-    /// Go's `ServeMux.findHandler` for this one pattern, on the escaped path: a missing
-    /// trailing slash and an unclean path are redirected, other paths are not found.
-    fn route(&self, request_path: &str, query: Option<&str>) -> Route {
-        let with_query = |path: String| match query {
-            Some(query) if !query.is_empty() => format!("{path}?{query}"),
-            _ => path,
-        };
-        let path = clean_path(request_path);
-        let segments = unescaped_segments(&path);
-        // Only a subtree pattern matches a path with a trailing slash exactly: redirect there,
-        // keeping the request's escaping.
-        if !path.ends_with('/') && self.subtree && segments == self.segments {
-            return Route::Redirect(with_query(format!("{path}/")));
-        }
-        if path != request_path {
-            return Route::Redirect(with_query(path));
-        }
-        if self.matches(&segments) {
-            Route::Metrics
-        } else {
-            Route::NotFound
-        }
-    }
-}
-
-/// The segments of an absolute path, each percent-decoded (an invalid escape is kept as is).
-fn unescaped_segments(path: &str) -> Vec<String> {
-    path.split('/')
-        .skip(1)
-        .map(|segment| crate::go::unescape(segment, false).unwrap_or_else(|| segment.to_string()))
-        .collect()
-}
-
-/// Go's `cleanPath`: `path.Clean` of a rooted path, keeping a trailing slash.
-fn clean_path(p: &str) -> String {
-    if p.is_empty() {
-        return "/".into();
-    }
-    let p = if p.starts_with('/') {
-        p.to_string()
-    } else {
-        format!("/{p}")
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    for part in p.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
-    let mut clean = format!("/{}", parts.join("/"));
-    if p.ends_with('/') && clean != "/" {
-        clean.push('/');
-    }
-    clean
+/// `PROMETHEUS_PATH` as the default mux's pattern: a literal path (patterns with a method,
+/// a host or wildcards are not supported, §7).
+fn metrics_mux(path: &str) -> Result<ServeMux<()>, String> {
+    let mut mux = ServeMux::default();
+    mux.handle(path, ())
+        .map_err(|_| format!("unsupported PROMETHEUS_PATH {path:?}"))?;
+    Ok(mux)
 }

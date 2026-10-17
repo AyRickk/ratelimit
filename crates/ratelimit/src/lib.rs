@@ -1,12 +1,15 @@
 //! A drop-in, superset reimplementation of envoyproxy/ratelimit.
 
 pub mod config;
+pub mod debug;
 pub mod go;
+pub mod goserver;
 pub mod grpc;
 pub mod health;
 pub mod http;
 pub mod limiter;
 pub mod local_cache;
+pub mod mux;
 pub mod net;
 pub mod protojson;
 pub mod redis;
