@@ -1,0 +1,208 @@
+//! envoyproxy/ratelimit's health checker (`src/server/health.go`): the service is healthy when
+//! all its components are, as `/healthcheck` and the gRPC health service report it. The gRPC
+//! health service is a port of grpc-go's (`health/server.go`), which serves `""` as serving.
+
+use ratelimit_proto::grpc::health::v1::{
+    HealthCheckRequest, HealthCheckResponse, HealthListRequest, HealthListResponse,
+    health_check_response::ServingStatus,
+    health_server::{Health, HealthServer},
+};
+use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+use tonic::{Request, Response, Status};
+
+/// Redis: unhealthy until its connection is confirmed at startup.
+pub const REDIS: &str = "redis";
+/// The config: with `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED`, unhealthy until a config with
+/// domains loads.
+pub const CONFIG: &str = "config";
+/// Unhealthy once the process got SIGTERM.
+pub const SIGTERM: &str = "sigterm";
+
+/// The service name upstream reports health for.
+const SERVICE: &str = "ratelimit";
+
+/// grpc-go's health server: a status per service name, and the streams watching them.
+#[derive(Clone)]
+pub struct HealthService {
+    statuses: Arc<Mutex<HashMap<String, ServingStatus>>>,
+    updates: broadcast::Sender<(String, ServingStatus)>,
+}
+
+impl Default for HealthService {
+    fn default() -> Self {
+        Self {
+            statuses: Arc::new(Mutex::new(HashMap::from([(
+                String::new(),
+                ServingStatus::Serving,
+            )]))),
+            updates: broadcast::channel(64).0,
+        }
+    }
+}
+
+impl HealthService {
+    /// `SetServingStatus`.
+    pub fn set_serving_status(&self, service: &str, status: ServingStatus) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .insert(service.to_string(), status);
+        let _ = self.updates.send((service.to_string(), status));
+    }
+
+    pub fn server(&self) -> HealthServer<Self> {
+        HealthServer::new(self.clone())
+    }
+}
+
+type WatchStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Health for HealthService {
+    async fn check(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let statuses = self.statuses.lock().unwrap();
+        match statuses.get(&request.get_ref().service) {
+            Some(status) => Ok(Response::new(HealthCheckResponse {
+                status: *status as i32,
+            })),
+            None => Err(Status::not_found("unknown service")),
+        }
+    }
+
+    async fn list(
+        &self,
+        _: Request<HealthListRequest>,
+    ) -> Result<Response<HealthListResponse>, Status> {
+        let statuses = self.statuses.lock().unwrap();
+        Ok(Response::new(HealthListResponse {
+            statuses: statuses
+                .iter()
+                .map(|(service, status)| {
+                    let response = HealthCheckResponse {
+                        status: *status as i32,
+                    };
+                    (service.clone(), response)
+                })
+                .collect(),
+        }))
+    }
+
+    type WatchStream = WatchStream;
+
+    /// The current status (`SERVICE_UNKNOWN` for a service never set), then each change;
+    /// a status equal to the last one sent is skipped.
+    async fn watch(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<WatchStream>, Status> {
+        let service = request.into_inner().service;
+        let (mut updates, initial) = {
+            let statuses = self.statuses.lock().unwrap();
+            let initial = statuses
+                .get(&service)
+                .copied()
+                .unwrap_or(ServingStatus::ServiceUnknown);
+            (self.updates.subscribe(), initial)
+        };
+        let stream = async_stream(move |sender| async move {
+            let mut last = None;
+            let mut next = Some(initial);
+            loop {
+                if let Some(status) = next.take()
+                    && last != Some(status)
+                {
+                    last = Some(status);
+                    let response = HealthCheckResponse {
+                        status: status as i32,
+                    };
+                    if sender.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+                match updates.recv().await {
+                    Ok((name, status)) if name == service => next = Some(status),
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// A stream fed by `produce` through a channel.
+fn async_stream<F, Fut>(
+    produce: F,
+) -> tokio_stream::wrappers::ReceiverStream<Result<HealthCheckResponse, Status>>
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<Result<HealthCheckResponse, Status>>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(produce(sender));
+    tokio_stream::wrappers::ReceiverStream::new(receiver)
+}
+
+/// The components' health, reported to `/healthcheck` and to the gRPC health service.
+pub struct HealthChecker {
+    components: Mutex<BTreeMap<&'static str, bool>>,
+    ok: AtomicBool,
+    grpc: HealthService,
+}
+
+impl HealthChecker {
+    /// `NewHealthChecker`.
+    pub fn new(grpc: HealthService, healthy_with_at_least_one_config_loaded: bool) -> Self {
+        let mut components = BTreeMap::from([(REDIS, false), (SIGTERM, true)]);
+        if healthy_with_at_least_one_config_loaded {
+            components.insert(CONFIG, false);
+        }
+        grpc.set_serving_status(SERVICE, ServingStatus::NotServing);
+        Self {
+            components: Mutex::new(components),
+            ok: AtomicBool::new(false),
+            grpc,
+        }
+    }
+
+    /// Whether every component is healthy (`/healthcheck`).
+    pub fn is_ok(&self) -> bool {
+        self.ok.load(Ordering::SeqCst)
+    }
+
+    /// `Fail`: the component is unhealthy, and so is the service.
+    pub fn fail(&self, component: &str) -> Result<(), String> {
+        let mut components = self.components.lock().unwrap();
+        let Some(healthy) = components.get_mut(component) else {
+            return Err(format!("Invalid component: {component}"));
+        };
+        *healthy = false;
+        self.ok.store(false, Ordering::SeqCst);
+        self.grpc
+            .set_serving_status(SERVICE, ServingStatus::NotServing);
+        Ok(())
+    }
+
+    /// `Ok`: the component is healthy, and the service too if every component is.
+    pub fn ok(&self, component: &str) -> Result<(), String> {
+        let mut components = self.components.lock().unwrap();
+        let Some(healthy) = components.get_mut(component) else {
+            return Err(format!("Invalid component: {component}"));
+        };
+        *healthy = true;
+        if components.values().all(|healthy| *healthy) {
+            self.ok.store(true, Ordering::SeqCst);
+            self.grpc
+                .set_serving_status(SERVICE, ServingStatus::Serving);
+        }
+        Ok(())
+    }
+}

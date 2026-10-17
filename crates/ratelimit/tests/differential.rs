@@ -103,17 +103,21 @@ async fn free_port() -> u16 {
 }
 
 /// A port for a server that cannot report the one it gets (upstream's Prometheus listener):
-/// taken from a range below the ephemeral ports, which this process walks, so that no other
-/// test's ephemeral port can take it between this check and the server's bind.
+/// taken from a range below the ephemeral ports, so that no other test's ephemeral port can
+/// take it between this check and the server's bind, and never handed out twice, since the
+/// services bind with `SO_REUSEPORT` and two of them would share a port.
 fn reserved_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let base = 20_000 + (std::process::id() % 400) as u16 * 25;
-    loop {
-        let port = base + NEXT.fetch_add(1, Ordering::SeqCst) % 25;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    const RANGE: u16 = 10_000;
+    let base = (std::process::id() % RANGE as u32) as u16;
+    let mut given = GIVEN.lock().unwrap();
+    (0..RANGE)
+        .map(|offset| 20_000 + (base + offset) % RANGE)
+        .find(|port| {
+            !given.contains(port) && std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok()
+        })
+        .inspect(|port| given.push(*port))
+        .expect("a free port")
 }
 
 /// A throwaway Redis server, stopped when dropped.
@@ -3928,17 +3932,19 @@ fn upstream_binary() -> PathBuf {
 struct Service {
     _process: Child,
     grpc: String,
+    /// `HOST:PORT`.
+    http: String,
 }
 
 impl Service {
     async fn start(binary: &std::path::Path, environment: &[(&str, String)]) -> Self {
-        let grpc_port = reserved_port();
+        let (grpc_port, http_port) = (reserved_port(), reserved_port());
         let mut environment = environment.to_vec();
         environment.extend([
             ("GRPC_HOST", "127.0.0.1".to_string()),
             ("GRPC_PORT", grpc_port.to_string()),
             ("HOST", "127.0.0.1".into()),
-            ("PORT", reserved_port().to_string()),
+            ("PORT", http_port.to_string()),
             ("DEBUG_HOST", "127.0.0.1".into()),
             ("DEBUG_PORT", reserved_port().to_string()),
         ]);
@@ -3953,6 +3959,7 @@ impl Service {
         Self {
             _process: process,
             grpc: format!("http://127.0.0.1:{grpc_port}"),
+            http: format!("127.0.0.1:{http_port}"),
         }
     }
 
@@ -4242,5 +4249,225 @@ async fn the_binary_stops_on_sigterm_like_upstream() {
                 .expect("the service did not stop")
                 .unwrap();
         assert!(status.success(), "{}: {status}", binary.display());
+    }
+}
+
+type HealthClient = ratelimit_proto::grpc::health::v1::health_client::HealthClient<Channel>;
+
+/// Both binaries started alike, ready to serve.
+async fn both_services(
+    environment: impl Fn(&Redis) -> Vec<(&'static str, String)>,
+) -> (Vec<Service>, Vec<Redis>) {
+    let redis = vec![Redis::start().await, Redis::start().await];
+    let mut services = Vec::new();
+    for (binary, redis) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&redis)
+    {
+        let service = Service::start(binary, &environment(redis)).await;
+        service.client().await;
+        services.push(service);
+    }
+    (services, redis)
+}
+
+/// `/healthcheck` and gorilla/mux's routing around it answer like upstream's.
+#[tokio::test]
+async fn the_healthcheck_answers_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("health");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (services, _redis) = both_services(|redis| binary_environment(&runtime, redis)).await;
+    for (method, target) in [
+        ("GET", "/healthcheck"),
+        ("POST", "/healthcheck"),
+        ("HEAD", "/healthcheck"),
+        ("GET", "/healthcheck/"),
+        ("GET", "//healthcheck"),
+        ("GET", "/x/../healthcheck?y=1"),
+        ("GET", "/health%63heck"),
+        ("GET", "/other"),
+        ("GET", "/"),
+        ("GET", "/a%20b/../c%2Fd"),
+    ] {
+        let upstream = http_request(&services[0].http, method, target, &[]).await;
+        let ours = http_request(&services[1].http, method, target, &[]).await;
+        assert_eq!(ours, upstream, "{method} {target}");
+    }
+}
+
+/// The gRPC health service answers like grpc-go's: "" and "ratelimit" serving, other names
+/// unknown; with HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED, a config without domains is
+/// unhealthy.
+#[tokio::test]
+async fn health_is_reported_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::grpc::health::v1::{HealthCheckRequest, HealthListRequest};
+    let check = |service: &str| HealthCheckRequest {
+        service: service.into(),
+    };
+    let summary = |r: Result<
+        tonic::Response<ratelimit_proto::grpc::health::v1::HealthCheckResponse>,
+        tonic::Status,
+    >| {
+        r.map(|r| r.into_inner().status)
+            .map_err(|s| format!("{:?}: {}", s.code(), s.message()))
+    };
+    for empty in [false, true] {
+        let runtime = temp_dir("health");
+        let files: &[(&str, &[u8])] = match empty {
+            false => &[
+                ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+                ("current", b"->v1"),
+            ],
+            true => &[("v1/ratelimit/config", b"/"), ("current", b"->v1")],
+        };
+        write_tree(&runtime, files);
+        let (services, _redis) = both_services(|redis| {
+            let mut environment = binary_environment(&runtime, redis);
+            environment.push(("HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED", "true".into()));
+            environment
+        })
+        .await;
+        let mut answers = Vec::new();
+        for service in &services {
+            let mut client = HealthClient::connect(service.grpc.clone()).await.unwrap();
+            let mut statuses = Vec::new();
+            for name in ["", "ratelimit", "other"] {
+                statuses.push(summary(client.check(check(name)).await));
+            }
+            let mut listed: Vec<(String, i32)> = client
+                .list(HealthListRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .statuses
+                .into_iter()
+                .map(|(k, v)| (k, v.status))
+                .collect();
+            listed.sort();
+            let http = http_request(&service.http, "GET", "/healthcheck", &[]).await;
+            answers.push((statuses, listed, http.status, http.body));
+        }
+        assert_eq!(answers[1], answers[0], "empty config: {empty}");
+    }
+}
+
+/// On SIGTERM the service turns unhealthy at once (an open Watch sees it, /healthcheck
+/// answers 500) and stops once the Watch ends.
+#[tokio::test]
+async fn sigterm_turns_health_off_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::grpc::health::v1::HealthCheckRequest;
+    let runtime = temp_dir("health");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (mut services, _redis) = both_services(|redis| binary_environment(&runtime, redis)).await;
+    let mut seen = Vec::new();
+    for service in &mut services {
+        let mut client = HealthClient::connect(service.grpc.clone()).await.unwrap();
+        let request = HealthCheckRequest {
+            service: "ratelimit".into(),
+        };
+        let mut watch = client.watch(request).await.unwrap().into_inner();
+        let first = watch.message().await.unwrap().unwrap().status;
+        let pid = service._process.id().unwrap().to_string();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), watch.message())
+            .await
+            .expect("no health change after SIGTERM")
+            .unwrap()
+            .unwrap()
+            .status;
+        let http = http_request(&service.http, "GET", "/healthcheck", &[])
+            .await
+            .status;
+        drop(watch);
+        drop(client);
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(30), service._process.wait())
+                .await
+                .expect("the service did not stop")
+                .unwrap();
+        seen.push((first, second, http, status.success()));
+    }
+    assert_eq!(seen[1], seen[0]);
+}
+
+/// With REDIS_HEALTH_CHECK_ACTIVE_CONNECTION, losing Redis makes the service unhealthy;
+/// without it, health does not follow Redis.
+#[tokio::test]
+async fn redis_connections_drive_health_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    for active in [true, false] {
+        let runtime = temp_dir("health");
+        write_tree(
+            &runtime,
+            &[
+                ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+                ("current", b"->v1"),
+            ],
+        );
+        let (services, redis) = both_services(|redis| {
+            let mut environment = binary_environment(&runtime, redis);
+            environment.push(("REDIS_HEALTH_CHECK_ACTIVE_CONNECTION", active.to_string()));
+            environment
+        })
+        .await;
+        for redis in &redis {
+            let _: Result<(), _> = redis
+                .client
+                .custom(
+                    CustomCommand::new_static("SHUTDOWN", ClusterHash::Random, false),
+                    vec!["NOSAVE"],
+                )
+                .await;
+        }
+        let expected = if active { 500 } else { 200 };
+        if !active {
+            // Give a wrong implementation time to turn unhealthy before checking it did not.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        for service in &services {
+            let mut status = 0;
+            for _ in 0..100 {
+                status = http_request(&service.http, "GET", "/healthcheck", &[])
+                    .await
+                    .status;
+                if status == expected {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(status, expected, "{} with active={active}", service.grpc);
+        }
     }
 }

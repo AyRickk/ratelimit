@@ -209,6 +209,20 @@ pub fn unescape(s: &str, query: bool) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// `url.URL.EscapedPath` of an unescaped path: bytes outside `[A-Za-z0-9$&+,-./:;=@_~]` as
+/// `%XX`.
+pub fn escape_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"$&+,-./:;=@_~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out += &format!("%{b:02X}");
+        }
+    }
+    out
+}
+
 /// Why a `strconv` parser failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumError {
