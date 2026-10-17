@@ -1,6 +1,7 @@
 //! The `envoy.service.ratelimit.v3.RateLimitService` gRPC endpoint.
 
 use crate::service::{RateLimitCache, RateLimitService, ServiceError};
+use crate::stats::ServerStats;
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_service_server::{self, RateLimitServiceServer},
@@ -10,13 +11,15 @@ use tonic::{Request, Response, Status};
 
 pub struct GrpcService<C> {
     service: Arc<RateLimitService<C>>,
+    stats: ServerStats,
 }
 
-/// The gRPC server for `service`.
+/// The gRPC server for `service`, its calls counted in `stats`.
 pub fn server<C: RateLimitCache>(
     service: Arc<RateLimitService<C>>,
+    stats: ServerStats,
 ) -> RateLimitServiceServer<GrpcService<C>> {
-    RateLimitServiceServer::new(GrpcService { service })
+    RateLimitServiceServer::new(GrpcService { service, stats })
 }
 
 #[tonic::async_trait]
@@ -26,8 +29,9 @@ impl<C: RateLimitCache> rate_limit_service_server::RateLimitService for GrpcServ
         request: Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, Status> {
         // Upstream returns plain Go errors, which grpc-go sends as UNKNOWN with the error text.
-        self.service
-            .should_rate_limit(request.get_ref())
+        let call = self.service.should_rate_limit(request.get_ref());
+        self.stats
+            .record("ShouldRateLimit", call)
             .await
             .map(Response::new)
             .map_err(|e| match e {

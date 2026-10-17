@@ -2,6 +2,7 @@
 //! all its components are, as `/healthcheck` and the gRPC health service report it. The gRPC
 //! health service is a port of grpc-go's (`health/server.go`), which serves `""` as serving.
 
+use crate::stats::ServerStats;
 use ratelimit_proto::grpc::health::v1::{
     HealthCheckRequest, HealthCheckResponse, HealthListRequest, HealthListResponse,
     health_check_response::ServingStatus,
@@ -31,6 +32,8 @@ const SERVICE: &str = "ratelimit";
 pub struct HealthService {
     statuses: Arc<Mutex<HashMap<String, ServingStatus>>>,
     updates: broadcast::Sender<(String, ServingStatus)>,
+    /// Upstream's interceptor counts the unary calls (`Check`, `List`).
+    stats: Option<ServerStats>,
 }
 
 impl Default for HealthService {
@@ -41,11 +44,28 @@ impl Default for HealthService {
                 ServingStatus::Serving,
             )]))),
             updates: broadcast::channel(64).0,
+            stats: None,
         }
     }
 }
 
 impl HealthService {
+    /// The service with its unary calls counted in `stats`.
+    pub fn with_stats(self, stats: ServerStats) -> Self {
+        Self {
+            stats: Some(stats),
+            ..self
+        }
+    }
+
+    /// `call`, counted as `method` when stats are kept.
+    async fn record<T>(&self, method: &str, call: impl std::future::Future<Output = T>) -> T {
+        match &self.stats {
+            Some(stats) => stats.record(method, call).await,
+            None => call.await,
+        }
+    }
+
     /// `SetServingStatus`.
     pub fn set_serving_status(&self, service: &str, status: ServingStatus) {
         self.statuses
@@ -69,31 +89,37 @@ impl Health for HealthService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
-        let statuses = self.statuses.lock().unwrap();
-        match statuses.get(&request.get_ref().service) {
-            Some(status) => Ok(Response::new(HealthCheckResponse {
-                status: *status as i32,
-            })),
-            None => Err(Status::not_found("unknown service")),
-        }
+        let call = async {
+            let statuses = self.statuses.lock().unwrap();
+            match statuses.get(&request.get_ref().service) {
+                Some(status) => Ok(Response::new(HealthCheckResponse {
+                    status: *status as i32,
+                })),
+                None => Err(Status::not_found("unknown service")),
+            }
+        };
+        self.record("Check", call).await
     }
 
     async fn list(
         &self,
         _: Request<HealthListRequest>,
     ) -> Result<Response<HealthListResponse>, Status> {
-        let statuses = self.statuses.lock().unwrap();
-        Ok(Response::new(HealthListResponse {
-            statuses: statuses
-                .iter()
-                .map(|(service, status)| {
-                    let response = HealthCheckResponse {
-                        status: *status as i32,
-                    };
-                    (service.clone(), response)
-                })
-                .collect(),
-        }))
+        let call = async {
+            let statuses = self.statuses.lock().unwrap();
+            Ok(Response::new(HealthListResponse {
+                statuses: statuses
+                    .iter()
+                    .map(|(service, status)| {
+                        let response = HealthCheckResponse {
+                            status: *status as i32,
+                        };
+                        (service.clone(), response)
+                    })
+                    .collect(),
+            }))
+        };
+        self.record("List", call).await
     }
 
     type WatchStream = WatchStream;

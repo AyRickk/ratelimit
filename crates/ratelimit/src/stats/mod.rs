@@ -1,7 +1,7 @@
 //! Counters, named as envoyproxy/ratelimit names them (`src/stats/manager_impl.go`): one per
 //! name, kept for the life of the process like gostats' store, so a counter recreated by a
 //! config reload or a request keeps its value. Flushing sends each counter's increase since
-//! the previous flush to a [`Sink`].
+//! the previous flush to a [`Sink`]; a timer's values go to it at once, as gostats' do.
 
 mod dogstatsd;
 mod logging;
@@ -18,7 +18,7 @@ pub use statsd::StatsdSink;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 /// A counter, shared by everything holding the same name.
 #[derive(Debug, Clone, Default)]
@@ -46,10 +46,37 @@ impl Counter {
     }
 }
 
+/// The sink the store flushes to, once flushing starts.
+#[derive(Clone, Default)]
+struct SinkCell(Arc<OnceLock<Arc<Sink>>>);
+
+impl std::fmt::Debug for SinkCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SinkCell").finish_non_exhaustive()
+    }
+}
+
+/// A timer (gostats' `timer`): each value goes to the sink as it is added.
+#[derive(Debug, Clone)]
+pub struct Timer {
+    name: String,
+    sink: SinkCell,
+}
+
+impl Timer {
+    /// `AddValue`.
+    pub fn add_value(&self, value: f64) {
+        if let Some(sink) = self.sink.0.get() {
+            sink.flush_timer(&self.name, value);
+        }
+    }
+}
+
 /// The counters of the service (`ratelimit.service.*`).
 #[derive(Debug, Default)]
 pub struct Stats {
     counters: Mutex<HashMap<String, Counter>>,
+    sink: SinkCell,
     /// `EXTRA_TAGS`, serialized as gostats appends them to every name.
     tags: String,
     /// How many `EXTRA_TAGS` keys are reserved words.
@@ -124,6 +151,14 @@ impl Stats {
     /// The counter `name` of `scope`, with the tags.
     pub fn scope_counter(&self, scope: &Scope, name: &str) -> Counter {
         self.counter(&format!("{}.{name}{}", scope.name, self.tags))
+    }
+
+    /// The timer `name` of `scope`, with the tags.
+    pub fn scope_timer(&self, scope: &Scope, name: &str) -> Timer {
+        Timer {
+            name: format!("{}.{name}{}", scope.name, self.tags),
+            sink: self.sink.clone(),
+        }
     }
 
     /// The counter named `name`, created at 0 the first time.
@@ -224,6 +259,8 @@ pub fn flush_every(
     sink: Sink,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let sink = Arc::new(sink);
+    let _ = stats.sink.0.set(sink.clone());
     tokio::spawn(async move {
         let start = tokio::time::Instant::now() + interval;
         let mut ticks = tokio::time::interval_at(start, interval);
@@ -234,6 +271,36 @@ pub fn flush_every(
             stats.flush(&sink).await;
         }
     })
+}
+
+/// Upstream's `ServerReporter` (`src/metrics/metrics.go`), the gRPC server's interceptor:
+/// `ratelimit_server.<method>.total_requests`, and `response_time` in milliseconds.
+#[derive(Debug, Clone)]
+pub struct ServerStats {
+    stats: Arc<Stats>,
+    scope: Scope,
+}
+
+impl ServerStats {
+    /// `NewServerReporter(ScopeWithTags("ratelimit_server", EXTRA_TAGS))`.
+    pub fn new(stats: Arc<Stats>) -> Self {
+        let scope = stats.scope_with_tags("ratelimit_server");
+        Self { stats, scope }
+    }
+
+    /// The interceptor around a unary call of `method`, once its request is decoded.
+    pub async fn record<F: std::future::Future>(&self, method: &str, call: F) -> F::Output {
+        let start = std::time::Instant::now();
+        let total_requests = format!("{method}.total_requests");
+        self.stats.scope_counter(&self.scope, &total_requests).inc();
+        let output = call.await;
+        let timer = self
+            .stats
+            .scope_timer(&self.scope, &format!("{method}.response_time"));
+        // `time.Since(start).Milliseconds()`: whole milliseconds.
+        timer.add_value(start.elapsed().as_millis() as f64);
+        output
+    }
 }
 
 /// The counters of one limit.

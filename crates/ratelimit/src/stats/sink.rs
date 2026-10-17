@@ -30,6 +30,16 @@ impl Sink {
         }
     }
 
+    pub fn flush_timer(&self, name: &str, value: f64) {
+        match self {
+            Sink::Null => {}
+            Sink::Logging(sink) => sink.flush_timer(name, value),
+            Sink::Statsd(sink) => sink.flush_timer(name, value),
+            Sink::Dogstatsd(sink) => sink.flush_timer(name, value),
+            Sink::Prometheus(sink) => sink.flush_timer(name, value),
+        }
+    }
+
     /// Delivers what was flushed so far.
     pub async fn flush(&self) {
         match self {

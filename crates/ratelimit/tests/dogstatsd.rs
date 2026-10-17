@@ -299,3 +299,22 @@ async fn the_address_is_resolved_like_go() {
     assert!(error.contains("too many colons"), "{error}");
     assert!(DogStatsdSink::with_container_id("[::1]", port, settings(), None).is_ok());
 }
+
+/// A timer is `Timing(name, time.Duration(milliseconds) * time.Millisecond)`: whole
+/// milliseconds with six decimals, then the tags and the container ID.
+#[tokio::test]
+async fn timers_are_whole_milliseconds() {
+    let (socket, port) = server().await;
+    let settings = DogStatsdSettings {
+        env: "prod".into(),
+        ..Default::default()
+    };
+    let sink =
+        DogStatsdSink::with_container_id("127.0.0.1", port, settings, Some("abc".into())).unwrap();
+    sink.flush_timer("t.__k=v", 2.7);
+    sink.flush_timer("u", 0.0);
+    assert_eq!(
+        datagrams(&socket).await.concat(),
+        "t:2.000000|ms|#env:prod,k:v|c:abc\nu:0.000000|ms|#env:prod|c:abc\n"
+    );
+}

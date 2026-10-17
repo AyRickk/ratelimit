@@ -246,3 +246,43 @@ async fn tags_follow_gostats() {
         output.text()
     );
 }
+
+/// Timers as gostats writes them: whole values as integers, others with six decimals
+/// (`net_sink.go`'s `FlushTimer`, which takes integers only below `math.MaxUint64`); the
+/// logging sink's `"timer"` line.
+#[tokio::test]
+async fn timers_are_written_like_gostats() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    let sink = StatsdSink::new("127.0.0.1", port, StatsdProtocol::Udp);
+    for (name, value) in [
+        ("a", 3.0),
+        ("b", 1.5),
+        ("c", -2.0),
+        ("d", 0.0),
+        ("e", 1e20),
+        ("f", -0.0),
+    ] {
+        sink.flush_timer(name, value);
+    }
+    sink.flush().await;
+    let mut buffer = vec![0; 65536];
+    let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buffer))
+        .await
+        .expect("a datagram")
+        .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&buffer[..n]).unwrap(),
+        "a:3|ms\nb:1.500000|ms\nc:-2.000000|ms\nd:0|ms\ne:100000000000000000000.000000|ms\nf:0|ms\n"
+    );
+
+    let output = Output::default();
+    logging_sink(&output).flush_timer("t", 3.5);
+    assert_eq!(
+        output.text(),
+        concat!(
+            r#"{"level":"debug","ts":1700000000.123457,"logger":"gostats.loggingsink","msg":"flushing timer","json":{"name":"t","type":"timer","value":"3.500000"}}"#,
+            "\n"
+        )
+    );
+}

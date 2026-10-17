@@ -218,7 +218,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ✅ | `tests/differential.rs` |
 | `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ✅ | `tests/differential.rs` |
 | `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
-| `ratelimit_server.<method>.total_requests` / `response_time` (health `Check` and `List` included) | ⬜ | |
+| `ratelimit_server.<method>.total_requests` / `response_time` (health `Check` and `List` included) | ✅ | `server_stats_are_reported_like_upstream` in `tests/differential.rs` (statsd, DogStatsD, Prometheus with the default mapper's histogram); timer lines: `tests/stats.rs`, `tests/dogstatsd.rs` |
 | `runtime.load_attempts`, `runtime.load_failures` (with `EXTRA_TAGS`, `reserved_tag` counted again) | ✅ | `tests/differential.rs` |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.num_values` (gauges) | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
