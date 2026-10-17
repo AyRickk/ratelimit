@@ -75,6 +75,15 @@ pub fn format_float(v: f64) -> String {
     format!("{v}")
 }
 
+/// `strconv.FormatFloat(v, 'f', precision, 64)`.
+pub fn format_fixed(v: f64, precision: usize) -> String {
+    match v {
+        v if v.is_nan() => "NaN".into(),
+        v if v.is_infinite() => if v > 0.0 { "+Inf" } else { "-Inf" }.into(),
+        v => format!("{v:.precision$}"),
+    }
+}
+
 /// `path.Clean` (and `filepath.Clean` on Unix): the shortest equivalent path, lexically.
 pub fn clean(path: &str) -> String {
     if path.is_empty() {

@@ -567,7 +567,11 @@ impl Subject {
         let address = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(grpc::server(service.clone()))
+                // The oracle's server has no interceptor: these stats are kept apart.
+                .add_service(grpc::server(
+                    service.clone(),
+                    ratelimit::stats::ServerStats::new(Arc::new(Stats::default())),
+                ))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let client = RateLimitServiceClient::connect(format!("http://{address}"))
@@ -5699,5 +5703,235 @@ async fn a_busy_debug_port_is_ignored_like_upstream() {
             .await
             .status;
         assert_eq!(status, 200, "{}", service.grpc);
+    }
+}
+
+/// The calls whose server stats are compared: `ShouldRateLimit`, health `Check` (one for a
+/// service it does not know) and `List`, which upstream's interceptor counts, and a `Watch`,
+/// which it does not (streams are not intercepted).
+async fn server_calls(service: &Service) {
+    use ratelimit_proto::grpc::health::v1::{HealthCheckRequest, HealthListRequest};
+    let mut client = service.client().await;
+    for _ in 0..3 {
+        client
+            .should_rate_limit(request("llm", &[&[("user", "a")]]))
+            .await
+            .unwrap();
+    }
+    let mut health = HealthClient::connect(service.grpc.clone()).await.unwrap();
+    for name in ["ratelimit", "unknown"] {
+        let _ = health
+            .check(HealthCheckRequest {
+                service: name.into(),
+            })
+            .await;
+    }
+    health.list(HealthListRequest {}).await.unwrap();
+    let mut watch = health
+        .watch(HealthCheckRequest {
+            service: "ratelimit".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    watch.message().await.unwrap();
+}
+
+/// Statsd lines summed by name: counters by value, timers by count once their value (a few
+/// milliseconds, read from each side's clock) is checked to be small.
+fn server_stat_lines(lines: &[String]) -> BTreeMap<String, u64> {
+    let mut sums = BTreeMap::new();
+    for line in lines {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.starts_with("ratelimit_server.") && name != "reserved_tag" {
+            continue;
+        }
+        let (value, kind) = rest.split_once('|').unwrap();
+        let kind = kind.split('|').next().unwrap();
+        let value: f64 = value.parse().unwrap();
+        let (key, add) = match kind {
+            "ms" => {
+                assert!((0.0..1000.0).contains(&value), "{line}");
+                assert_eq!(value.trunc(), value, "{line}");
+                (format!("{name}|ms {}", rest.split_once('|').unwrap().1), 1)
+            }
+            _ => (
+                format!("{name}|{}", rest.split_once('|').unwrap().1),
+                value as u64,
+            ),
+        };
+        *sums.entry(key).or_default() += add;
+    }
+    sums
+}
+
+/// The gRPC server's stats (`ratelimit_server.<method>.total_requests` and `response_time`)
+/// reach statsd, DogStatsD and Prometheus like upstream's, with `EXTRA_TAGS`.
+#[tokio::test]
+async fn server_stats_are_reported_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("server-stats");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let stats_environment = |redis: &Redis, sink: Vec<(&'static str, String)>| {
+        let mut environment = binary_environment(&runtime, redis);
+        environment.extend([
+            ("DISABLE_STATS", "false".to_string()),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+        ]);
+        environment.extend(sink);
+        environment
+    };
+    let tagged = ("EXTRA_TAGS", "host:h,k:v".to_string());
+
+    // statsd over TCP.
+    let servers = [StatsdServer::start().await, StatsdServer::start().await];
+    let mut sums = Vec::new();
+    let redis = [Redis::start().await, Redis::start().await];
+    for ((binary, redis), server) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&redis)
+    .zip(&servers)
+    {
+        let sink = vec![
+            ("STATSD_HOST", "127.0.0.1".to_string()),
+            ("STATSD_PORT", server.address.port().to_string()),
+            tagged.clone(),
+        ];
+        let service = Service::start(binary, &stats_environment(redis, sink)).await;
+        server_calls(&service).await;
+        sums.push(wait_for_server_stats(|| server.lines.lock().unwrap().clone()).await);
+    }
+    assert!(
+        sums[0]
+            .keys()
+            .any(|k| k.contains("ShouldRateLimit.response_time")),
+        "{:?}",
+        sums[0]
+    );
+    assert_eq!(sums[1], sums[0], "statsd");
+
+    // DogStatsD.
+    let servers = [
+        DogStatsdServer::start().await,
+        DogStatsdServer::start().await,
+    ];
+    let mut sums = Vec::new();
+    for ((binary, redis), server) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&redis)
+    .zip(&servers)
+    {
+        let sink = vec![
+            ("USE_STATSD", "false".to_string()),
+            ("USE_DOG_STATSD", "true".into()),
+            ("STATSD_HOST", "127.0.0.1".into()),
+            ("STATSD_PORT", server.address.port().to_string()),
+            tagged.clone(),
+        ];
+        let service = Service::start(binary, &stats_environment(redis, sink)).await;
+        server_calls(&service).await;
+        let lines = || {
+            let datagrams = server.datagrams.lock().unwrap();
+            datagrams
+                .iter()
+                .flat_map(|d| {
+                    String::from_utf8_lossy(d)
+                        .lines()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        sums.push(wait_for_server_stats(lines).await);
+    }
+    assert!(
+        sums[0]
+            .keys()
+            .any(|k| k.contains("ShouldRateLimit.response_time")),
+        "{:?}",
+        sums[0]
+    );
+    assert_eq!(sums[1], sums[0], "DogStatsD");
+
+    // Prometheus, with the default mapper and no `EXTRA_TAGS` (which would leave the names
+    // unmapped, and the timers summaries): a counter and a histogram per method, whose
+    // buckets depend on each side's timing and are left out.
+    let mut series = Vec::new();
+    for (binary, redis) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .zip(&redis)
+    {
+        let address = format!("127.0.0.1:{}", reserved_port());
+        let sink = vec![
+            ("USE_STATSD", "false".to_string()),
+            ("USE_PROMETHEUS", "true".into()),
+            ("PROMETHEUS_ADDR", address.clone()),
+        ];
+        let service = Service::start(binary, &stats_environment(redis, sink)).await;
+        server_calls(&service).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let lines = loop {
+            let scraped = http_request(&address, "GET", "/metrics", &[]).await;
+            let lines: Vec<String> = scraped
+                .body
+                .lines()
+                .filter(|l| {
+                    l.starts_with("ratelimit_service_total_requests")
+                        || l.starts_with("ratelimit_service_response_time_seconds_count")
+                        || l.starts_with("# TYPE ratelimit_service_")
+                })
+                .map(String::from)
+                .collect();
+            // 6 calls counted, and 6 timed.
+            let total: f64 = lines
+                .iter()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .sum();
+            if total >= 12.0 || std::time::Instant::now() > deadline {
+                break lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        series.push(lines);
+    }
+    assert!(!series[0].is_empty());
+    assert_eq!(series[1], series[0], "Prometheus");
+}
+
+/// The server's stats from `lines` once every call of `server_calls` is in them (3
+/// `ShouldRateLimit`, 2 `Check`, 1 `List`, each counted and timed), or after 10 s.
+async fn wait_for_server_stats(lines: impl Fn() -> Vec<String>) -> BTreeMap<String, u64> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let sums = server_stat_lines(&lines());
+        let calls: u64 = sums
+            .iter()
+            .filter(|(name, _)| name.starts_with("ratelimit_server."))
+            .map(|(_, n)| n)
+            .sum();
+        if calls >= 12 || std::time::Instant::now() > deadline {
+            return sums;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }

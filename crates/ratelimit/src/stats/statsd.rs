@@ -94,6 +94,15 @@ impl StatsdSink {
         self.write_line(format!("{name}:{value}|c\n").as_bytes());
     }
 
+    /// A whole value as an integer, any other with six decimals.
+    pub fn flush_timer(&self, name: &str, value: f64) {
+        let line = match (0.0..u64::MAX as f64).contains(&value) && value.trunc() == value {
+            true => format!("{name}:{}|ms\n", value as u64),
+            false => format!("{name}:{}|ms\n", crate::go::format_fixed(value, 6)),
+        };
+        self.write_line(line.as_bytes());
+    }
+
     /// Adds `line` to the buffer, queueing the buffer first when the line does not fit. A line
     /// longer than a buffer is queued on its own.
     fn write_line(&self, line: &[u8]) {

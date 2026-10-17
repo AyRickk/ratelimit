@@ -27,6 +27,10 @@ impl LoggingSink {
         self.log(Some(name), "counter", value as f64);
     }
 
+    pub fn flush_timer(&self, name: &str, value: f64) {
+        self.log(Some(name), "timer", value);
+    }
+
     /// The line closing every flush.
     pub fn flush(&self) {
         self.log(None, "all stats", 0.0);

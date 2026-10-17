@@ -308,9 +308,15 @@ impl DogStatsdSink {
     }
 
     pub fn flush_counter(&self, name: &str, value: u64) {
-        let (name, tags) = self.mogrify(name);
         // As upstream: `int64(value)`.
-        let mut line = format!("{name}:{}|c", value as i64);
+        self.write_metric(name, &format!("{}|c", value as i64));
+    }
+
+    /// A line for the metric `name` (mogrified) of `value` (with its type), its tags and the
+    /// container's ID.
+    fn write_metric(&self, name: &str, value: &str) {
+        let (name, tags) = self.mogrify(name);
+        let mut line = format!("{name}:{value}");
         let tags: Vec<String> = self
             .global_tags
             .iter()
@@ -328,6 +334,16 @@ impl DogStatsdSink {
         }
         line.push('\n');
         self.write_line(line.as_bytes());
+    }
+
+    /// `Timing(name, time.Duration(milliseconds) * time.Millisecond)`: whole milliseconds, with
+    /// six decimals.
+    pub fn flush_timer(&self, name: &str, milliseconds: f64) {
+        let milliseconds = milliseconds.trunc();
+        self.write_metric(
+            name,
+            &format!("{}|ms", crate::go::format_fixed(milliseconds, 6)),
+        );
     }
 
     /// Adds `line` to the datagram being filled, sending that one first when the line does not

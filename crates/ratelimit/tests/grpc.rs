@@ -62,7 +62,10 @@ descriptors:
     let address = listener.local_addr().unwrap();
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(grpc::server(service))
+            .add_service(grpc::server(
+                service,
+                ratelimit::stats::ServerStats::new(Arc::new(ratelimit::stats::Stats::default())),
+            ))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     RateLimitServiceClient::connect(format!("http://{address}"))

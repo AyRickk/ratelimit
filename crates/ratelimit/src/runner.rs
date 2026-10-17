@@ -120,7 +120,12 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
         "GRPC_XDS_SOTW" => return Err("CONFIG_TYPE=GRPC_XDS_SOTW is not supported yet".into()),
         other => return Err(format!("Invalid setting for ConfigType: {other}")),
     };
-    let health_service = HealthService::default();
+    // runner.go: the server's reporter is made before the server.
+    let server_stats = crate::stats::ServerStats::new(stats.clone());
+    let health_service = HealthService::default().with_stats(server_stats.clone());
+    // NewServer's own scope (that of the `go.*` and `localcache.*` gauges): its tags count in
+    // `reserved_tag` like every tagged scope's.
+    stats.count_tagged_scope();
     let with_config = settings.healthy_with_at_least_one_config_loaded;
     let health = Arc::new(HealthChecker::new(health_service.clone(), with_config));
     let sigterm_health = health.clone();
@@ -190,7 +195,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), String> {
     }
     let server = builder
         .add_service(health_service.server())
-        .add_service(grpc::server(service.clone()));
+        .add_service(grpc::server(service.clone(), server_stats));
     let stop = shutting_down(signals.stop);
     // Start: the debug port first; a failure to listen there is not fatal (upstream logs it).
     let (grpc_done, grpc_stopped) = tokio::sync::watch::channel(false);
