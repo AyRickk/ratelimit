@@ -206,7 +206,7 @@ fn resolve_udp(address: &str) -> Result<std::net::SocketAddr, String> {
                 .rsplit_once(':')
                 .ok_or_else(|| format!("address {address}: missing port in address"))?;
             if host.contains(':') {
-                return Err(format!("address {address}: too many colons"));
+                return Err(format!("address {address}: too many colons in address"));
             }
             (host, port, false)
         }

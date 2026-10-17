@@ -5,7 +5,7 @@
 
 use super::MetricType;
 use super::mapper::{Action, DEFAULT_BUCKETS, Mapper, ObserverType};
-use crate::config::yaml::go_format_float as go_float;
+use crate::go::format_float as go_float;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
@@ -165,7 +165,10 @@ impl Vector {
 /// `NewDesc`'s checks of a metric name and its label names.
 fn desc_error(name: &str, label_names: &[String]) -> Option<String> {
     if !is_valid_metric_name(name) {
-        return Some(format!("{} is not a valid metric name", go_quote(name)));
+        return Some(format!(
+            "{} is not a valid metric name",
+            crate::go::quote(name)
+        ));
     }
     label_names
         .iter()
@@ -173,8 +176,8 @@ fn desc_error(name: &str, label_names: &[String]) -> Option<String> {
         .map(|l| {
             format!(
                 "{} is not a valid label name for metric {}",
-                go_quote(l),
-                go_quote(name)
+                crate::go::quote(l),
+                crate::go::quote(name)
             )
         })
 }
@@ -566,8 +569,8 @@ impl Exporter {
                                 "collected metric {} {} has help {} but should have {}",
                                 vector.name,
                                 sample.dto(),
-                                go_quote(&vector.help),
-                                go_quote(family.help)
+                                crate::go::quote(&vector.help),
+                                crate::go::quote(family.help)
                             ));
                             continue;
                         }
@@ -602,7 +605,7 @@ impl Exporter {
                 if !seen.insert((vector.name.clone(), identity)) {
                     errors.push(format!(
                         "collected metric {} {{ {}}} was collected before with the same name and label values",
-                        go_quote(&vector.name),
+                        crate::go::quote(&vector.name),
                         sample.dto()
                     ));
                     continue;
@@ -685,7 +688,13 @@ impl Sample<'_> {
         let mut out: Vec<String> = self
             .labels
             .iter()
-            .map(|(k, v)| format!("label:{{name:{} value:{}}}", go_quote(k), go_quote(v)))
+            .map(|(k, v)| {
+                format!(
+                    "label:{{name:{} value:{}}}",
+                    crate::go::quote(k),
+                    crate::go::quote(v)
+                )
+            })
             .collect();
         let value = match self.value {
             Value::Counter { whole, fraction } => {
@@ -796,8 +805,8 @@ fn suffix_collision(
     {
         return Err(format!(
             "collected metric named {} collides with previously collected histogram named {}",
-            go_quote(name),
-            go_quote(base)
+            crate::go::quote(name),
+            crate::go::quote(base)
         ));
     }
     if kind == Kind::Histogram {
@@ -811,8 +820,8 @@ fn suffix_collision(
                 };
                 return Err(format!(
                     "collected {what} named {} collides with previously collected metric named {}",
-                    go_quote(name),
-                    go_quote(&other)
+                    crate::go::quote(name),
+                    crate::go::quote(&other)
                 ));
             }
         }
@@ -839,30 +848,5 @@ pub(super) fn escape_metric_name(name: &str) -> String {
         }
         previous = Some(c);
     }
-    out
-}
-
-/// Go's `%q` of a string, for error messages: ASCII control characters escaped, other
-/// characters as they are.
-pub(super) fn go_quote(s: &str) -> String {
-    let mut out = String::from('"');
-    for c in s.chars() {
-        match c {
-            '"' => out += "\\\"",
-            '\\' => out += "\\\\",
-            '\x07' => out += "\\a",
-            '\x08' => out += "\\b",
-            '\x0c' => out += "\\f",
-            '\n' => out += "\\n",
-            '\r' => out += "\\r",
-            '\t' => out += "\\t",
-            '\x0b' => out += "\\v",
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }

@@ -28,6 +28,11 @@
 //	                                         stale series
 //
 // GET /stats and POST /flush answer once the sink's exporter has handled every event.
+//
+// With -settings, the oracle only prints upstream's settings.NewSettings() for its environment
+// as JSON ({"settings": {VARIABLE: value}, "sink": failure}, durations in nanoseconds, floats
+// as strconv.FormatFloat(v, 'g', -1, 64) text, and how creating the stats sink fails, if it
+// does), or the panic it raises ({"error": "..."}), and exits.
 package main
 
 import (
@@ -40,6 +45,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,6 +252,72 @@ func mapNames(m *mapper.MetricMapper, body string) []mapResult {
 	return results
 }
 
+// printSettings prints settings.NewSettings() as JSON, or its panic.
+func printSettings() {
+	encoder := json.NewEncoder(os.Stdout)
+	defer func() {
+		if r := recover(); r != nil {
+			_ = encoder.Encode(map[string]string{"error": fmt.Sprint(r)})
+		}
+	}()
+	s := settings.NewSettings()
+	values := map[string]any{}
+	v := reflect.ValueOf(s)
+	for i := 0; i < v.NumField(); i++ {
+		key := v.Type().Field(i).Tag.Get("envconfig")
+		if key == "" {
+			continue
+		}
+		switch value := v.Field(i).Interface().(type) {
+		case time.Duration:
+			values[key] = int64(value)
+		case float32:
+			values[key] = strconv.FormatFloat(float64(value), 'g', -1, 64)
+		case float64:
+			values[key] = strconv.FormatFloat(value, 'g', -1, 64)
+		case []string:
+			values[key] = append([]string{}, value...)
+		case map[string]string:
+			if value == nil {
+				value = map[string]string{}
+			}
+			values[key] = value
+		default:
+			values[key] = value
+		}
+	}
+	_ = encoder.Encode(map[string]any{"settings": values, "sink": sinkError(s)})
+}
+
+// sinkError is how the runner's stats sink selection fails for s (its Fatalf messages or
+// panics), or "" when it does not; the Prometheus sink, which would listen, is not created.
+func sinkError(s settings.Settings) (failure string) {
+	defer func() {
+		if r := recover(); r != nil {
+			failure = fmt.Sprint(r)
+		}
+	}()
+	several := "Error: unable to use more than one stats sink at the same time. Set one of USE_DOG_STATSD, USE_STATSD, USE_PROMETHEUS."
+	switch {
+	case s.DisableStats:
+	case s.UseDogStatsd:
+		if s.UseStatsd || s.UsePrometheus {
+			return several
+		}
+		if _, err := godogstats.NewSink(godogstats.WithStatsdHost(s.StatsdHost),
+			godogstats.WithStatsdPort(s.StatsdPort),
+			godogstats.WithMogrifierFromEnv(s.UseDogStatsdMogrifiers)); err != nil {
+			return fmt.Sprintf("Failed to create dogstatsd sink: %v", err)
+		}
+	case s.UseStatsd:
+		if s.UsePrometheus {
+			return several
+		}
+		gostats.NewTCPStatsdSink(gostats.WithStatsdHost(s.StatsdHost), gostats.WithStatsdPort(s.StatsdPort))
+	}
+	return ""
+}
+
 func main() {
 	grpcAddr := flag.String("grpc", "127.0.0.1:0", "gRPC listen address")
 	controlAddr := flag.String("control", "127.0.0.1:0", "control HTTP listen address")
@@ -259,7 +332,12 @@ func main() {
 	prometheusPath := flag.String("prometheus-path", "/metrics", "PROMETHEUS_PATH")
 	prometheusMapper := flag.String("prometheus-mapper", "", "PROMETHEUS_MAPPER_YAML")
 	prometheusMs := flag.Bool("prometheus-ms", false, "PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS")
+	printSettingsOnly := flag.Bool("settings", false, "print settings.NewSettings() as JSON and exit")
 	flag.Parse()
+	if *printSettingsOnly {
+		printSettings()
+		return
+	}
 
 	ctx := context.Background()
 	sink := &countingSink{counters: map[string]uint64{}}

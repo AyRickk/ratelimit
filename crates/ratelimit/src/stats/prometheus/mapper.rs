@@ -517,7 +517,7 @@ fn go_sprintf(format: &str, args: &[&str]) -> String {
                     next += 1;
                     match verb {
                         's' | 'v' => out += arg,
-                        'q' => out += &super::exporter::go_quote(arg),
+                        'q' => out += &crate::go::quote(arg),
                         'x' => arg.bytes().for_each(|b| out += &format!("{b:02x}")),
                         'X' => arg.bytes().for_each(|b| out += &format!("{b:02X}")),
                         'T' => out += "string",
@@ -580,99 +580,6 @@ fn expand(regex: &Regex, template: &str, captures: &regex::Captures) -> String {
         }
     }
     out + rest
-}
-
-/// Go's `time.ParseDuration`, in nanoseconds.
-fn go_parse_duration(text: &str) -> Option<i64> {
-    const OVERFLOW: u64 = 1 << 63;
-    let (negative, mut s) = match text.as_bytes().first() {
-        Some(b'-') => (true, &text[1..]),
-        Some(b'+') => (false, &text[1..]),
-        _ => (false, text),
-    };
-    if s == "0" {
-        return Some(0);
-    }
-    if s.is_empty() {
-        return None;
-    }
-    let mut total: u64 = 0;
-    while !s.is_empty() {
-        if !(s.starts_with('.') || s.starts_with(|c: char| c.is_ascii_digit())) {
-            return None;
-        }
-        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
-        let mut whole: u64 = 0;
-        for b in s[..digits].bytes() {
-            if whole > OVERFLOW / 10 {
-                return None;
-            }
-            whole = whole * 10 + u64::from(b - b'0');
-            if whole > OVERFLOW {
-                return None;
-            }
-        }
-        s = &s[digits..];
-        let mut fraction: u64 = 0;
-        let mut scale = 1.0;
-        let mut fraction_digits = 0;
-        if let Some(after) = s.strip_prefix('.') {
-            fraction_digits = after.bytes().take_while(u8::is_ascii_digit).count();
-            let mut overflow = false;
-            for b in after[..fraction_digits].bytes() {
-                if overflow {
-                    continue;
-                }
-                if fraction > (OVERFLOW - 1) / 10 {
-                    overflow = true;
-                    continue;
-                }
-                let next = fraction * 10 + u64::from(b - b'0');
-                if next > OVERFLOW {
-                    overflow = true;
-                    continue;
-                }
-                fraction = next;
-                scale *= 10.0;
-            }
-            s = &after[fraction_digits..];
-        }
-        if digits == 0 && fraction_digits == 0 {
-            return None;
-        }
-        let unit_len = s
-            .bytes()
-            .take_while(|b| *b != b'.' && !b.is_ascii_digit())
-            .count();
-        let unit: u64 = match &s[..unit_len] {
-            "ns" => 1,
-            "us" | "\u{b5}s" | "\u{3bc}s" => 1_000,
-            "ms" => 1_000_000,
-            "s" => 1_000_000_000,
-            "m" => 60_000_000_000,
-            "h" => 3_600_000_000_000,
-            _ => return None,
-        };
-        s = &s[unit_len..];
-        if whole > OVERFLOW / unit {
-            return None;
-        }
-        let mut value = whole * unit;
-        if fraction > 0 {
-            value += (fraction as f64 * (unit as f64 / scale)) as u64;
-            if value > OVERFLOW {
-                return None;
-            }
-        }
-        total += value;
-        if total > OVERFLOW {
-            return None;
-        }
-    }
-    if negative {
-        return Some((total as i64).wrapping_neg());
-    }
-    i64::try_from(total).ok()
 }
 
 /// Decodes the mapper file as yaml.v2 decodes it into statsd_exporter's types. Type errors are
@@ -788,7 +695,7 @@ impl Decoder {
                 Resolved::Float(v) if v.is_finite() && v.trunc() <= i64::MAX as f64 => {
                     Some(v as i64)
                 }
-                Resolved::Str(text) => go_parse_duration(&text),
+                Resolved::Str(text) => crate::go::parse_duration(&text).ok(),
                 _ => None,
             };
             if let Some(value) = value {

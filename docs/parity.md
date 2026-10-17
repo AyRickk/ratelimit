@@ -8,6 +8,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 
 ## 1. Environment variables
 
+Reading them (values, defaults, set-but-empty values, the first error and its text, including the `<SETTING>_<FIELD>` variables envconfig reads for each untagged `*tls.Config` setting, such as `REDISTLSCONFIG_MINVERSION`) is proven for every variable by `settings_are_read_like_upstream` in `tests/differential.rs`, against upstream's `settings.NewSettings()`. The rows below track what each one does.
+
 | Variable | Upstream default | Status | Test |
 |---|---|---|---|
 | `HOST` | `0.0.0.0` | ⬜ | |
@@ -43,44 +45,45 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `XDS_CLIENT_BACKOFF_RANDOM_FACTOR` | `0.5` | ⬜ | |
 | `XDS_CLIENT_BACKOFF_JITTER` | `true` | ⬜ | |
 | `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ⬜ | |
-| `USE_DOG_STATSD` | `false` | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
-| `USE_DOG_STATSD_MOGRIFIERS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
-| `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
-| `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`, `DD_ORIGIN_DETECTION_ENABLED` | — (read by datadog-go, not by `settings.go`) | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not read from the environment yet |
-| `USE_STATSD` | `true` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
-| `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `EXTRA_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet (a value containing `:` makes upstream panic at startup) |
-| `STATS_FLUSH_INTERVAL` | `10s` | 🚧 | behaviour: `tests/stats.rs`; not read from the environment yet |
-| `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/stats.rs` (selection); not read from the environment yet |
-| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; not read from the environment yet (gostats also accepts `udp4`, `udp6` and any other network name) |
-| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `USE_PROMETHEUS` | `false` | 🚧 | behaviour: `tests/stats.rs`, `tests/prometheus.rs` (selection); not read from the environment yet |
-| `PROMETHEUS_ADDR` | `:9090` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `PROMETHEUS_PATH` | `/metrics` | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not read from the environment yet |
-| `PROMETHEUS_MAPPER_YAML` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not read from the environment yet |
-| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `USE_DOG_STATSD` | `false` | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
+| `USE_DOG_STATSD_MOGRIFIERS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
+| `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
+| `DD_ENTITY_ID`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION`, `DD_ORIGIN_DETECTION_ENABLED` | — (read by datadog-go, not by `settings.go`) | 🚧 | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; not wired into the binary yet |
+| `USE_STATSD` | `true` | 🚧 | behaviour: `tests/stats.rs` (selection); not wired into the binary yet |
+| `STATSD_HOST` | `localhost` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `STATSD_PORT` | `8125` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `EXTRA_TAGS` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet (a value containing `:` makes upstream panic at startup) |
+| `STATS_FLUSH_INTERVAL` | `10s` | 🚧 | behaviour: `tests/stats.rs`; not wired into the binary yet |
+| `DISABLE_STATS` | `false` | 🚧 | behaviour: `tests/stats.rs` (selection); not wired into the binary yet |
+| `STATSD_PROTOCOL` | `tcp` (read by gostats, not by `settings.go`) | 🚧 | behaviour (`tcp`, `udp`): `tests/differential.rs`, `tests/stats.rs`; not wired into the binary yet (gostats also accepts `udp4`, `udp6` and any other network name) |
+| `GOSTATS_FLUSH_INTERVAL_SECONDS`, `GOSTATS_LOGGING_SINK_DISABLED` | `5`, `false` (read by gostats, not by `settings.go`) | ✅ | only checked (an invalid value fails when the statsd sink is created), as upstream: `tests/differential.rs` |
+| `SANITIZE_DESCRIPTOR_METRIC_DOTS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `USE_PROMETHEUS` | `false` | 🚧 | behaviour: `tests/stats.rs`, `tests/prometheus.rs` (selection); not wired into the binary yet |
+| `PROMETHEUS_ADDR` | `:9090` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `PROMETHEUS_PATH` | `/metrics` | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
+| `PROMETHEUS_MAPPER_YAML` | — | 🚧 | behaviour: `tests/differential.rs`, `tests/prometheus.rs`; not wired into the binary yet |
+| `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
 | `RUNTIME_ROOT` | `/srv/runtime_data/current` | ⬜ | |
 | `RUNTIME_SUBDIRECTORY` | — | ⬜ | |
 | `RUNTIME_APPDIRECTORY` | `config` | ⬜ | |
 | `RUNTIME_IGNOREDOTFILES` | `false` | ⬜ | |
 | `RUNTIME_WATCH_ROOT` | `true` | ⬜ | |
 | `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
-| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not read from the environment yet |
-| `NEAR_LIMIT_RATIO` | `0.8` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `CACHE_KEY_PREFIX` | — | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | 🚧 | behaviour: section 4; not wired into the binary yet |
+| `NEAR_LIMIT_RATIO` | `0.8` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `CACHE_KEY_PREFIX` | — | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
 | `BACKEND_TYPE` | `redis` | ⬜ | |
-| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not read from the environment yet |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | 🚧 | behaviour: section 4; not wired into the binary yet |
 | `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ⬜ | |
-| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
-| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_PER_UNIT_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_REQUEST_HEADERS_ENABLED` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
+| `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
 | `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ⬜ | |
 | `REDIS_SOCKET_TYPE` | `unix` | ⬜ | |
 | `REDIS_TYPE` | `SINGLE` | ⬜ | |
@@ -139,7 +142,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
 | `SHADOW_MODE` | `false` | ⬜ | |
 | `QUOTA_MODE` | `false` | ⬜ | |
-| `RESPONSE_DYNAMIC_METADATA` | `false` | 🚧 | behaviour: `tests/differential.rs`; not read from the environment yet |
+| `RESPONSE_DYNAMIC_METADATA` | `false` | 🚧 | behaviour: `tests/differential.rs`; not wired into the binary yet |
 | `MERGE_DOMAIN_CONFIG` | `false` | ⬜ | |
 | `TRACING_ENABLED` | `false` | ⬜ | |
 | `TRACING_SERVICE_NAME` | `RateLimit` | ⬜ | |
@@ -237,6 +240,8 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 |---|---|---|
 | Client `limit` with `unit: UNKNOWN` ⇒ the process panics | gRPC error `INVALID_ARGUMENT` | D1: crashes are not reproduced |
 | Invalid environment variable re-read on reload ⇒ panic | config error | D1 |
+| An invalid environment variable (or `DOG_STATSD_MOGRIFIER_*`, or gostats' own checks) ⇒ panic at startup | an error with the same text | D1 |
+| A variable whose value is not valid UTF-8 keeps its bytes (and Go's quoting shows them as `\xNN` in errors) | read with U+FFFD in place of invalid sequences | Rust strings are UTF-8 |
 | `descriptors[].limit` in metadata as Go prototext, one or two spaces between fields depending on the build | the same text, always one space; `unit_multiplier:{value:N}` when set | Go randomises the spacing; `unit_multiplier` is an extension |
 | Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
 | `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
@@ -262,7 +267,7 @@ Section 1 is **generated** from `src/settings/settings.go` (134 variables); rege
 | DogStatsD lines are packed by 32 workers, by name hash | one buffer: the same lines, in other datagrams | datagram boundaries carry no meaning for the agent |
 | Mogrifier `PATTERN`s are Go RE2 | Rust `regex`, with `\d`, `\w`, `\s`, `\b` and their negations made ASCII as in Go; syntax only one of the two accepts (e.g. `\Q…\E`, `\b{start}`) differs | different engine |
 | An invalid mogrifier ⇒ panic at startup | configuration error | D1 |
-| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
+| Error texts: an invalid mogrifier `PATTERN` (after `failed to compile pattern for <NAME>: <PATTERN>: `), a DogStatsD address that does not resolve or cannot be dialled (e.g. port 0) | the Rust regex and resolver texts | different libraries; the message prefixes are kept |
 | A `STATSD_HOST` starting with `unix://` sends DogStatsD over a Unix socket | not supported: the address does not resolve | not needed by the targeted deployments; can be added |
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
