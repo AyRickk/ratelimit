@@ -3,14 +3,21 @@
 //! request (decoded) and the response (encoded). Errors are not Go's texts: upstream only logs
 //! them, and answers every decoding error alike.
 
+use base64::Engine;
+use prost_types::{Duration, Struct, Timestamp, Value, value::Kind as ValueKind};
+use ratelimit_proto::envoy::config::core::v3::HeaderValue;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor,
     rate_limit_descriptor::{Entry, RateLimitOverride},
 };
-use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
+use ratelimit_proto::envoy::service::ratelimit::v3::{
+    RateLimitRequest, RateLimitResponse,
+    rate_limit_response::{DescriptorStatus, Quota, RateLimit, quota::ExpirationSpecifier},
+};
 
 /// A token kind (`json.Kind`), as bits so that kinds combine.
 type Kind = u16;
+const EOF: Kind = 1 << 0;
 const NULL: Kind = 1 << 1;
 const BOOL: Kind = 1 << 2;
 const NUMBER: Kind = 1 << 3;
@@ -21,7 +28,6 @@ const OBJECT_CLOSE: Kind = 1 << 7;
 const ARRAY_OPEN: Kind = 1 << 8;
 const ARRAY_CLOSE: Kind = 1 << 9;
 const COMMA: Kind = 1 << 10;
-const EOF: Kind = 1 << 0;
 const SCALAR: Kind = NULL | BOOL | NUMBER | STRING;
 
 #[derive(Clone, Debug)]
@@ -512,6 +518,7 @@ fn enumeration(decoder: &mut Decoder, names: &[(&str, i32)]) -> Result<i32> {
     number.ok_or_else(|| "invalid enum".into())
 }
 
+/// The request's units (`envoy.type.v3.RateLimitUnit`), which stop at `YEAR`.
 const UNITS: &[(&str, i32)] = &[
     ("UNKNOWN", 0),
     ("SECOND", 1),
@@ -681,13 +688,6 @@ fn format_double(n: f64) -> String {
     format!("{n}")
 }
 
-use prost_types::{Duration, Struct, Timestamp, Value, value::Kind as ValueKind};
-use ratelimit_proto::envoy::config::core::v3::HeaderValue;
-use ratelimit_proto::envoy::service::ratelimit::v3::{
-    RateLimitResponse,
-    rate_limit_response::{DescriptorStatus, Quota, RateLimit, quota::ExpirationSpecifier},
-};
-
 /// An enum value: its name, or its number when it has none.
 fn enum_value(e: &mut Encoder, number: i32, names: &[(&str, i32)]) {
     match names.iter().find(|(_, n)| *n == number) {
@@ -697,6 +697,7 @@ fn enum_value(e: &mut Encoder, number: i32, names: &[(&str, i32)]) {
 }
 
 const CODES: &[(&str, i32)] = &[("UNKNOWN", 0), ("OK", 1), ("OVER_LIMIT", 2)];
+/// The response's units (`RateLimitResponse.RateLimit.Unit`), which also have `WEEK`.
 const RESPONSE_UNITS: &[(&str, i32)] = &[
     ("UNKNOWN", 0),
     ("SECOND", 1),
@@ -708,19 +709,9 @@ const RESPONSE_UNITS: &[(&str, i32)] = &[
     ("YEAR", 6),
 ];
 
+/// Bytes in standard base64, padded.
 fn bytes_value(e: &mut Encoder, bytes: &[u8]) {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().fold(0u32, |n, &b| n << 8 | b as u32) << (8 * (3 - chunk.len()));
-        for i in 0..4 {
-            text.push(match i <= chunk.len() {
-                true => ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char,
-                false => '=',
-            });
-        }
-    }
-    e.string(&text);
+    e.string(&base64::engine::general_purpose::STANDARD.encode(bytes));
 }
 
 fn struct_value(e: &mut Encoder, value: &Struct) -> Result<()> {

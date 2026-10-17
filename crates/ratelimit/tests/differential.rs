@@ -4745,6 +4745,9 @@ fn json_requests_are_decoded_like_upstream() {
     }
     // Strings holding numbers: no space around, only the first token counts.
     for text in [
+        "\\u0031",
+        "\\u00312",
+        "\\u0020\\u0031",
         " 1",
         "1 ",
         "1 2",
@@ -4891,8 +4894,12 @@ fn json_requests_are_decoded_like_upstream() {
         .iter()
         .map(|input| format!("{}\n", hex(input)))
         .collect();
-    std::io::Write::write_all(&mut oracle.stdin.take().unwrap(), lines.as_bytes()).unwrap();
+    // Written while the answers are read, so that neither pipe fills up.
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
     let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
     let upstream: Vec<String> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -4978,20 +4985,7 @@ descriptors:
             .filter(|l| !l.starts_with("date:") && !l.starts_with("content-length:"))
             .collect();
         headers.sort();
-        let (mut text, mut in_string, mut escaped, mut after_comma) =
-            (String::new(), false, false, false);
-        for c in body.chars() {
-            if !(after_comma && c == ' ') {
-                text.push(c);
-            }
-            after_comma = !in_string && c == ',';
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if in_string => escaped = true,
-                '"' => in_string = !in_string,
-                _ => {}
-            }
-        }
+        let text = without_go_spaces(body);
         (status, headers, text)
     };
     let user = r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"a"}]}]}"#;
@@ -5010,6 +5004,11 @@ descriptors:
         ("POST", "/json", "not json".into()),
         ("POST", "/json", String::new()),
         ("DELETE", "/json?x=1", user.to_string()),
+        (
+            "HEAD",
+            "/json",
+            r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"h"}]}]}"#.into(),
+        ),
         ("POST", "/json/", user.to_string()),
     ];
     let reset = regex::Regex::new(r#""durationUntilReset":"(\d+)s""#).unwrap();
@@ -5041,25 +5040,15 @@ descriptors:
     }
     // A client limit with an unknown unit makes upstream panic, which closes the connection
     // with no answer; it is a bad request here. `unitMultiplier` is unknown to upstream.
-    let unknown_unit = r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"e"}],"limit":{"requestsPerUnit":5}}]}"#;
-    assert_eq!(
-        send(
-            services[0].http.clone(),
-            "POST",
-            "/json",
-            unknown_unit.into()
-        )
-        .await,
-        ""
-    );
-    let ours = send(
-        services[1].http.clone(),
-        "POST",
-        "/json",
-        unknown_unit.into(),
-    )
-    .await;
-    assert_eq!(simplify(&ours).0, "400 Bad Request");
+    for unit in ["", r#","unit":-1"#, r#","unit":8"#] {
+        let request = format!(
+            r#"{{"domain":"llm","descriptors":[{{"entries":[{{"key":"user","value":"e"}}],"limit":{{"requestsPerUnit":5{unit}}}}}]}}"#
+        );
+        let upstream = send(services[0].http.clone(), "POST", "/json", request.clone()).await;
+        assert_eq!(upstream, "", "{request}");
+        let ours = send(services[1].http.clone(), "POST", "/json", request.clone()).await;
+        assert_eq!(simplify(&ours).0, "400 Bad Request", "{request}");
+    }
     let multiplier = r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"f"}],"limit":{"requestsPerUnit":5,"unit":"HOUR","unitMultiplier":2}}]}"#;
     let upstream = send(services[0].http.clone(), "POST", "/json", multiplier.into()).await;
     assert_eq!(simplify(&upstream).0, "400 Bad Request");
@@ -5070,4 +5059,276 @@ descriptors:
         "{}",
         ours.2
     );
+    // Bodies up to gRPC's largest message (4 MiB) are read, larger ones refused.
+    let request = r#"{"domain":"d","descriptors":[{"entries":[{"key":"k"}]}]}"#;
+    for (size, status) in [(4 << 20, "200 OK"), ((4 << 20) + 1, "400 Bad Request")] {
+        let body = format!("{request}{}", " ".repeat(size - request.len()));
+        let ours = simplify(&send(services[1].http.clone(), "POST", "/json", body).await);
+        assert_eq!(ours.0, status, "{size}");
+    }
+}
+
+/// `/json`'s encoding writes responses like `protojson.Marshal` (Go's spaces after commas
+/// left out), and refuses the same ones: every field, enum numbers with no name, Duration and
+/// Timestamp fractions and ranges, base64 padding, numbers in the metadata.
+#[test]
+fn json_responses_are_encoded_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use prost_types::{ListValue, Struct, Timestamp, Value, value::Kind};
+    use ratelimit_proto::envoy::config::core::v3::HeaderValue;
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::{
+        DescriptorStatus, Quota, RateLimit, quota::ExpirationSpecifier,
+    };
+    let number = |n: f64| Value {
+        kind: Some(Kind::NumberValue(n)),
+    };
+    let metadata = |values: Vec<(&str, Value)>| Struct {
+        fields: values
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    };
+    let with_metadata = |values: Vec<(&str, Value)>| RateLimitResponse {
+        dynamic_metadata: Some(metadata(values)),
+        ..Default::default()
+    };
+    let with_reset = |seconds: i64, nanos: i32| RateLimitResponse {
+        statuses: vec![DescriptorStatus {
+            duration_until_reset: Some(prost_types::Duration { seconds, nanos }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let with_time = |seconds: i64, nanos: i32| RateLimitResponse {
+        quota: Some(Quota {
+            expiration_specifier: Some(ExpirationSpecifier::ValidUntil(Timestamp {
+                seconds,
+                nanos,
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let header = |raw: &[u8]| HeaderValue {
+        key: "k".into(),
+        value: String::new(),
+        raw_value: raw.to_vec(),
+    };
+    let mut responses = vec![
+        RateLimitResponse::default(),
+        RateLimitResponse {
+            overall_code: 1,
+            statuses: vec![
+                DescriptorStatus {
+                    code: 2,
+                    current_limit: Some(RateLimit {
+                        name: "n\"\\\u{1}\u{1f}\u{7f}é\u{2028}<>&".into(),
+                        requests_per_unit: 5,
+                        unit: 7,
+                        unit_multiplier: None,
+                    }),
+                    limit_remaining: 3,
+                    duration_until_reset: Some(prost_types::Duration {
+                        seconds: 5,
+                        nanos: 0,
+                    }),
+                    quota: Some(Quota {
+                        requests: 2,
+                        expiration_specifier: None,
+                        id: "q".into(),
+                    }),
+                },
+                DescriptorStatus::default(),
+                DescriptorStatus {
+                    current_limit: Some(RateLimit::default()),
+                    ..Default::default()
+                },
+            ],
+            response_headers_to_add: vec![
+                header(&[]),
+                header(&[1]),
+                header(&[1, 2]),
+                header(&[0, 1, 2, 255]),
+            ],
+            request_headers_to_add: vec![HeaderValue {
+                key: String::new(),
+                value: "v".into(),
+                raw_value: vec![],
+            }],
+            raw_body: b"body\xff".to_vec(),
+            dynamic_metadata: Some(Struct::default()),
+            quota: Some(Quota::default()),
+        },
+        // Enum numbers with no name.
+        RateLimitResponse {
+            overall_code: 9,
+            statuses: vec![DescriptorStatus {
+                code: -3,
+                current_limit: Some(RateLimit {
+                    unit: 42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        with_metadata(vec![
+            (
+                "null",
+                Value {
+                    kind: Some(Kind::NullValue(0)),
+                },
+            ),
+            (
+                "b",
+                Value {
+                    kind: Some(Kind::BoolValue(false)),
+                },
+            ),
+            (
+                "s",
+                Value {
+                    kind: Some(Kind::StringValue("x\ty".into())),
+                },
+            ),
+            ("é", number(1.0)),
+            ("B", number(-0.0)),
+            (
+                "",
+                Value {
+                    kind: Some(Kind::ListValue(ListValue { values: vec![] })),
+                },
+            ),
+            (
+                "nested",
+                Value {
+                    kind: Some(Kind::StructValue(metadata(vec![(
+                        "l",
+                        Value {
+                            kind: Some(Kind::ListValue(ListValue {
+                                values: vec![
+                                    number(2.5),
+                                    Value {
+                                        kind: Some(Kind::StructValue(Struct::default())),
+                                    },
+                                ],
+                            })),
+                        },
+                    )]))),
+                },
+            ),
+        ]),
+    ];
+    for n in [
+        1e-10,
+        1.5e-100,
+        1e100,
+        1e21,
+        1e20,
+        999999999999999999999.0,
+        123456789.123,
+        -2.5e-7,
+        1e-6,
+        9.99e-7,
+        5e-324,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        0.1,
+        1.0 / 3.0,
+        1e15,
+        1e16,
+        1e-5,
+        123e300,
+    ] {
+        responses.push(with_metadata(vec![("n", number(n))]));
+    }
+    for (seconds, nanos) in [
+        (0, 0),
+        (1, 500_000_000),
+        (0, 1),
+        (0, 1_000),
+        (0, 1_000_000),
+        (0, -1_000),
+        (-1, -500_000_000),
+        (315_576_000_000, 999_999_999),
+        (-315_576_000_000, -999_999_999),
+        (315_576_000_001, 0),
+        (0, 1_000_000_000),
+        (0, -1_000_000_000),
+        (1, -1),
+        (-1, 1),
+    ] {
+        responses.push(with_reset(seconds, nanos));
+    }
+    for (seconds, nanos) in [
+        (0, 0),
+        (-1, 0),
+        (951_782_400, 0),
+        (1_700_000_000, 120_000_000),
+        (253_402_300_799, 999_999_999),
+        (-62_135_596_800, 0),
+        (-62_135_596_801, 0),
+        (253_402_300_800, 0),
+        (0, -1),
+        (0, 1_000_000_000),
+        (68_256_000, 7),
+        (-2_208_988_800, 0),
+    ] {
+        responses.push(with_time(seconds, nanos));
+    }
+    // What protojson refuses to write.
+    responses.push(with_metadata(vec![("unset", Value { kind: None })]));
+    for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        responses.push(with_metadata(vec![("n", number(n))]));
+    }
+
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-protojson-marshal")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let lines: String = responses
+        .iter()
+        .map(|response| format!("{}\n", hex(&prost::Message::encode_to_vec(response))))
+        .collect();
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(without_go_spaces)
+        .collect();
+    assert_eq!(upstream.len(), responses.len());
+    for (response, upstream) in responses.iter().zip(&upstream) {
+        let ours = match ratelimit::protojson::encode_response(response) {
+            Ok(json) => format!("ok {json}"),
+            Err(_) => "error".to_string(),
+        };
+        assert_eq!(&ours, upstream, "{response:?}");
+    }
+}
+
+/// `text` without the spaces Go's protojson may put after commas, outside strings.
+fn without_go_spaces(text: &str) -> String {
+    let (mut out, mut in_string, mut escaped, mut after_comma) =
+        (String::new(), false, false, false);
+    for c in text.chars() {
+        if !(after_comma && c == ' ') {
+            out.push(c);
+        }
+        after_comma = !in_string && c == ',';
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+    out
 }

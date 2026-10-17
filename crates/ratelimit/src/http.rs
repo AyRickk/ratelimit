@@ -6,6 +6,7 @@ use crate::service::{RateLimitCache, RateLimitService};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
+use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
 use std::sync::Arc;
 
 /// An answer, before it becomes a hyper response.
@@ -104,6 +105,9 @@ fn respond<B>(health: &HealthChecker, request: &hyper::Request<B>) -> Routed {
     route(health, uri, &path)
 }
 
+/// The largest `/json` body read: grpc-go's default largest message.
+const MAX_JSON_BODY: usize = 4 << 20;
+
 /// Where a request goes: answered at once, or to `/json`, which reads its body.
 enum Routed {
     Answer(Answer),
@@ -133,11 +137,7 @@ fn route(health: &HealthChecker, uri: &hyper::Uri, path: &str) -> Routed {
         "/healthcheck" if health.is_ok() => Answer::new(200, text(), b"OK"),
         "/healthcheck" => Answer::new(500, Vec::new(), b""),
         "/json" => return Routed::Json,
-        _ => {
-            let mut headers = text();
-            headers.push(("x-content-type-options", "nosniff".into()));
-            Answer::new(404, headers, b"404 page not found\n")
-        }
+        _ => Answer::error(404, "404 page not found"),
     })
 }
 
@@ -155,10 +155,10 @@ async fn json<C: RateLimitCache>(service: &RateLimitService<C>, body: Option<Byt
     let Ok(body) = crate::protojson::encode_response(&response) else {
         return Answer::error(500, "Internal Server Error");
     };
-    let status = match response.overall_code {
-        0 => 500,
-        2 => 429,
-        _ => 200,
+    let status = match response.overall_code() {
+        Code::Unknown => 500,
+        Code::OverLimit => 429,
+        Code::Ok => 200,
     };
     let headers = vec![("content-type", "application/json".to_string())];
     Answer::new(status, headers, body.as_bytes())
@@ -211,7 +211,9 @@ async fn respond_to<C: RateLimitCache>(
     let answer = match respond(health, &request) {
         Routed::Answer(answer) => answer,
         Routed::Json => {
-            let body = request.into_body().collect().await.ok();
+            // Upstream reads any length; past the size gRPC refuses, the body is refused.
+            let body = http_body_util::Limited::new(request.into_body(), MAX_JSON_BODY);
+            let body = body.collect().await.ok();
             json(service, body.map(|body| body.to_bytes())).await
         }
     };

@@ -294,6 +294,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A request target with a fragment (`/healthcheck#x`) keeps it in the path, so it is not found | the fragment is dropped (hyper's URI parser) | Clients do not send fragments |
 | With `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, a lost connection is noticed when radix next uses it (a command, or its PING every 5 s / pool size) | as soon as the socket closes | Earlier, not different: the same states in the same order |
 | `/json` refuses `unitMultiplier` (or `unit_multiplier`, even `null`) in a client limit with `400`: Go's type has no such field | read and applied as over gRPC, echoed in the metadata's limit | Extension (see `unit_multiplier` above): requests upstream refuses, none it accepts |
-| On `/json`, a client limit with an unknown unit (`0`, `{}`, or a number above `7`) makes the service panic, and Go's server closes the connection with no answer | `400 Bad Request` | D1 |
+| On `/json`, a client limit with an unknown unit (none, `0`, a negative number, or one above `7`) makes the service panic, and Go's server closes the connection with no answer | `400 Bad Request` | D1 |
 | `/json` bodies over 2048 bytes are chunked (HTTP/1.1) or ended by closing the connection (HTTP/1.0), with no `Content-Length` | always a `Content-Length` | Different HTTP server; the bodies read alike |
 | `/json` answers with a space after every comma, or after none, depending on the build (protojson's `detrand`) | never | Go randomises it on purpose |
+| `/json` reads a body of any length | a body over 4 MiB (grpc-go's largest message) gets `400 Bad Request` | D1: an unbounded body can exhaust the memory and get the process killed |
