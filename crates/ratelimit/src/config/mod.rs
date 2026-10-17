@@ -282,6 +282,11 @@ impl Descriptor {
 
 impl RateLimitConfig {
     /// `GetLimit`: the limit that applies to `descriptor` in `domain`.
+    /// `IsEmptyDomains`: whether the config has no domain.
+    pub fn is_empty_domains(&self) -> bool {
+        self.domains.is_empty()
+    }
+
     pub fn get_limit<'a>(&'a self, domain: &str, descriptor: &RateLimitDescriptor) -> LimitLookup {
         let Some(mut current) = self.domains.get(domain) else {
             return LimitLookup::UnknownDomain;

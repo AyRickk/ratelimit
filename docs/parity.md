@@ -12,8 +12,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 
 | Variable | Upstream default | Status | Test |
 |---|---|---|---|
-| `HOST` | `0.0.0.0` | ⬜ | |
-| `PORT` | `8080` | ⬜ | |
+| `HOST` | `0.0.0.0` | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`), listening like `GRPC_HOST` |
+| `PORT` | `8080` | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_binary_*`) |
 | `DEBUG_HOST` | `0.0.0.0` | ⬜ | |
 | `DEBUG_PORT` | `6070` | ⬜ | |
 | `GRPC_UDS` | — | ✅ | `the_binary_serves_on_a_unix_socket_like_upstream` in `tests/differential.rs` |
@@ -84,7 +84,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `LIMIT_REQUEST_LIMIT_HEADER` | `RateLimit-Limit` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `LIMIT_REQUEST_REMAINING_HEADER` | `RateLimit-Remaining` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
-| `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ⬜ | |
+| `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ✅ | `health_is_reported_like_upstream` in `tests/differential.rs` |
 | `REDIS_SOCKET_TYPE` | `unix` | ✅ | `tcp`: `tests/differential.rs`; `unix`: `tests/runner.rs` |
 | `REDIS_TYPE` | `SINGLE` | 🚧 | `SINGLE`, and an invalid value: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream`; `CLUSTER`, `SENTINEL` not supported yet |
 | `REDIS_URL` | `/var/run/nutcracker/ratelimit.sock` | ✅ | `tests/differential.rs`; `redis://` URLs (user, password, database): `tests/runner.rs` |
@@ -122,7 +122,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ⬜ | |
 | `REDIS_PERSECOND_PIPELINE_LIMIT` | `0` | ⬜ | |
 | `REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
-| `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | `false` | ⬜ | |
+| `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | `false` | ✅ | `redis_connections_drive_health_like_upstream` in `tests/differential.rs` |
 | `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR` | `false` | ⬜ | |
 | `REDIS_TIMEOUT` | `10s` | ✅ | the connection timeout, as radix's dialer: `tests/runner.rs` |
 | `REDIS_PERSECOND_TIMEOUT` | `10s` | ⬜ | |
@@ -188,10 +188,10 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `quota_mode`: `backend_name` / `model_name_override` groups, `OVER_LIMIT` when all exhausted, `passedBackends` per group | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
-| `POST /json`: protojson, 200 / 429 / 400 / 500 | ⬜ | |
+| `/json` (any method): protojson, 200 / 429 / 400 / 500 | ⬜ | |
 | SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
-| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down | ⬜ | |
-| `grpc.health.v1`, service `ratelimit` | ⬜ | |
+| `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404); what Go's server answers itself (bad escapes, `Host` checks, `OPTIONS *`) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_http_server_reads_requests_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
+| `grpc.health.v1`, service `ratelimit` | ✅ | `tests/differential.rs` (`health_is_reported_like_upstream`, `sigterm_turns_health_off_like_upstream`), `tests/health.rs` |
 | Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*` | ⬜ | |
 | `GRPC_UDS` | ✅ | `tests/differential.rs` |
 | Max connection age | ✅ | the gRPC server's keepalive settings |
@@ -218,7 +218,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Per key: `total_hits`, `over_limit`, `near_limit`, `over_limit_with_local_cache`, `within_limit`, `shadow_mode`, `total_negative_hits` | ✅ | `tests/differential.rs` |
 | `domain_not_found`, `global_shadow_mode`, `config_load_success`, `config_load_error` | ✅ | `tests/differential.rs` |
 | `call.should_rate_limit.redis_error` / `service_error` | ✅ | `tests/differential.rs` |
-| `ratelimit_server.<method>.total_requests` / `response_time` | ⬜ | |
+| `ratelimit_server.<method>.total_requests` / `response_time` (health `Check` and `List` included) | ⬜ | |
 | `runtime.load_attempts`, `runtime.load_failures` (with `EXTRA_TAGS`, `reserved_tag` counted again) | ✅ | `tests/differential.rs` |
 | `redis_pool.cx_*`, `localcache.*`, `memcache.*`, `runtime.num_values` (gauges) | ⬜ | |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
@@ -289,3 +289,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | The statsd sink logs Go `net` errors (`connection error: dial tcp 127.0.0.1:8125: connect: connection refused`) | the same messages with the operating system's error text | Rust has no `net.OpError`; the message prefixes are kept |
 | After a failed write to statsd, gostats resends a buffer from the first unwritten byte, so the new connection can start mid-line | resends from the start of the first line not fully written | D1: a corrupt line is a bug |
 | statsd buffers are cut at the same line boundaries as gostats' but are not timed alike (gostats also pushes its buffer every second), so while the server is unreachable which lines are dropped can differ; the queue is bounded alike (about 4 MiB) | buffers pushed only when full or flushed | Not observable while the server is reachable |
+| Go's server refuses some requests itself with a `400` closed by the connection (no `Content-Length`); among them a request line it cannot parse (e.g. a raw space in the target) or an invalid header name or value | the same answers with a `Content-Length` for a bad `%` escape and a missing or malformed `Host`; hyper's empty `400` for the others | Different HTTP server; both refuse the request, and the bodies read alike |
+| A gRPC health `Watch` stream that falls behind gets only the latest status (grpc-go keeps one pending update) | every change in order, duplicates skipped; past 64 pending changes the oldest are dropped | The final status is the same |
+| A request target with a fragment (`/healthcheck#x`) keeps it in the path, so it is not found | the fragment is dropped (hyper's URI parser) | Clients do not send fragments |
+| With `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`, a lost connection is noticed when radix next uses it (a command, or its PING every 5 s / pool size) | as soon as the socket closes | Earlier, not different: the same states in the same order |
