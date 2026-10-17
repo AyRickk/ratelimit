@@ -167,7 +167,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
 | Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
 | Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
-| YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL/LS/PS as line breaks | ✅ | `tests/differential.rs` |
+| YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL as a line break | ✅ | `tests/differential.rs` |
 | Quoted scalars continued on less indented lines: accepted by yaml.v2, refused by the Rust parser | ⬜ | |
 | Startup without a valid config ⇒ gRPC error on every call (no exit) | ⬜ | |
 | File provider: goruntime's loader (snapshot keys, dotfiles, symlinks, failures, nil loader), `SymlinkRefresher` / `DirectoryRefresher` on inotify events, reload coalescing, `runtime` scope | ✅ | snapshots and the first load: `tests/differential.rs`; reloads: `tests/differential.rs` on Linux (inotify, as upstream's fsnotify) |
@@ -262,7 +262,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | An `Accept` header with more than 12 clauses of equal weight is ordered by Go's pdqsort | kept in order | the order only matters for the `escaping` parameter |
 | Off Linux, fsnotify watches the runtime directory with kqueue | polled every 100 ms (development only: the image is Linux, where both use inotify) | not a deployment target |
 | A runtime directory that cannot be watched: the error names Go's errno (`no such file or directory (syscall.Errno 0x2)`) | the same form, with the C library's text for the errno | matches glibc's texts for common errors |
-| Line separators (U+2028, U+2029) inside a literal block scalar stay as they are | become `\n` | the Rust parser does not know YAML 1.1's extra line breaks; they are converted before parsing |
+| U+2028 and U+2029 also break lines in YAML 1.1 (kept as characters in scalars) | characters only | the Rust parser is YAML 1.2; converting them would change scalars |
+| yaml.v2 reads only the first YAML document of a file: a control character or invalid byte after a later `---` (and beyond its 512-byte read-ahead) is not seen; and it decodes as it parses, so a syntax error before a bad byte further on is reported first | the whole file is checked first | rare inputs; the file is refused either way in the second case |
+| A snapshot's files are loaded in Go's random map order (which decides which error is reported, or the merge order) | in key order | one of upstream's orders, deterministic |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |

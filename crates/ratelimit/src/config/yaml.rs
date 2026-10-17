@@ -459,52 +459,53 @@ impl MarkedEventReceiver for Builder {
 /// its error. (yaml.v2 decodes 512 bytes at a time as it parses: a syntax error before a bad
 /// byte further on is reported first there.)
 pub(crate) fn decode(bytes: &[u8]) -> Result<String, String> {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        _ => decode_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)),
+    }
+}
+
+/// UTF-8, with yaml.v2's errors.
+fn decode_utf8(bytes: &[u8]) -> Result<String, String> {
     let fail = |problem: &str| Err(format!("yaml: {problem}"));
-    let text = match bytes {
-        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes)?,
-        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes)?,
-        _ => {
-            let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-            let mut i = 0;
-            while i < bytes.len() {
-                let octet = bytes[i];
-                let width = match octet {
-                    _ if octet & 0x80 == 0 => 1,
-                    _ if octet & 0xE0 == 0xC0 => 2,
-                    _ if octet & 0xF0 == 0xE0 => 3,
-                    _ if octet & 0xF8 == 0xF0 => 4,
-                    _ => return fail("invalid leading UTF-8 octet"),
-                };
-                if i + width > bytes.len() {
-                    return fail("incomplete UTF-8 octet sequence");
-                }
-                let mut value = u32::from(match width {
-                    1 => octet & 0x7F,
-                    2 => octet & 0x1F,
-                    3 => octet & 0x0F,
-                    _ => octet & 0x07,
-                });
-                for &trailing in &bytes[i + 1..i + width] {
-                    if trailing & 0xC0 != 0x80 {
-                        return fail("invalid trailing UTF-8 octet");
-                    }
-                    value = (value << 6) + u32::from(trailing & 0x3F);
-                }
-                let minimum = [0, 0, 0x80, 0x800, 0x10000][width];
-                if value < minimum {
-                    return fail("invalid length of a UTF-8 sequence");
-                }
-                if (0xD800..=0xDFFF).contains(&value) || value > 0x10FFFF {
-                    return fail("invalid Unicode character");
-                }
-                check_character(value)?;
-                i += width;
-            }
-            // Valid by now.
-            return Ok(String::from_utf8(bytes.to_vec()).unwrap());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octet = bytes[i];
+        let width = match octet {
+            _ if octet & 0x80 == 0 => 1,
+            _ if octet & 0xE0 == 0xC0 => 2,
+            _ if octet & 0xF0 == 0xE0 => 3,
+            _ if octet & 0xF8 == 0xF0 => 4,
+            _ => return fail("invalid leading UTF-8 octet"),
+        };
+        if i + width > bytes.len() {
+            return fail("incomplete UTF-8 octet sequence");
         }
-    };
-    Ok(text)
+        let mut value = u32::from(match width {
+            1 => octet & 0x7F,
+            2 => octet & 0x1F,
+            3 => octet & 0x0F,
+            _ => octet & 0x07,
+        });
+        for &trailing in &bytes[i + 1..i + width] {
+            if trailing & 0xC0 != 0x80 {
+                return fail("invalid trailing UTF-8 octet");
+            }
+            value = (value << 6) + u32::from(trailing & 0x3F);
+        }
+        let minimum = [0, 0, 0x80, 0x800, 0x10000][width];
+        if value < minimum {
+            return fail("invalid length of a UTF-8 sequence");
+        }
+        if (0xD800..=0xDFFF).contains(&value) || value > 0x10FFFF {
+            return fail("invalid Unicode character");
+        }
+        check_character(value)?;
+        i += width;
+    }
+    // Every sequence was checked.
+    Ok(String::from_utf8(bytes.to_vec()).unwrap())
 }
 
 /// UTF-16 after its byte order mark, with yaml.v2's errors.
@@ -555,8 +556,8 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
     for c in content.chars() {
         check_character(c as u32)?;
     }
-    // YAML 1.1 (libyaml) also breaks lines at NEL, LS and PS; the parser here is YAML 1.2.
-    let content = content.replace(['\u{85}', '\u{2028}', '\u{2029}'], "\n");
+    // libyaml reads NEL as a line break, `\n` (the parser here is YAML 1.2).
+    let content = content.replace('\u{85}', "\n");
     let content = content.as_str();
     let mut builder = Builder {
         stack: Vec::new(),

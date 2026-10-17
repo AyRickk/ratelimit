@@ -10,6 +10,8 @@ use crate::go;
 use crate::settings::Settings;
 use crate::stats::{Counter, Stats};
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
@@ -34,44 +36,20 @@ pub struct Ops {
 }
 
 impl Ops {
-    /// goruntime's `getFileSystemOp`: the operation of an event with exactly one of them.
+    /// goruntime's `getFileSystemOp`: the operation of an event with exactly one of them, or
+    /// `Write` for an event with none (an overflow, an unmount), as its `switch` falls there.
     pub fn single(self) -> Option<FsOp> {
-        match self {
-            Ops {
-                create: true,
-                write: false,
-                remove: false,
-                rename: false,
-                chmod: false,
-            } => Some(FsOp::Create),
-            Ops {
-                create: false,
-                write: true,
-                remove: false,
-                rename: false,
-                chmod: false,
-            } => Some(FsOp::Write),
-            Ops {
-                create: false,
-                write: false,
-                remove: true,
-                rename: false,
-                chmod: false,
-            } => Some(FsOp::Remove),
-            Ops {
-                create: false,
-                write: false,
-                remove: false,
-                rename: true,
-                chmod: false,
-            } => Some(FsOp::Rename),
-            Ops {
-                create: false,
-                write: false,
-                remove: false,
-                rename: false,
-                chmod: true,
-            } => Some(FsOp::Chmod),
+        let flags = [
+            (self.create, FsOp::Create),
+            (self.write, FsOp::Write),
+            (self.remove, FsOp::Remove),
+            (self.rename, FsOp::Rename),
+            (self.chmod, FsOp::Chmod),
+        ];
+        let mut set = flags.iter().filter(|(on, _)| *on).map(|(_, op)| *op);
+        match (set.next(), set.next()) {
+            (None, _) => Some(FsOp::Write),
+            (Some(op), None) => Some(op),
             _ => None,
         }
     }
@@ -89,7 +67,8 @@ pub enum Refresher {
 }
 
 impl Refresher {
-    /// `WatchDirectory`: the directory to watch for `runtime_path` and `app_dir`.
+    /// `WatchDirectory`: the directory to watch for `runtime_path` and `app_dir` (which the
+    /// directory refresher also keeps, to compare event paths with).
     pub fn watch_directory(&mut self, runtime_path: &str, app_dir: &str) -> String {
         match self {
             Refresher::Symlink { .. } => go::dir(runtime_path),
@@ -128,7 +107,7 @@ pub fn load_snapshot(
     subdirectory: &str,
     ignore_dotfiles: bool,
 ) -> (Snapshot, u64) {
-    let root = go::join(&[watch_path, subdirectory]);
+    let root = OsString::from(go::join(&[watch_path, subdirectory]));
     let mut walk = Walk {
         root: root.clone(),
         ignore_dotfiles,
@@ -136,7 +115,10 @@ pub fn load_snapshot(
         failures: 0,
     };
     match std::fs::symlink_metadata(&root) {
-        Ok(metadata) => walk.visit(&root, &base_name(&root), &metadata),
+        Ok(metadata) => {
+            let name = base_name(&root.to_string_lossy());
+            walk.visit(&root, name.as_bytes(), &metadata);
+        }
         Err(_) => walk.failures += 1,
     }
     (walk.snapshot, walk.failures)
@@ -150,8 +132,20 @@ fn base_name(path: &str) -> String {
     }
 }
 
+/// `filepath.Join(dir, name)` for a cleaned `dir` and a directory entry's name, on bytes (a
+/// name need not be UTF-8).
+fn child_path(dir: &OsStr, name: &OsStr) -> OsString {
+    let mut path = match dir.as_bytes() {
+        b"." => Vec::new(),
+        b"/" => b"/".to_vec(),
+        dir => [dir, b"/"].concat(),
+    };
+    path.extend_from_slice(name.as_bytes());
+    OsString::from_vec(path)
+}
+
 struct Walk {
-    root: String,
+    root: OsString,
     ignore_dotfiles: bool,
     snapshot: Snapshot,
     failures: u64,
@@ -159,8 +153,8 @@ struct Walk {
 
 impl Walk {
     /// `walk` and goruntime's `walkDirectoryCallback` for one path.
-    fn visit(&mut self, path: &str, name: &str, metadata: &std::fs::Metadata) {
-        let hidden = self.ignore_dotfiles && name.starts_with('.');
+    fn visit(&mut self, path: &OsStr, name: &[u8], metadata: &std::fs::Metadata) {
+        let hidden = self.ignore_dotfiles && name.starts_with(b".");
         if !metadata.is_dir() {
             if hidden {
                 return;
@@ -175,9 +169,9 @@ impl Walk {
             return;
         }
         let names = std::fs::read_dir(path).map(|entries| {
-            let mut names: Vec<String> = entries
+            let mut names: Vec<OsString> = entries
                 .filter_map(Result::ok)
-                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map(|e| e.file_name())
                 .collect();
             names.sort();
             names
@@ -191,20 +185,24 @@ impl Walk {
             return;
         }
         for name in names {
-            let child = go::join(&[path, &name]);
+            let child = child_path(path, &name);
             match std::fs::symlink_metadata(&child) {
-                Ok(metadata) => self.visit(&child, &name, &metadata),
+                Ok(metadata) => self.visit(&child, name.as_bytes(), &metadata),
                 Err(_) => self.failures += 1,
             }
         }
     }
 
-    /// `filepath.Rel(root, path)` with `/` replaced by `.`; `.` for the root itself.
-    fn key(&self, path: &str) -> String {
-        match path.strip_prefix(&self.root) {
-            Some("") | None => ".".to_string(),
-            Some(rest) => rest.trim_start_matches('/').replace('/', "."),
-        }
+    /// `filepath.Rel(root, path)` with `/` replaced by `.` (`.` for the root itself).
+    fn key(&self, path: &OsStr) -> String {
+        let (root, path) = (self.root.as_bytes(), path.as_bytes());
+        let relative = match root {
+            _ if path == root => b".".as_slice(),
+            b"." => path,
+            b"/" => &path[1..],
+            _ => &path[root.len() + 1..],
+        };
+        String::from_utf8_lossy(relative).replace('/', ".")
     }
 }
 
@@ -279,6 +277,7 @@ impl Loader {
         })
     }
 
+    /// The current snapshot.
     pub fn snapshot(&self) -> Snapshot {
         match &self.shared {
             Some(shared) => shared.snapshot.lock().unwrap().clone(),
@@ -340,7 +339,8 @@ pub fn loader(settings: &Settings, stats: &Stats) -> Result<Loader, String> {
 }
 
 /// envoyproxy/ratelimit's `FileProvider`: loads the config from the runtime snapshot at start
-/// and after each refresh, and hands each result to `update`.
+/// and after each refresh, and hands each result to `update`. Like upstream's, it runs for the
+/// life of the process: dropping it stops nothing.
 pub struct FileProvider {
     _loader: Loader,
 }
@@ -400,13 +400,13 @@ mod watcher {
     //! fsnotify v1.7.0's inotify backend for one directory.
 
     use super::{Ops, errno};
-    use inotify::{EventMask, Inotify, WatchMask};
+    use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
     pub struct Watcher {
         inotify: Inotify,
-        /// The watched path, as fsnotify names events (`filepath.Clean` of what was added);
-        /// `None` once inotify dropped the watch.
-        path: Option<String>,
+        /// The watch and its path, as fsnotify names events (`filepath.Clean` of what was
+        /// added); `None` once the watch is gone.
+        watch: Option<(WatchDescriptor, String)>,
         buffer: Vec<u8>,
         pending: std::collections::VecDeque<(String, Ops)>,
     }
@@ -424,13 +424,13 @@ mod watcher {
                 | WatchMask::DELETE
                 | WatchMask::DELETE_SELF;
             let clean = crate::go::clean(path);
-            inotify
+            let descriptor = inotify
                 .watches()
                 .add(&clean, mask)
                 .map_err(|e| format!("unable to watch file ({path}): {}", errno(&e)))?;
             Ok(Self {
                 inotify,
-                path: Some(clean),
+                watch: Some((descriptor, clean)),
                 buffer: vec![0; 4096 * 64],
                 pending: Default::default(),
             })
@@ -442,19 +442,29 @@ mod watcher {
                 if let Some(event) = self.pending.pop_front() {
                     return Some(event);
                 }
-                let events = match self.inotify.read_events_blocking(&mut self.buffer) {
-                    Ok(events) => events,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return None,
+                // fsnotify reports a read error and goes on reading.
+                let Ok(events) = self.inotify.read_events_blocking(&mut self.buffer) else {
+                    continue;
                 };
+                let mut moved = None;
                 for event in events {
                     let mask = event.mask;
-                    let watch_path = self.path.clone();
-                    if mask.contains(EventMask::DELETE_SELF) || mask.contains(EventMask::MOVE_SELF)
-                    {
-                        self.path = None;
+                    // Events of no known watch (an overflow) are named from "" (`byWd`).
+                    let watch = self
+                        .watch
+                        .as_ref()
+                        .filter(|(wd, _)| *wd == event.wd)
+                        .cloned();
+                    if watch.is_some() && mask.contains(EventMask::DELETE_SELF) {
+                        self.watch = None;
                     }
-                    let mut name = watch_path.unwrap_or_default();
+                    if mask.contains(EventMask::MOVE_SELF)
+                        && let Some((descriptor, _)) = &watch
+                    {
+                        moved = Some(descriptor.clone());
+                        self.watch = None;
+                    }
+                    let mut name = watch.map(|(_, path)| path).unwrap_or_default();
                     if let Some(file) = event.name {
                         name = format!("{name}/{}", file.to_string_lossy());
                     }
@@ -469,6 +479,10 @@ mod watcher {
                         chmod: mask.contains(EventMask::ATTRIB),
                     };
                     self.pending.push_back((name, ops));
+                }
+                // A moved directory is no longer watched, as fsnotify removes the watch.
+                if let Some(descriptor) = moved {
+                    let _ = self.inotify.watches().remove(descriptor);
                 }
             }
         }

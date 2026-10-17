@@ -102,6 +102,20 @@ async fn free_port() -> u16 {
         .port()
 }
 
+/// A port for a server that cannot report the one it gets (upstream's Prometheus listener):
+/// taken from a range below the ephemeral ports, which this process walks, so that no other
+/// test's ephemeral port can take it between this check and the server's bind.
+fn reserved_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 400) as u16 * 25;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::SeqCst) % 25;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 /// A throwaway Redis server, stopped when dropped.
 struct Redis {
     _process: Child,
@@ -645,7 +659,7 @@ impl Prometheus {
             path: "/metrics",
             mapper,
             milliseconds: false,
-            oracle_address: format!("127.0.0.1:{}", free_port().await),
+            oracle_address: format!("127.0.0.1:{}", reserved_port()),
         }
     }
 
@@ -3084,6 +3098,16 @@ async fn prometheus_options_like_upstream() {
     h.scrape("GET", "/stats/", &[]).await;
 }
 
+/// Looks variables up in `environment`, as an environment would.
+fn lookup_in<'a>(environment: &'a [(&'a str, String)]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key| {
+        environment
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+}
+
 /// Upstream's `settings.NewSettings()` for `environment`, from the oracle: the settings as JSON,
 /// or the panic's text.
 async fn upstream_settings(environment: &[(&str, &str)]) -> Result<serde_json::Value, String> {
@@ -3472,8 +3496,24 @@ async fn settings_are_read_like_upstream() {
     }
 }
 
+/// A temporary directory, removed when dropped (even when a test fails).
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A fresh temporary directory.
-fn temp_dir(name: &str) -> PathBuf {
+fn temp_dir(name: &str) -> TempDir {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ratelimit-{name}-{}-{}",
@@ -3482,7 +3522,7 @@ fn temp_dir(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
 
 /// Writes `files` (path → contents; a contents of `->target` makes a symlink) under `root`.
@@ -3516,13 +3556,7 @@ async fn upstream_snapshot(environment: &[(&str, String)]) -> serde_json::Value 
 /// Ours, shaped like the oracle's JSON.
 fn our_snapshot(environment: &[(&str, String)]) -> serde_json::Value {
     use base64::Engine;
-    let lookup = |key: &str| {
-        environment
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.clone())
-    };
-    let settings = ratelimit::settings::Settings::from_lookup(&lookup).unwrap();
+    let settings = ratelimit::settings::Settings::from_lookup(&lookup_in(environment)).unwrap();
     let stats = Stats::new(&settings.extra_tags);
     match ratelimit::runtime::loader(&settings, &stats) {
         Err(e) => serde_json::json!({ "error": e }),
@@ -3578,6 +3612,16 @@ async fn runtime_snapshots_are_taken_like_upstream() {
     ];
     let root = temp_dir("runtime");
     write_tree(&root, tree);
+    use std::os::unix::ffi::OsStrExt;
+    let latin1_name = std::ffi::OsStr::from_bytes(b"caf\xe9.yaml");
+    // macOS refuses names that are not UTF-8.
+    if cfg!(target_os = "linux") {
+        std::fs::write(
+            root.join("v1/ratelimit/config").join(latin1_name),
+            b"latin1",
+        )
+        .unwrap();
+    }
     let unreadable = root.join("v1/ratelimit/config/secret");
     std::fs::write(&unreadable, b"s").unwrap();
     let locked = root.join("v1/ratelimit/config/locked");
@@ -3625,6 +3669,20 @@ async fn runtime_snapshots_are_taken_like_upstream() {
         ("RUNTIME_APPDIRECTORY", "missing".into()),
         ("RUNTIME_WATCH_ROOT", "false".into()),
     ]));
+    // Relative paths, down to `.` (the test's directory, the same on both sides).
+    cases.push(env(&[
+        ("RUNTIME_ROOT", ".".into()),
+        ("RUNTIME_SUBDIRECTORY", ".".into()),
+        ("RUNTIME_APPDIRECTORY", "src".into()),
+        ("RUNTIME_WATCH_ROOT", "false".into()),
+    ]));
+    cases.push(env(&[
+        ("RUNTIME_ROOT", ".".into()),
+        ("RUNTIME_SUBDIRECTORY", ".".into()),
+        ("RUNTIME_APPDIRECTORY", ".".into()),
+        ("RUNTIME_WATCH_ROOT", "false".into()),
+        ("RUNTIME_IGNOREDOTFILES", "true".into()),
+    ]));
     // Without a subdirectory: the nil loader; the runtime scope still counts reserved tags.
     cases.push(env(&[
         ("RUNTIME_ROOT", path("current")),
@@ -3651,7 +3709,6 @@ async fn runtime_snapshots_are_taken_like_upstream() {
         assert_eq!(ours, upstream, "{environment:?}");
     }
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
 }
 
 const LLM_CONFIG: &[u8] = b"domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: minute, requests_per_unit: 2}\n";
@@ -3722,7 +3779,6 @@ async fn the_file_provider_loads_the_runtime_directory_like_upstream() {
         h.call(request("elsewhere", &[&[("k", "v")]]))
             .await
             .unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
     }
     let root = temp_dir("provider");
     write_tree(
@@ -3736,7 +3792,6 @@ async fn the_file_provider_loads_the_runtime_directory_like_upstream() {
     let mut h = file_provider_harness(&root, true).await;
     h.at(1_700_000_000).await;
     let _ = h.call(request("llm", &[&[("user", "a")]])).await;
-    std::fs::remove_dir_all(&root).unwrap();
     // Bytes yaml.v2 cannot read fail the load too.
     for bad in [
         &b"domain: caf\xe9\n"[..],
@@ -3750,7 +3805,6 @@ async fn the_file_provider_loads_the_runtime_directory_like_upstream() {
         );
         let mut h = file_provider_harness(&root, true).await;
         let _ = h.call(request("a", &[&[("k", "v")]])).await;
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -3770,11 +3824,11 @@ async fn config_characters_are_read_like_upstream() {
         assert!(h.load_config(config).await.is_err(), "{config:?}");
     }
     h.load_config("\u{feff}domain: bom\n").await.unwrap();
-    // NEL, LS and PS break lines in YAML 1.1.
+    // NEL breaks lines in YAML 1.1; LS stays a character in a scalar.
     for config in [
         "domain: tab\tand\u{a0}\u{85}descriptors: []\n",
-        "domain: a\u{2028}descriptors: []\n",
-        "domain: a\u{85}descriptors:\u{2029}  - key: k\u{85}    rate_limit: {unit: second, requests_per_unit: 1}\n",
+        "domain: \"a\u{2028}b\"\n",
+        "domain: a\u{85}descriptors:\u{85}  - key: k\u{85}    rate_limit: {unit: second, requests_per_unit: 1}\n",
     ] {
         let _ = h.load_config(config).await;
     }
@@ -3817,7 +3871,6 @@ async fn the_file_provider_reloads_like_upstream() {
     assert!(touched.success());
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
 
     // Directory: a file moved in reloads; one moved out does not (a rename), a deleted one does.
     let root = temp_dir("reload");
@@ -3849,5 +3902,4 @@ async fn the_file_provider_reloads_like_upstream() {
     h.await_config_loads(3).await;
     h.call(request("llm", &[&[("user", "a")]])).await.unwrap();
     h.call(request("other", &[&[("k", "v")]])).await.unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
 }
