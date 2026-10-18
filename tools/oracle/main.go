@@ -480,6 +480,7 @@ func main() {
 	redisURL := flag.String("redis", "127.0.0.1:6379", "Redis address")
 	prefix := flag.String("cache-key-prefix", "", "CACHE_KEY_PREFIX")
 	localCacheSize := flag.Int("local-cache-size", 0, "LOCAL_CACHE_SIZE_IN_BYTES (0 disables the local cache)")
+	calendarMonth := flag.Bool("calendar-month", false, "USE_CALENDAR_MONTH_RATE_LIMIT for the cache")
 	stopIncrement := flag.Bool("stop-cache-key-increment", false, "STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT")
 	nearLimitRatio := flag.Float64("near-limit-ratio", 0.8, "NEAR_LIMIT_RATIO")
 	statsdAddr := flag.String("statsd", "", "host:port of a statsd server (TCP) that also receives the stats")
@@ -576,7 +577,7 @@ func main() {
 		localCache = freecache.NewCacheCustomTimer(*localCacheSize, freecacheTimer{clk})
 	}
 	cache := redis.NewFixedRateLimitCacheImpl(client, nil, clk, rand.New(utils.NewLockedSource(1)), 0,
-		localCache, float32(*nearLimitRatio), *prefix, statsManager, *stopIncrement, false)
+		localCache, float32(*nearLimitRatio), *prefix, statsManager, *stopIncrement, *calendarMonth)
 
 	// Nothing is sent on it: PUT /config calls SetConfig directly. NewService needs a provider.
 	events := &configEvents{events: make(chan provider.ConfigUpdateEvent)}

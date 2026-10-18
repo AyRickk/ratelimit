@@ -354,6 +354,10 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
             load.sanitize_descriptor_metric_dots.to_string(),
         ),
         ("SHADOW_MODE", settings.global_shadow_mode.to_string()),
+        (
+            "USE_CALENDAR_MONTH_RATE_LIMIT",
+            settings.use_calendar_month.to_string(),
+        ),
         ("QUOTA_MODE", settings.global_quota_mode.to_string()),
         (
             "RESPONSE_DYNAMIC_METADATA",
@@ -411,6 +415,7 @@ impl Oracle {
             .args(["-cache-key-prefix", &settings.cache_key_prefix])
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
             .args(["-near-limit-ratio", &near_limit_ratio])
+            .arg(format!("-calendar-month={}", settings.use_calendar_month))
             .args(statsd.map(|server| format!("-statsd={}", server.address)))
             .args(dogstatsd.map(|server| format!("-dogstatsd={}", server.address)))
             .args(prometheus.map(Prometheus::oracle_args).unwrap_or_default())
@@ -717,7 +722,8 @@ async fn http_request(
 ) -> Scraped {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = None;
-    for _ in 0..300 {
+    // Up to 30 s: a loaded machine can be slow to start a listener.
+    for _ in 0..3000 {
         match tokio::net::TcpStream::connect(address).await {
             Ok(connected) => {
                 stream = Some(connected);
@@ -794,6 +800,19 @@ fn comparable(mut scraped: Scraped, upstream: bool) -> Scraped {
         let body = created.replace_all(&scraped.body, "");
         let spaces = regex::Regex::new(r" +").unwrap();
         scraped.body = spaces.replace_all(&body, " ").replace(" }", "}");
+        // Go gathers concurrently: which of two help texts is the expected one, and so the
+        // series named, is random (docs/parity.md §7). The pair is kept, not its order.
+        let help = regex::Regex::new(
+            r#"collected metric (\S+) .* has help "([^"]*)" but should have "([^"]*)""#,
+        )
+        .unwrap();
+        scraped.body = help
+            .replace_all(&scraped.body, |c: &regex::Captures| {
+                let mut helps = [c[2].to_string(), c[3].to_string()];
+                helps.sort();
+                format!("collected metric {} has helps {helps:?}", &c[1])
+            })
+            .into_owned();
     }
     scraped
 }
@@ -1346,6 +1365,65 @@ descriptors:
     h.at(1_000_000_059).await;
     h.call(request("d", &[&[("m", "x")]])).await.unwrap();
     h.assert_same_redis().await;
+}
+
+/// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month limit counts in the UTC calendar month (its
+/// key, its TTL, its reset, refunds included, and the response's and request's reset
+/// headers), across short, leap and year-end months; off, a month is 30 days from the epoch.
+/// Other units are not affected.
+#[tokio::test]
+async fn calendar_months_are_counted_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    const MONTHLY: &str = "
+domain: d
+descriptors:
+  - key: monthly
+    rate_limit: {unit: month, requests_per_unit: 2}
+  - key: daily
+    rate_limit: {unit: day, requests_per_unit: 5}
+";
+    for calendar in [true, false] {
+        let settings = Settings {
+            cache: RedisCacheSettings {
+                local_cache_size_in_bytes: 1 << 20,
+                use_calendar_month: calendar,
+                ..Default::default()
+            },
+            service: ServiceSettings {
+                response_headers: Some(LimitHeaders::default()),
+                request_headers: Some(LimitHeaders {
+                    limit: "X-Limit".into(),
+                    remaining: "X-Remaining".into(),
+                    reset: "X-Reset".into(),
+                }),
+                use_calendar_month: calendar,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut h = Harness::configured(MONTHLY, settings).await;
+        for now in [
+            1_706_745_599, // 2024-01-31 23:59:59
+            1_706_745_600, // 2024-02-01 00:00:00
+            1_709_208_000, // 2024-02-29 12:00:00, a leap year
+            1_677_625_200, // 2023-02-28 23:00:00
+            1_710_460_800, // 2024-03-15 00:00:00
+            1_735_689_570, // 2024-12-31 23:59:30
+        ] {
+            h.at(now).await;
+            for _ in 0..4 {
+                h.call(request("d", &[&[("monthly", "m")], &[("daily", "x")]]))
+                    .await
+                    .unwrap();
+            }
+            h.call(refund(request("d", &[&[("monthly", "m")]]), 1))
+                .await
+                .unwrap();
+        }
+        h.assert_same_redis().await;
+    }
 }
 
 fn with_hits(
@@ -6816,6 +6894,99 @@ async fn prometheus_flushes_are_logged_like_upstream() {
     assert_eq!(runs[1], runs[0]);
 }
 
+/// `EXPIRATION_JITTER_MAX_SECONDS`: each key's TTL is its window plus a random extra below
+/// the maximum, on both sides (the extras themselves are random), refunds' too; none at 0.
+#[tokio::test]
+async fn expirations_are_jittered_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("jitter");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    for (jitter, spread) in [("100", 60..160), ("0", 60..61)] {
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let redis = Redis::start().await;
+            let (grpc, http) = (reserved_port(), reserved_port());
+            let environment = vec![
+                (
+                    "RUNTIME_ROOT",
+                    runtime.join("current").to_string_lossy().into_owned(),
+                ),
+                ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+                ("REDIS_SOCKET_TYPE", "tcp".into()),
+                ("REDIS_URL", redis.address.clone()),
+                ("DISABLE_STATS", "true".into()),
+                ("EXPIRATION_JITTER_MAX_SECONDS", jitter.into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ];
+            let users: Vec<String> = (0..20).map(|i| format!("u{i}")).collect();
+            // Each key counted then refunded: its TTL is the refund script's, jittered too.
+            let mut requests: Vec<RateLimitRequest> = users
+                .iter()
+                .map(|user| request("llm", &[&[("user", user)]]))
+                .collect();
+            requests.extend(
+                users
+                    .iter()
+                    .map(|user| refund(request("llm", &[&[("user", user)]]), 1)),
+            );
+            requested_run(
+                &binary,
+                &environment,
+                (grpc, http),
+                &requests,
+                None,
+                std::time::Duration::ZERO,
+            )
+            .await;
+            let keys: Vec<String> = redis
+                .client
+                .custom(
+                    CustomCommand::new_static("KEYS", ClusterHash::Random, false),
+                    vec!["*"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(keys.len(), users.len(), "{keys:?}");
+            let mut ttls = std::collections::BTreeSet::new();
+            for key in keys {
+                let ttl: i64 = redis
+                    .client
+                    .custom(
+                        CustomCommand::new_static("TTL", ClusterHash::Random, false),
+                        vec![key],
+                    )
+                    .await
+                    .unwrap();
+                // A second may have passed since the EXPIRE.
+                assert!(
+                    (spread.start - 2..spread.end).contains(&ttl),
+                    "{} {jitter}: {ttl}",
+                    binary.display()
+                );
+                ttls.insert(ttl);
+            }
+            if jitter != "0" {
+                assert!(ttls.len() > 5, "{} {jitter}: {ttls:?}", binary.display());
+            }
+        }
+    }
+}
+
 /// The stderr of `binary` run with `environment`, serving gRPC and HTTP on `ports`: once it
 /// serves, each request in turn (errors ignored), then `json` on `/json` (answered with 200),
 /// then `linger`, then SIGTERM.
@@ -7081,7 +7252,8 @@ async fn a_password_protected_redis_is_logged_like_upstream() {
 
 /// A Redis that answers only after the first dials fail: each failure, each retry, then the
 /// connection restored, as upstream logs them. A binary slowed down enough to dial only once
-/// Redis is up has nothing to compare: the pair of runs is tried again.
+/// Redis is up has nothing to compare, and a dial made while Redis comes up gets that
+/// instant's error: the pair of runs is tried again, three times at most.
 #[tokio::test]
 async fn a_late_redis_is_logged_like_upstream() {
     if !tools_available() {
@@ -7096,17 +7268,21 @@ async fn a_late_redis_is_logged_like_upstream() {
         ],
     );
     let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let mut last = None;
     for _ in 0..3 {
         let runs = late_redis_runs(&runtime, &waits).await;
         if runs
             .iter()
             .all(|r| r.iter().any(|l| l.contains("re-established")))
         {
-            assert_eq!(runs[1], runs[0]);
-            return;
+            if runs[1] == runs[0] {
+                return;
+            }
+            last = Some(runs);
         }
     }
-    panic!("no run dialled before Redis was up");
+    let runs = last.expect("a run dialled before Redis was up");
+    assert_eq!(runs[1], runs[0]);
 }
 
 /// The Redis lines of upstream's binary then ours, each with a Redis started 800 ms after it.
@@ -7594,6 +7770,18 @@ async fn traces_are_exported_like_upstream() {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             let channel = channel.expect("the service serves");
+            // Serving for sure, with no traced call: its health check over HTTP answers.
+            let mut healthy = false;
+            for _ in 0..600 {
+                let answer =
+                    http_request(&format!("127.0.0.1:{http}"), "GET", "/healthcheck", &[]).await;
+                if answer.status == 200 {
+                    healthy = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(healthy, "the service is healthy");
             let mut client = RateLimitServiceClient::new(channel.clone());
             let call = |headers: &[(&'static str, String)]| {
                 let mut call = tonic::Request::new(request("llm", &[&[("user", "t")]]));

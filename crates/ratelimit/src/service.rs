@@ -2,7 +2,7 @@
 //! `src/service/ratelimit.go`.
 
 use crate::config::{ConfigError, LimitLookup, RateLimit, RateLimitConfig};
-use crate::limiter::{Clock, unit_seconds};
+use crate::limiter::{Clock, reset_seconds};
 use crate::stats::Stats;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use ratelimit_proto::envoy::config::core::v3::HeaderValue;
@@ -59,6 +59,8 @@ pub struct ServiceSettings {
     pub per_unit_headers: bool,
     /// `RESPONSE_DYNAMIC_METADATA`: describe the request in the response's dynamic metadata.
     pub response_dynamic_metadata: bool,
+    /// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month's reset is the next UTC calendar month.
+    pub use_calendar_month: bool,
 }
 
 /// The names of the three headers describing the descriptor closest to its limit.
@@ -335,8 +337,8 @@ impl<C: RateLimitCache> RateLimitService<C> {
             .current_limit
             .as_ref()
             .expect("a status with a limit");
-        let window = unit_seconds(limit.unit())?;
-        let reset = window - self.clock.unix_now() % window;
+        let now = self.clock.unix_now();
+        let reset = reset_seconds(limit.unit(), now, self.settings.use_calendar_month)?;
         Ok(vec![
             header(&names.limit, limit.requests_per_unit),
             header(&names.remaining, status.limit_remaining),

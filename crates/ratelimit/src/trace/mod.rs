@@ -357,40 +357,11 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-/// Random bytes from a per-thread generator (splitmix64), seeded from the system (or, if
-/// it fails, from the time and the thread).
-fn random_bytes(out: &mut [u8]) {
-    thread_local! {
-        static STATE: std::cell::Cell<u64> = std::cell::Cell::new({
-            let mut seed = [0u8; 8];
-            match getrandom::fill(&mut seed) {
-                Ok(()) => u64::from_ne_bytes(seed),
-                Err(_) => {
-                    use std::hash::BuildHasher;
-                    std::collections::hash_map::RandomState::new()
-                        .hash_one((now(), std::thread::current().id()))
-                }
-            }
-        });
-    }
-    for chunk in out.chunks_mut(8) {
-        let value = STATE.with(|state| {
-            let next = state.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
-            state.set(next);
-            let mut z = next;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        });
-        chunk.copy_from_slice(&value.to_be_bytes()[..chunk.len()]);
-    }
-}
-
 /// A random ID, never all zeros (an invalid one).
 fn random_id<const N: usize>() -> [u8; N] {
     loop {
         let mut id = [0u8; N];
-        random_bytes(&mut id);
+        crate::random::fill(&mut id);
         if id != [0; N] {
             return id;
         }
@@ -409,7 +380,7 @@ fn random_span_id() -> [u8; 8] {
 fn random_uuid() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
-        random_bytes(&mut bytes);
+        crate::random::fill(&mut bytes);
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;

@@ -474,6 +474,8 @@ impl Settings {
             },
             stop_cache_key_increment_when_overlimit: self.stop_cache_key_increment_when_overlimit,
             near_limit_ratio: self.near_limit_ratio,
+            expiration_jitter_max_seconds: self.expiration_jitter_max_seconds,
+            use_calendar_month: self.use_calendar_month_rate_limit,
         }
     }
 
@@ -487,6 +489,7 @@ impl Settings {
             })
         };
         ServiceSettings {
+            use_calendar_month: self.use_calendar_month_rate_limit,
             global_shadow_mode: self.shadow_mode,
             global_quota_mode: self.quota_mode,
             response_headers: headers(
