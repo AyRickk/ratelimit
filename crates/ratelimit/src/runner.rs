@@ -224,8 +224,15 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     }
 
     // createLimiter: Redis, healthy once connected.
-    let connection = match settings.backend_type.as_str() {
-        "redis" | "" => RedisConnection::from_settings(&settings)?,
+    // The per-second pool comes first, as in `NewRateLimiterCacheImplFromSettings`.
+    let (per_second_connection, connection) = match settings.backend_type.as_str() {
+        "redis" | "" => (
+            settings
+                .redis_persecond
+                .then(|| RedisConnection::per_second_from_settings(&settings))
+                .transpose()?,
+            RedisConnection::from_settings(&settings)?,
+        ),
         "memcache" => {
             return Err("BACKEND_TYPE=memcache is not supported yet"
                 .to_string()
@@ -243,8 +250,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let backoff = StartupBackoff::from_settings(&settings);
     // The pool's stats exist before it connects (`newPoolStats`), so are flushed meanwhile.
     let mut per_second = None;
-    if settings.redis_persecond {
-        let connection = RedisConnection::per_second_from_settings(&settings)?;
+    if let Some(connection) = per_second_connection {
         let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_per_second_pool"));
         let pool = connection
             .connect(&backoff, shutting_down(signals.stop.clone()))

@@ -32,12 +32,14 @@ pub struct RedisConnection {
     pub pipeline_limit: i64,
     pub pool_on_empty_behavior: String,
     pub redis_type: String,
+    /// The pool's variables' prefix (`REDIS`, `REDIS_PERSECOND`), for errors naming them.
+    pub prefix: &'static str,
 }
 
 /// What `newClientImpl` takes for one pool, from its group of settings.
 struct PoolSettings<'a> {
-    /// The pool size's variable, for its error.
-    pool_size_name: &'static str,
+    /// The variables' prefix, for errors naming them.
+    prefix: &'static str,
     socket_type: &'a str,
     url: &'a str,
     pool_size: i64,
@@ -54,6 +56,8 @@ impl RedisConnection {
     pub fn from_settings(s: &Settings) -> Result<Self, String> {
         crate::settings::refuse_unsupported(&[
             (s.redis_tls, "REDIS_TLS"),
+            // Upstream loads the TLS files for either pool, the per-second one enabled or not.
+            (s.redis_persecond_tls, "REDIS_PERSECOND_TLS"),
             (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
             (!s.redis_auth_file.is_empty(), "REDIS_AUTH_FILE"),
             (
@@ -62,7 +66,7 @@ impl RedisConnection {
             ),
         ])?;
         Self::new(PoolSettings {
-            pool_size_name: "REDIS_POOL_SIZE",
+            prefix: "REDIS",
             socket_type: &s.redis_socket_type,
             url: &s.redis_url,
             pool_size: s.redis_pool_size,
@@ -86,13 +90,9 @@ impl RedisConnection {
                 !s.redis_persecond_auth_file.is_empty(),
                 "REDIS_PERSECOND_AUTH_FILE",
             ),
-            (
-                s.redis_close_connection_on_readonly_error,
-                "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
-            ),
         ])?;
         Self::new(PoolSettings {
-            pool_size_name: "REDIS_PERSECOND_POOL_SIZE",
+            prefix: "REDIS_PERSECOND",
             socket_type: &s.redis_persecond_socket_type,
             url: &s.redis_persecond_url,
             pool_size: s.redis_persecond_pool_size,
@@ -107,9 +107,8 @@ impl RedisConnection {
     fn new(p: PoolSettings<'_>) -> Result<Self, String> {
         let pool_size = match p.pool_size {
             0 => 4,
-            size => {
-                usize::try_from(size).map_err(|_| format!("invalid {} {size}", p.pool_size_name))?
-            }
+            size => usize::try_from(size)
+                .map_err(|_| format!("invalid {}_POOL_SIZE {size}", p.prefix))?,
         };
         // createDialer: the auth is `user:password` or a password; radix then fills in what
         // is still empty from a redis:// URL.
@@ -138,6 +137,7 @@ impl RedisConnection {
             pipeline_limit: p.pipeline_limit,
             pool_on_empty_behavior: p.pool_on_empty_behavior.to_string(),
             redis_type: p.redis_type.to_string(),
+            prefix: p.prefix,
         })
     }
 
@@ -315,7 +315,8 @@ impl RedisConnection {
         checked?;
         if !self.database.is_empty() && self.database.parse::<u8>().is_err() {
             return Err(format!(
-                "REDIS_URL database {} is not supported",
+                "{}_URL database {} is not supported",
+                self.prefix,
                 crate::go::quote(&self.database)
             ));
         }
@@ -380,8 +381,8 @@ impl RedisConnection {
                 "single" => crate::log::warn(&format!("Creating single with urls {masked}")),
                 "cluster" | "sentinel" => {
                     return Err(format!(
-                        "REDIS_TYPE={} is not supported yet",
-                        self.redis_type
+                        "{}_TYPE={} is not supported yet",
+                        self.prefix, self.redis_type
                     ));
                 }
                 _ => return Err(format!("Unrecognized redis type {}", self.redis_type)),
