@@ -180,42 +180,43 @@ impl RedisConnection {
     }
 
     /// radix's AUTH arguments: with a user even when the password is empty.
-    fn auth_arguments((username, password): &(String, String)) -> Option<Vec<String>> {
-        match (username.is_empty(), password.is_empty()) {
-            (false, _) => Some(vec![username.clone(), password.clone()]),
-            (true, false) => Some(vec![password.clone()]),
-            (true, true) => None,
+    fn auth_arguments(credentials: &(String, String)) -> Option<Vec<String>> {
+        match fred_credentials(credentials) {
+            (Some(username), Some(password)) => Some(vec![username, password]),
+            (_, Some(password)) => Some(vec![password]),
+            _ => None,
         }
     }
 
     /// The user and password to authenticate with: from `REDIS_AUTH` (or the URL), or from
     /// the auth file, read now, what it leaves empty taken from the URL (radix's `Dial`).
     fn credentials(&self) -> Result<(String, String), String> {
-        if self.auth_file.is_empty() {
-            return Ok((self.username.clone(), self.password.clone()));
+        self.file_credentials().credentials()
+    }
+
+    /// What reads the credentials at each connection: the file, and the URL's for what it
+    /// leaves empty (with no file, they are `REDIS_AUTH`'s or the URL's).
+    fn file_credentials(&self) -> FileCredentials {
+        FileCredentials {
+            path: self.auth_file.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
         }
-        let (mut username, mut password) = read_auth_file(&self.auth_file)?;
-        if username.is_empty() {
-            username = self.username.clone();
-        }
-        if password.is_empty() {
-            password = self.password.clone();
-        }
-        Ok((username, password))
     }
 
     /// A client builder; the probe leaves the database to the dial (`probe`).
     fn builder(&self, server: ServerConfig, probe: bool) -> Builder {
-        // With an auth file, each connection reads it (the provider), as radix's dialer does.
-        let (username, password) = match self.auth_file.is_empty() {
-            true => fred_credentials(&(self.username.clone(), self.password.clone())),
-            false => (None, None),
+        // With an auth file, each connection reads it (the provider), as radix's dialer does;
+        // fred reads it once connected, where radix reads it before dialling.
+        let mut credential_provider = None;
+        let (username, password) = if self.auth_file.is_empty() {
+            fred_credentials(&(self.username.clone(), self.password.clone()))
+        } else {
+            let provider: std::sync::Arc<dyn fred::types::config::CredentialProvider> =
+                std::sync::Arc::new(self.file_credentials());
+            credential_provider = Some(provider);
+            (None, None)
         };
-        let credential_provider = (!self.auth_file.is_empty()).then(|| {
-            std::sync::Arc::new(FileCredentials {
-                connection: self.clone(),
-            }) as std::sync::Arc<dyn fred::types::config::CredentialProvider>
-        });
         let mut builder = Builder::from_config(Config {
             server,
             username,
@@ -497,10 +498,38 @@ fn read_auth_file(path: &str) -> Result<(String, String), String> {
     })
 }
 
-/// The pool's credentials, read from the auth file at each connection.
-#[derive(Debug)]
+/// The pool's credentials, read from the auth file at each connection; what it leaves empty
+/// is the URL's.
 struct FileCredentials {
-    connection: RedisConnection,
+    /// Empty: the URL's credentials (or `REDIS_AUTH`'s) as they are.
+    path: String,
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for FileCredentials {
+    /// The path only: the password stays out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileCredentials")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl FileCredentials {
+    fn credentials(&self) -> Result<(String, String), String> {
+        if self.path.is_empty() {
+            return Ok((self.username.clone(), self.password.clone()));
+        }
+        let (mut username, mut password) = read_auth_file(&self.path)?;
+        if username.is_empty() {
+            username = self.username.clone();
+        }
+        if password.is_empty() {
+            password = self.password.clone();
+        }
+        Ok((username, password))
+    }
 }
 
 #[tonic::async_trait]
@@ -510,7 +539,6 @@ impl fred::types::config::CredentialProvider for FileCredentials {
         _server: Option<&Server>,
     ) -> Result<(Option<String>, Option<String>), fred::error::Error> {
         let credentials = self
-            .connection
             .credentials()
             .map_err(|e| fred::error::Error::new(fred::error::ErrorKind::Auth, e))?;
         Ok(fred_credentials(&credentials))
@@ -711,4 +739,32 @@ fn radix_reconnects() -> ReconnectPolicy {
     let mut policy = ReconnectPolicy::new_exponential(0, 125, 4000, 2);
     policy.set_jitter(0);
     policy
+}
+
+#[cfg(test)]
+mod auth_file_tests {
+    use super::*;
+
+    /// radix fills the user and the password independently from the URL, each only if the
+    /// file left it empty.
+    #[test]
+    fn a_file_is_completed_by_the_url() {
+        let dir = std::env::temp_dir().join(format!("ratelimit-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials = |contents: &str| {
+            let path = dir.join("auth");
+            std::fs::write(&path, contents).unwrap();
+            FileCredentials {
+                path: path.to_string_lossy().into_owned(),
+                username: "url-user".into(),
+                password: "url-pass".into(),
+            }
+            .credentials()
+            .unwrap()
+        };
+        assert_eq!(credentials("me:"), ("me".into(), "url-pass".into()));
+        assert_eq!(credentials("secret"), ("url-user".into(), "secret".into()));
+        assert_eq!(credentials(":secret"), ("url-user".into(), "secret".into()));
+        assert_eq!(credentials("me:a:b\n"), ("me".into(), "a:b".into()));
+    }
 }
