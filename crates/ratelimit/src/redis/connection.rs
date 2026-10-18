@@ -34,31 +34,90 @@ pub struct RedisConnection {
     pub redis_type: String,
 }
 
+/// What `newClientImpl` takes for one pool, from its group of settings.
+struct PoolSettings<'a> {
+    /// The pool size's variable, for its error.
+    pool_size_name: &'static str,
+    socket_type: &'a str,
+    url: &'a str,
+    pool_size: i64,
+    auth: &'a str,
+    timeout: i64,
+    pool_on_empty_behavior: &'a str,
+    redis_type: &'a str,
+    pipeline_limit: i64,
+}
+
 impl RedisConnection {
-    /// The main pool's connection, or why upstream refuses to start (or what is not supported
-    /// yet).
+    /// The main pool's connection (`REDIS_*`), or why upstream refuses to start (or what is
+    /// not supported yet).
     pub fn from_settings(s: &Settings) -> Result<Self, String> {
         crate::settings::refuse_unsupported(&[
             (s.redis_tls, "REDIS_TLS"),
             (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
             (!s.redis_auth_file.is_empty(), "REDIS_AUTH_FILE"),
-            (s.redis_persecond, "REDIS_PERSECOND"),
             (
                 s.redis_close_connection_on_readonly_error,
                 "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
             ),
         ])?;
-        let pool_size = match s.redis_pool_size {
+        Self::new(PoolSettings {
+            pool_size_name: "REDIS_POOL_SIZE",
+            socket_type: &s.redis_socket_type,
+            url: &s.redis_url,
+            pool_size: s.redis_pool_size,
+            auth: &s.redis_auth,
+            timeout: s.redis_timeout,
+            pool_on_empty_behavior: &s.redis_pool_on_empty_behavior,
+            redis_type: &s.redis_type,
+            pipeline_limit: s.redis_pipeline_limit,
+        })
+    }
+
+    /// The per-second pool's connection (`REDIS_PERSECOND_*`), for limits in seconds.
+    pub fn per_second_from_settings(s: &Settings) -> Result<Self, String> {
+        crate::settings::refuse_unsupported(&[
+            (s.redis_persecond_tls, "REDIS_PERSECOND_TLS"),
+            (
+                s.redis_persecond_aws_iam_auth,
+                "REDIS_PERSECOND_AWS_IAM_AUTH",
+            ),
+            (
+                !s.redis_persecond_auth_file.is_empty(),
+                "REDIS_PERSECOND_AUTH_FILE",
+            ),
+            (
+                s.redis_close_connection_on_readonly_error,
+                "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
+            ),
+        ])?;
+        Self::new(PoolSettings {
+            pool_size_name: "REDIS_PERSECOND_POOL_SIZE",
+            socket_type: &s.redis_persecond_socket_type,
+            url: &s.redis_persecond_url,
+            pool_size: s.redis_persecond_pool_size,
+            auth: &s.redis_persecond_auth,
+            timeout: s.redis_persecond_timeout,
+            pool_on_empty_behavior: &s.redis_persecond_pool_on_empty_behavior,
+            redis_type: &s.redis_persecond_type,
+            pipeline_limit: s.redis_persecond_pipeline_limit,
+        })
+    }
+
+    fn new(p: PoolSettings<'_>) -> Result<Self, String> {
+        let pool_size = match p.pool_size {
             0 => 4,
-            size => usize::try_from(size).map_err(|_| format!("invalid REDIS_POOL_SIZE {size}"))?,
+            size => {
+                usize::try_from(size).map_err(|_| format!("invalid {} {size}", p.pool_size_name))?
+            }
         };
-        // createDialer: REDIS_AUTH is `user:password` or a password; radix then fills in what
+        // createDialer: the auth is `user:password` or a password; radix then fills in what
         // is still empty from a redis:// URL.
-        let (mut username, mut password) = match s.redis_auth.split_once(':') {
+        let (mut username, mut password) = match p.auth.split_once(':') {
             Some((user, pass)) => (user.to_string(), pass.to_string()),
-            None => (String::new(), s.redis_auth.clone()),
+            None => (String::new(), p.auth.to_string()),
         };
-        let (address, url) = parse_redis_url(&s.redis_url);
+        let (address, url) = parse_redis_url(p.url);
         if username.is_empty() {
             username = url.username;
         }
@@ -66,19 +125,19 @@ impl RedisConnection {
             password = url.password;
         }
         Ok(Self {
-            network: s.redis_socket_type.clone(),
+            network: p.socket_type.to_string(),
             address,
             username,
             password,
             database: url.database,
             pool_size,
-            timeout: crate::settings::duration(s.redis_timeout),
-            masked_url: mask_credentials_in_url(&s.redis_url),
-            auth: s.redis_auth.clone(),
-            pool_size_setting: s.redis_pool_size,
-            pipeline_limit: s.redis_pipeline_limit,
-            pool_on_empty_behavior: s.redis_pool_on_empty_behavior.clone(),
-            redis_type: s.redis_type.clone(),
+            timeout: crate::settings::duration(p.timeout),
+            masked_url: mask_credentials_in_url(p.url),
+            auth: p.auth.to_string(),
+            pool_size_setting: p.pool_size,
+            pipeline_limit: p.pipeline_limit,
+            pool_on_empty_behavior: p.pool_on_empty_behavior.to_string(),
+            redis_type: p.redis_type.to_string(),
         })
     }
 

@@ -398,6 +398,7 @@ fn oracle_environment(settings: &Settings) -> Vec<(&'static str, String)> {
 impl Oracle {
     async fn start(
         redis: &Redis,
+        per_second: Option<&Redis>,
         all: &Settings,
         statsd: Option<&StatsdServer>,
         dogstatsd: Option<&DogStatsdServer>,
@@ -416,6 +417,7 @@ impl Oracle {
             .args(["-local-cache-size", &local_cache_size, &stop_increment])
             .args(["-near-limit-ratio", &near_limit_ratio])
             .arg(format!("-calendar-month={}", settings.use_calendar_month))
+            .args(per_second.map(|redis| format!("-redis-per-second={}", redis.address)))
             .args(statsd.map(|server| format!("-statsd={}", server.address)))
             .args(dogstatsd.map(|server| format!("-dogstatsd={}", server.address)))
             .args(prometheus.map(Prometheus::oracle_args).unwrap_or_default())
@@ -507,6 +509,7 @@ struct Subject {
 impl Subject {
     async fn start(
         redis: &Redis,
+        per_second: Option<&Redis>,
         settings: &Settings,
         statsd: Option<&StatsdServer>,
         dogstatsd: Option<&DogStatsdServer>,
@@ -541,12 +544,15 @@ impl Subject {
             }
             None => None,
         };
-        let cache = RedisCache::new(
+        let mut cache = RedisCache::new(
             redis.connect().await,
             clock.clone(),
             stats.clone(),
             settings.cache.clone(),
         );
+        if let Some(redis) = per_second {
+            cache = cache.with_per_second(redis.connect().await);
+        }
         let service = Arc::new(RateLimitService::new(
             cache,
             clock.clone(),
@@ -599,6 +605,8 @@ struct Harness {
     oracle_redis: Redis,
     subject: Subject,
     subject_redis: Redis,
+    /// With `Settings::per_second`, each side's per-second Redis (upstream's, then ours).
+    per_second: Option<(Redis, Redis)>,
     load_options: LoadOptions,
     /// With `Settings::statsd`, what the oracle and this implementation sent to statsd.
     statsd: Option<StatsdServers>,
@@ -614,6 +622,8 @@ struct Harness {
 #[derive(Default)]
 struct Settings {
     cache: RedisCacheSettings,
+    /// `REDIS_PERSECOND`: limits in seconds in a second Redis on each side.
+    per_second: bool,
     service: ServiceSettings,
     load: LoadOptions,
     /// `EXTRA_TAGS`.
@@ -1057,6 +1067,10 @@ impl Harness {
     async fn configured(config: &str, settings: Settings) -> Self {
         let oracle_redis = Redis::start().await;
         let subject_redis = Redis::start().await;
+        let per_second = match settings.per_second {
+            true => Some((Redis::start().await, Redis::start().await)),
+            false => None,
+        };
         let statsd = match settings.statsd {
             true => Some(StatsdServers {
                 oracle: StatsdServer::start().await,
@@ -1073,6 +1087,7 @@ impl Harness {
         };
         let oracle = Oracle::start(
             &oracle_redis,
+            per_second.as_ref().map(|(oracle, _)| oracle),
             &settings,
             statsd.as_ref().map(|s| &s.oracle),
             dogstatsd.as_ref().map(|s| &s.oracle),
@@ -1081,6 +1096,7 @@ impl Harness {
         .await;
         let subject = Subject::start(
             &subject_redis,
+            per_second.as_ref().map(|(_, subject)| subject),
             &settings,
             statsd.as_ref().map(|s| &s.subject),
             dogstatsd.as_ref().map(|s| &s.subject),
@@ -1093,6 +1109,7 @@ impl Harness {
             oracle_redis,
             subject,
             subject_redis,
+            per_second,
             load_options: settings.load,
             statsd,
             dogstatsd,
@@ -1273,6 +1290,19 @@ impl Harness {
                 "expiry of {key}: {actual_expires}, upstream {expires}"
             );
         }
+        if let Some((oracle, subject)) = &self.per_second {
+            assert_eq!(
+                subject.commands().await,
+                oracle.commands().await,
+                "commands received by the per-second Redis"
+            );
+            let (expected, actual) = tokio::join!(oracle.dump(), subject.dump());
+            assert_eq!(
+                values(&actual),
+                values(&expected),
+                "per-second keys and values"
+            );
+        }
     }
 
     /// Stores a raw value under `key` in both Redis servers.
@@ -1422,6 +1452,52 @@ descriptors:
                 .await
                 .unwrap();
         }
+        h.assert_same_redis().await;
+    }
+}
+
+/// `REDIS_PERSECOND`: limits in seconds go to the per-second Redis, in pipelines of their
+/// own (the reads of `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` too), the others to the main
+/// one; each Redis receives what upstream's does.
+#[tokio::test]
+async fn per_second_limits_use_their_own_redis_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    const MIXED: &str = "
+domain: d
+descriptors:
+  - key: fast
+    rate_limit: {unit: second, requests_per_unit: 2}
+  - key: slow
+    rate_limit: {unit: minute, requests_per_unit: 3}
+";
+    for stop_increment in [false, true] {
+        let settings = Settings {
+            per_second: true,
+            cache: RedisCacheSettings {
+                stop_cache_key_increment_when_overlimit: stop_increment,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut h = Harness::configured(MIXED, settings).await;
+        h.at(1_700_000_000).await;
+        for _ in 0..4 {
+            h.call(request("d", &[&[("fast", "a")], &[("slow", "b")]]))
+                .await
+                .unwrap();
+        }
+        h.call(request("d", &[&[("fast", "only")]])).await.unwrap();
+        h.call(request("d", &[&[("slow", "only")]])).await.unwrap();
+        h.call(refund(
+            request("d", &[&[("fast", "a")], &[("slow", "b")]]),
+            1,
+        ))
+        .await
+        .unwrap();
+        h.at(1_700_000_001).await;
+        h.call(request("d", &[&[("fast", "a")]])).await.unwrap();
         h.assert_same_redis().await;
     }
 }
@@ -6985,6 +7061,103 @@ async fn expirations_are_jittered_like_upstream() {
             }
         }
     }
+}
+
+/// With `REDIS_PERSECOND`, the per-second pool connects first, with its own log lines, then
+/// the main one; its stats are under `redis_per_second_pool`.
+#[tokio::test]
+async fn a_per_second_redis_starts_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    const FAST: &[u8] = b"domain: d\ndescriptors:\n  - key: fast\n    rate_limit: {unit: second, requests_per_unit: 5}\n";
+    let runtime = temp_dir("per-second");
+    write_tree(
+        &runtime,
+        &[("v1/ratelimit/config/d.yaml", FAST), ("current", b"->v1")],
+    );
+    let stat =
+        regex::Regex::new(r#""name":"(ratelimit\.redis_per_second_pool\.[^"]+)","type":"(\w+)""#)
+            .unwrap();
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (main, per_second) = (Redis::start().await, Redis::start().await);
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", main.address.clone()),
+            ("REDIS_POOL_SIZE", "2".into()),
+            ("REDIS_PERSECOND", "true".into()),
+            ("REDIS_PERSECOND_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_PERSECOND_URL", per_second.address.clone()),
+            ("REDIS_PERSECOND_POOL_SIZE", "3".into()),
+            ("REDIS_PERSECOND_AUTH", "secret".into()),
+            ("REDIS_PERSECOND_POOL_ON_EMPTY_BEHAVIOR", "wait".into()),
+            ("DISABLE_STATS", "false".into()),
+            ("USE_STATSD", "false".into()),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+            ("LOG_LEVEL", "info".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        // The per-second Redis wants that password.
+        let _: String = per_second
+            .client
+            .custom(
+                CustomCommand::new_static("CONFIG", ClusterHash::Random, false),
+                vec!["SET", "requirepass", "secret"],
+            )
+            .await
+            .unwrap();
+        let requests = vec![request("d", &[&[("fast", "x")]]); 2];
+        let stderr = requested_run(
+            &binary,
+            &environment,
+            (grpc, http),
+            &requests,
+            None,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let ports = [
+            (main.address.clone(), "MAIN".to_string()),
+            (per_second.address.clone(), "PER_SECOND".to_string()),
+        ];
+        let mut lines: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("time=") && (l.contains("redis") || l.contains("Redis")))
+            .map(|l| {
+                let mut l = l
+                    .split_once(" level=")
+                    .map_or(l, |(_, rest)| rest)
+                    .to_string();
+                for (address, name) in &ports {
+                    l = l.replace(address, name);
+                }
+                l
+            })
+            .collect();
+        lines.dedup();
+        let stats: std::collections::BTreeSet<String> = stat
+            .captures_iter(&stderr)
+            .map(|c| format!("{} {}", &c[1], &c[2]))
+            .collect();
+        runs.push((lines, stats));
+    }
+    assert!(runs[0].1.len() >= 2, "{:?}", runs[0].1);
+    assert_eq!(runs[1], runs[0]);
 }
 
 /// The stderr of `binary` run with `environment`, serving gRPC and HTTP on `ports`: once it

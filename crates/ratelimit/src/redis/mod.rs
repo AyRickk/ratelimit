@@ -14,7 +14,8 @@ use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use ratelimit_proto::envoy::service::ratelimit::v3::{
-    RateLimitRequest, rate_limit_response::DescriptorStatus,
+    RateLimitRequest,
+    rate_limit_response::{DescriptorStatus, rate_limit::Unit},
 };
 use std::sync::Arc;
 
@@ -63,6 +64,8 @@ impl Default for RedisCacheSettings {
 pub struct RedisCache {
     /// Connections, each request's pipeline on one of them (radix's pool).
     pool: Pool,
+    /// `REDIS_PERSECOND`: the pool for limits in seconds, in a pipeline of their own.
+    per_second: Option<Pool>,
     clock: Arc<dyn Clock>,
     stats: Arc<Stats>,
     local_cache: Option<Arc<LocalCache>>,
@@ -91,11 +94,23 @@ impl RedisCache {
     ) -> Self {
         Self {
             pool,
+            per_second: None,
             clock,
             stats,
             local_cache,
             settings,
         }
+    }
+
+    /// The cache sending limits in seconds to `pool` (`REDIS_PERSECOND`).
+    pub fn with_per_second(mut self, pool: Pool) -> Self {
+        self.per_second = Some(pool);
+        self
+    }
+
+    /// The pipelines' pools: the main one, then the per-second one if any.
+    fn pools(&self) -> [Option<&Pool>; 2] {
+        [Some(&self.pool), self.per_second.as_ref()]
     }
 }
 
@@ -217,6 +232,8 @@ struct Check<'a> {
     over_in_local_cache: bool,
     /// With `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: these hits will take it over the limit.
     going_over: bool,
+    /// The pipeline it goes in: 0 the main one, 1 the per-second one (`REDIS_PERSECOND`).
+    pipeline: usize,
 }
 
 impl RateLimitCache for RedisCache {
@@ -265,6 +282,10 @@ impl RateLimitCache for RedisCache {
                 hits,
                 over_in_local_cache,
                 going_over: false,
+                pipeline: match (&self.per_second, limit.limit.unit()) {
+                    (Some(_), Unit::Second) => 1,
+                    _ => 0,
+                },
             });
         }
 
@@ -283,7 +304,7 @@ impl RateLimitCache for RedisCache {
 
         // Per descriptor not answered by the local cache: INCRBY + EXPIRE, or the refund
         // script. Hits go over the wire as signed 64-bit integers, as upstream sends them.
-        let mut commands = Vec::new();
+        let mut pipelines: [Vec<Command>; 2] = [Vec::new(), Vec::new()];
         let mut reply_of = Vec::new();
         for c in &checks {
             if c.over_in_local_cache {
@@ -298,7 +319,8 @@ impl RateLimitCache for RedisCache {
                 expiration = expiration.wrapping_add(crate::random::below(jitter as u64) as i64);
             }
             let expiration = expiration.to_string();
-            reply_of.push((c.index, commands.len()));
+            let commands = &mut pipelines[c.pipeline];
+            reply_of.push((c.index, c.pipeline, commands.len()));
             if c.hits.refund {
                 let amount = (c.hits.value as i64).to_string();
                 let args = vec![
@@ -332,21 +354,26 @@ impl RateLimitCache for RedisCache {
                 vec![
                     (
                         "pipeline length".into(),
-                        crate::trace::Value::Int(commands.len() as i64),
+                        crate::trace::Value::Int(pipelines[0].len() as i64),
                     ),
                     (
                         "perSecondPipeline length".into(),
-                        crate::trace::Value::Int(0),
+                        crate::trace::Value::Int(pipelines[1].len() as i64),
                     ),
                 ]
             },
         );
         let mut counts = vec![Count::After(0); limits.len()];
-        if !commands.is_empty() {
-            let replies = send(self.pool.next(), &commands).await?;
-            for (index, at) in reply_of {
-                counts[index] = Count::After(commands[at].counter(replies[at].clone())?);
+        // The main pipeline, then the per-second one.
+        let mut replies: [Vec<_>; 2] = [Vec::new(), Vec::new()];
+        for (pipeline, pool) in self.pools().into_iter().enumerate() {
+            if let (Some(pool), false) = (pool, pipelines[pipeline].is_empty()) {
+                replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
             }
+        }
+        for (index, pipeline, at) in reply_of {
+            let reply = replies[pipeline][at].clone();
+            counts[index] = Count::After(pipelines[pipeline][at].counter(reply)?);
         }
         for c in &checks {
             if c.over_in_local_cache {
@@ -386,21 +413,28 @@ impl RedisCache {
     /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: reads the counters first to mark the keys
     /// these hits will take over the limit.
     async fn find_keys_going_over(&self, checks: &mut [Check<'_>]) -> Result<(), CacheError> {
-        let mut reads: Vec<&mut Check> = checks.iter_mut().filter(|c| !c.hits.refund).collect();
-        if reads.is_empty() {
-            return Ok(());
-        }
-        let commands: Vec<Command> = reads
-            .iter()
-            .map(|c| Command {
-                name: "GET",
-                args: vec![c.key.clone()],
-            })
-            .collect();
-        let replies = send(self.pool.next(), &commands).await?;
-        for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
-            let before = command.counter(reply)?;
-            c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));
+        // The main pipeline's reads, then the per-second one's.
+        for (pipeline, pool) in self.pools().into_iter().enumerate() {
+            let Some(pool) = pool else { continue };
+            let mut reads: Vec<&mut Check> = checks
+                .iter_mut()
+                .filter(|c| !c.hits.refund && c.pipeline == pipeline)
+                .collect();
+            if reads.is_empty() {
+                continue;
+            }
+            let commands: Vec<Command> = reads
+                .iter()
+                .map(|c| Command {
+                    name: "GET",
+                    args: vec![c.key.clone()],
+                })
+                .collect();
+            let replies = send(pool.next(), &commands).await?;
+            for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
+                let before = command.counter(reply)?;
+                c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));
+            }
         }
         Ok(())
     }

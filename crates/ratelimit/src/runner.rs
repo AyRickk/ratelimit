@@ -237,24 +237,39 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             )));
         }
     };
+    // Each pool connects as `newClientImpl` does, the per-second one first, and makes Redis
+    // healthy once connected.
+    let active_health = settings.redis_health_check_active_connection;
+    let backoff = StartupBackoff::from_settings(&settings);
+    // The pool's stats exist before it connects (`newPoolStats`), so are flushed meanwhile.
+    let mut per_second = None;
+    if settings.redis_persecond {
+        let connection = RedisConnection::per_second_from_settings(&settings)?;
+        let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_per_second_pool"));
+        let pool = connection
+            .connect(&backoff, shutting_down(signals.stop.clone()))
+            .await?;
+        pool_stats.follow(&pool, active_health.then(|| health.clone()));
+        let _ = health.ok(health::REDIS);
+        per_second = Some(pool);
+    }
     let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
     let pool = connection
-        .connect(
-            &StartupBackoff::from_settings(&settings),
-            shutting_down(signals.stop.clone()),
-        )
+        .connect(&backoff, shutting_down(signals.stop.clone()))
         .await?;
-    let active_health = settings.redis_health_check_active_connection;
     pool_stats.follow(&pool, active_health.then(|| health.clone()));
     let _ = health.ok(health::REDIS);
     let clock = Arc::new(SystemClock);
-    let cache = RedisCache::with_local_cache(
+    let mut cache = RedisCache::with_local_cache(
         pool,
         clock.clone(),
         stats.clone(),
         settings.redis_cache(),
         local_cache,
     );
+    if let Some(pool) = per_second {
+        cache = cache.with_per_second(pool);
+    }
 
     // NewService: loads each config the provider sends (with
     // HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED, healthy only with domains); waits for the first
