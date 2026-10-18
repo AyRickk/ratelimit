@@ -270,17 +270,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         crate::debug!("Waiting for config update event");
     }
     let _provider = FileProvider::with_loader(loader, &settings, move |config| {
-        if let (true, Ok(config)) = (with_config, &config) {
-            let _ = match config.is_empty_domains() {
-                false => config_health.ok(health::CONFIG),
-                true => config_health.fail(health::CONFIG),
-            };
-        }
         let mut first = first.lock().unwrap();
         // The update loop takes every event but the initial one `NewService` waits for.
         let looped = !wait || first.is_none();
         if looped {
             crate::debug!("Setting config retrieved from config provider");
+        }
+        // `SetConfig`.
+        if let (true, Ok(config)) = (with_config, &config) {
+            let _ = match config.is_empty_domains() {
+                false => config_health.ok(health::CONFIG),
+                true => config_health.fail(health::CONFIG),
+            };
         }
         updated.update_config(config);
         if looped {

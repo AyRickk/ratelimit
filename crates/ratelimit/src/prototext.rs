@@ -73,6 +73,13 @@ impl Encoder {
         }
     }
 
+    /// A proto3 signed integer field: left out when 0.
+    fn signed(&mut self, name: &str, value: i64) {
+        if value != 0 {
+            self.scalar(name, &value.to_string());
+        }
+    }
+
     /// A proto3 enum field: left out when 0; its name, or its number when it has none.
     fn enumeration(&mut self, name: &str, value: i32, names: &[(&str, i32)]) {
         if value != 0 {
@@ -213,10 +220,7 @@ fn status(e: &mut Encoder, status: &DescriptorStatus) {
     }
     e.number("limit_remaining", status.limit_remaining.into());
     if let Some(d) = &status.duration_until_reset {
-        e.message("duration_until_reset", |e| {
-            e.scalar_if("seconds", d.seconds);
-            e.scalar_if("nanos", d.nanos.into());
-        });
+        e.message("duration_until_reset", |e| seconds(e, d.seconds, d.nanos));
     }
     if let Some(q) = &status.quota {
         e.message("quota", |e| quota(e, q));
@@ -234,12 +238,15 @@ fn quota(e: &mut Encoder, quota: &Quota) {
     e.number("requests", quota.requests.into());
     // A oneof member is printed when set, even at its default.
     if let Some(ExpirationSpecifier::ValidUntil(t)) = &quota.expiration_specifier {
-        e.message("valid_until", |e| {
-            e.scalar_if("seconds", t.seconds);
-            e.scalar_if("nanos", t.nanos.into());
-        });
+        e.message("valid_until", |e| seconds(e, t.seconds, t.nanos));
     }
     e.text("id", quota.id.as_bytes());
+}
+
+/// `google.protobuf.Duration` or `Timestamp`.
+fn seconds(e: &mut Encoder, seconds: i64, nanos: i32) {
+    e.signed("seconds", seconds);
+    e.signed("nanos", nanos.into());
 }
 
 fn header_value(e: &mut Encoder, header: &HeaderValue) {
@@ -278,14 +285,5 @@ fn value(e: &mut Encoder, value: &Value) {
                 e.message("values", |e| self::value(e, v));
             }
         }),
-    }
-}
-
-impl Encoder {
-    /// A proto3 signed integer field: left out when 0.
-    fn scalar_if(&mut self, name: &str, value: i64) {
-        if value != 0 {
-            self.scalar(name, &value.to_string());
-        }
     }
 }

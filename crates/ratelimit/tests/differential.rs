@@ -7074,7 +7074,8 @@ async fn a_password_protected_redis_is_logged_like_upstream() {
 }
 
 /// A Redis that answers only after the first dials fail: each failure, each retry, then the
-/// connection restored, as upstream logs them.
+/// connection restored, as upstream logs them. A binary slowed down enough to dial only once
+/// Redis is up has nothing to compare: the pair of runs is tried again.
 #[tokio::test]
 async fn a_late_redis_is_logged_like_upstream() {
     if !tools_available() {
@@ -7089,6 +7090,21 @@ async fn a_late_redis_is_logged_like_upstream() {
         ],
     );
     let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    for _ in 0..3 {
+        let runs = late_redis_runs(&runtime, &waits).await;
+        if runs
+            .iter()
+            .all(|r| r.iter().any(|l| l.contains("re-established")))
+        {
+            assert_eq!(runs[1], runs[0]);
+            return;
+        }
+    }
+    panic!("no run dialled before Redis was up");
+}
+
+/// The Redis lines of upstream's binary then ours, each with a Redis started 800 ms after it.
+async fn late_redis_runs(runtime: &std::path::Path, waits: &regex::Regex) -> Vec<Vec<String>> {
     let mut runs = Vec::new();
     for binary in [
         upstream_binary(),
@@ -7129,10 +7145,5 @@ async fn a_late_redis_is_logged_like_upstream() {
         lines.dedup();
         runs.push(lines);
     }
-    assert!(
-        runs[0].iter().any(|l| l.contains("re-established")),
-        "{:?}",
-        runs[0]
-    );
-    assert_eq!(runs[1], runs[0]);
+    runs
 }

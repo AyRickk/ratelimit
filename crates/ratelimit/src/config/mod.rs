@@ -440,12 +440,14 @@ impl RateLimitConfig {
                 if i == descriptor.entries.len() - 1 {
                     found = Some(limit.clone());
                     // Upstream walks a Go map, in a random order (docs/parity.md §7).
-                    let mut patterns: Vec<_> = share_patterns.iter().collect();
-                    patterns.sort();
-                    for (index, pattern) in patterns {
-                        crate::debug!(
-                            "share_threshold enabled for entry index {index}, using wildcard pattern {pattern}"
-                        );
+                    if crate::log::enabled(crate::log::Level::Debug) {
+                        let mut patterns: Vec<_> = share_patterns.iter().collect();
+                        patterns.sort();
+                        for (index, pattern) in patterns {
+                            crate::debug!(
+                                "share_threshold enabled for entry index {index}, using wildcard pattern {pattern}"
+                            );
+                        }
                     }
                 } else {
                     crate::debug!(
@@ -489,7 +491,9 @@ impl RateLimitConfig {
                 _ if limit.detailed_metric => detailed_key,
                 _ => value_to_metric_key,
             };
-            if limit.detailed_metric || full_key != limit.full_key {
+            if crate::log::enabled(crate::log::Level::Debug)
+                && (limit.detailed_metric || full_key != limit.full_key)
+            {
                 crate::debug!("Creating stats for key: '{full_key}'");
             }
             limit.full_key = full_key;

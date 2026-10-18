@@ -374,7 +374,8 @@ func printProtojsonMarshal() {
 }
 
 // detrandSeed is protobuf-go's seed for its random spacing (internal/detrand): 0 turns it
-// off, so that the text compared is deterministic.
+// off, so that the text compared is deterministic. It names an internal variable of the
+// protobuf-go version in go.mod: check it still exists when that version changes.
 //
 //go:linkname detrandSeed google.golang.org/protobuf/internal/detrand.randSeed
 var detrandSeed uint64
