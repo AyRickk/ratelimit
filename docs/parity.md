@@ -229,7 +229,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | logrus' text (and terminal) and JSON (`@timestamp`, `@message`) formats, in Go's local time zone; the info, warning, error and fatal lines of the features ported (runner, sinks, runtime directory, Redis startup and pool, config, listeners, `/json`, local cache) | ✅ | `tests/differential.rs` (`logs_are_written_like_upstream`, `redis_startup_is_logged_like_upstream`, `a_late_redis_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`), `log.rs` unit tests |
-| Debug lines (`LOG_LEVEL=debug`): config loading, each lookup, the cache and local cache, requests, statuses and responses as Go's `%+v` (prototext), errors, `/json`, the runtime and config update loops, health, Prometheus flushes | ✅ | `tests/differential.rs` (`debug_lines_are_written_like_upstream`, `prometheus_flushes_are_logged_like_upstream`, `messages_are_printed_like_upstream`) |
+| Debug lines (`LOG_LEVEL=debug`), best effort (D3): config loading, each lookup, the cache and local cache, requests, statuses and responses as Go's `%+v` (prototext), errors, `/json`, the runtime and config update loops, health, Prometheus flushes. Today they match upstream's; they may change for the extensions | ✅ | `tests/differential.rs` (`debug_lines_are_written_like_upstream`, `prometheus_flushes_are_logged_like_upstream`, `messages_are_printed_like_upstream`) |
 | OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
 ## 6. Image and deployment

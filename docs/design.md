@@ -21,7 +21,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D2. Full parity before v1.** Every feature of the reference is included: Memcached, xDS config, `quota_mode`, `share_threshold`, local cache, `REDIS_PERSECOND`, Redis sentinel / cluster / TLS / AWS IAM, DogStatsD, OTLP, `LIMIT_*` headers, dynamic metadata, `/json`, debug port, `grpc.health.v1`, `GRPC_UDS`, certificate hot reload, etc. The exhaustive list is `docs/parity.md`.
 
-**D3. Parity inventory** *(amended)*. `docs/parity.md`, whose environment variable section is **generated** from `src/settings/settings.go` (134 variables). It also covers YAML keys, the API, metric names, logs, traces and the image. v1 ships when every line is proven by a test or marked as a justified divergence.
+**D3. Parity inventory** *(amended)*. `docs/parity.md`, whose environment variable section is **generated** from `src/settings/settings.go` (134 variables). It also covers YAML keys, the API, metric names, logs, traces and the image. v1 ships when every line is proven by a test or marked as a justified divergence. Logs: the format (logrus' text and JSON) and every line at info, warning, error and fatal level are exact, since alerts and log pipelines match on them; debug lines are best effort: written at the same points as upstream's, but free to differ in text and order, and to describe the extensions. A debug line never justifies keeping code shaped like upstream's.
 
 **D4. gRPC API.** Only `envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit` (v2 was removed upstream). To reproduce precisely:
 
