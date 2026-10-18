@@ -6,9 +6,7 @@ use crate::limiter::{Clock, unit_seconds};
 use crate::stats::Stats;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use ratelimit_proto::envoy::config::core::v3::HeaderValue;
-use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
-    RateLimitDescriptor, rate_limit_descriptor::RateLimitOverride,
-};
+use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_response::{Code, DescriptorStatus, rate_limit::Unit},
@@ -157,7 +155,15 @@ impl<C: RateLimitCache> RateLimitService<C> {
         &self,
         request: &RateLimitRequest,
     ) -> Result<RateLimitResponse, ServiceError> {
+        crate::debug!("ShouldRateLimit: {}", crate::prototext::request(request));
         let response = self.decide(request).await;
+        match &response {
+            Ok(response) => crate::debug!(
+                "returning normal response: {}",
+                crate::prototext::response(response)
+            ),
+            Err(error) => crate::debug!("caught error during call: {error}"),
+        }
         match &response {
             Err(ServiceError::Service(_)) => self.stats.service_error().inc(),
             Err(ServiceError::Cache(_)) => self.stats.redis_error().inc(),
@@ -196,6 +202,10 @@ impl<C: RateLimitCache> RateLimitService<C> {
             })
             .collect();
         let mut statuses = self.cache.do_limit(request, &limits).await?;
+        crate::debug!(
+            "descriptor statuses: {}",
+            crate::prototext::statuses(&statuses)
+        );
         if statuses.len() != checks.len() {
             // Upstream asserts here and crashes; this is a backend bug, reported as such.
             return Err(CacheError(format!(
@@ -444,7 +454,7 @@ fn descriptor_metadata(descriptor: &RateLimitDescriptor) -> Value {
         .collect();
     fields.insert("entries".into(), list(entries));
     if let Some(limit) = &descriptor.limit {
-        fields.insert("limit".into(), string(&limit_text(limit)));
+        fields.insert("limit".into(), string(&crate::prototext::limit(limit)));
     }
     if let Some(hits) = descriptor.hits_addend {
         fields.insert("hitsAddend".into(), number(hits as f64));
@@ -456,28 +466,6 @@ fn struct_value(value: Struct) -> Value {
     Value {
         kind: Some(Kind::StructValue(value)),
     }
-}
-
-/// A client-sent limit in protobuf's text format, as Go's `String()` writes it but always with
-/// one space between fields (Go's is randomised): `requests_per_unit:10 unit:MINUTE`, zero
-/// fields left out.
-fn limit_text(limit: &RateLimitOverride) -> String {
-    let mut fields = Vec::new();
-    if limit.requests_per_unit != 0 {
-        fields.push(format!("requests_per_unit:{}", limit.requests_per_unit));
-    }
-    if limit.unit != 0 {
-        let unit = Unit::try_from(limit.unit)
-            .map_or_else(|_| limit.unit.to_string(), |u| u.as_str_name().to_string());
-        fields.push(format!("unit:{unit}"));
-    }
-    if let Some(multiplier) = limit.unit_multiplier {
-        fields.push(match multiplier {
-            0 => "unit_multiplier:{}".to_string(),
-            value => format!("unit_multiplier:{{value:{value}}}"),
-        });
-    }
-    fields.join(" ")
 }
 
 fn string(value: &str) -> Value {
@@ -526,8 +514,31 @@ fn descriptor_checks(
     let mut checks: Vec<Check> = request
         .descriptors
         .iter()
-        .map(
-            |descriptor| match config.get_limit(&request.domain, descriptor) {
+        .map(|descriptor| {
+            crate::debug!(
+                "got descriptor: {}",
+                descriptor
+                    .entries
+                    .iter()
+                    .map(|e| format!("({}={})", e.key, e.value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let lookup = config.get_limit(&request.domain, descriptor);
+            match &lookup {
+                LimitLookup::Limit(limit) if limit.unlimited => {
+                    crate::debug!("descriptor is unlimited, not passing to the cache")
+                }
+                LimitLookup::Limit(limit) => crate::debug!(
+                    "applying limit: {} requests per {}, shadow_mode: {}, quota: {}",
+                    limit.limit.requests_per_unit,
+                    crate::config::unit_name(limit.limit.unit),
+                    limit.shadow_mode,
+                    limit.quota_mode
+                ),
+                _ => crate::debug!("descriptor does not match any limit, no limits applied"),
+            }
+            match lookup {
                 LimitLookup::Limit(limit) => {
                     replaced.extend(limit.replaces.iter().cloned());
                     if limit.unlimited {
@@ -542,8 +553,8 @@ fn descriptor_checks(
                     Check::Limit(None)
                 }
                 LimitLookup::NoLimit => Check::Limit(None),
-            },
-        )
+            }
+        })
         .collect();
     for check in &mut checks {
         if let Check::Limit(limit) = check
@@ -551,6 +562,7 @@ fn descriptor_checks(
                 .as_ref()
                 .is_some_and(|l| !l.name.is_empty() && replaced.contains(&l.name))
         {
+            crate::debug!("replacing {}", limit.as_ref().unwrap().name);
             *limit = None;
         }
     }

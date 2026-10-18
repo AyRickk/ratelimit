@@ -100,6 +100,16 @@ pub fn error(message: &str) {
     log(Level::Error, message);
 }
 
+/// `logger.Debugf`: the line, formatted only when the level lets it through.
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Debug) {
+            $crate::log::log($crate::log::Level::Debug, &format!($($arg)*));
+        }
+    };
+}
+
 /// `Fatal`: the line if the level lets it through, then exit 1 whatever the level.
 pub fn fatal(message: &str) -> ! {
     log(Level::Fatal, message);

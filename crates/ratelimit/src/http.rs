@@ -76,6 +76,7 @@ async fn json<C: RateLimitCache>(
         Ok(response) => response,
         Err(error) => return bad_request(error.to_string()),
     };
+    crate::debug!("resp:{}", crate::prototext::response(&response));
     let body = match crate::protojson::encode_response(&response) {
         Ok(body) => body,
         Err(error) => {

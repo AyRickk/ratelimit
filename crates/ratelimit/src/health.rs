@@ -230,7 +230,17 @@ impl HealthChecker {
             return Err(format!("Invalid component: {component}"));
         };
         *healthy = true;
-        if components.values().all(|healthy| *healthy) {
+        let all_healthy = components.values().all(|healthy| *healthy);
+        crate::debug!(
+            "Health status of components: {}, all healthy: {all_healthy}",
+            {
+                // Go prints a map sorted by key, as the components are.
+                let entries: Vec<String> =
+                    components.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+                format!("map[{}]", entries.join(" "))
+            }
+        );
+        if all_healthy {
             self.ok.store(true, Ordering::SeqCst);
             self.grpc
                 .set_serving_status(SERVICE, ServingStatus::Serving);

@@ -64,6 +64,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	_ "unsafe" // go:linkname
 
 	"github.com/coocood/freecache"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
@@ -372,6 +373,41 @@ func printProtojsonMarshal() {
 	}
 }
 
+// detrandSeed is protobuf-go's seed for its random spacing (internal/detrand): 0 turns it
+// off, so that the text compared is deterministic. It names an internal variable of the
+// protobuf-go version in go.mod: check it still exists when that version changes.
+//
+//go:linkname detrandSeed google.golang.org/protobuf/internal/detrand.randSeed
+var detrandSeed uint64
+
+// printPrototext reads each stdin line, "request", "response" or "statuses" then a message's
+// binary encoding in hex (a RateLimitResponse for "statuses"), and prints what upstream's
+// debug lines print for it with %+v.
+func printPrototext() {
+	detrandSeed = 0
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(nil, 1<<24)
+	for scanner.Scan() {
+		kind, data, _ := strings.Cut(scanner.Text(), " ")
+		input, err := hex.DecodeString(data)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var message proto.Message = &pb.RateLimitResponse{}
+		if kind == "request" {
+			message = &pb.RateLimitRequest{}
+		}
+		if err := proto.Unmarshal(input, message); err != nil {
+			log.Fatal(err)
+		}
+		if kind == "statuses" {
+			fmt.Printf("%+v\n", message.(*pb.RateLimitResponse).Statuses)
+			continue
+		}
+		fmt.Printf("%+v\n", message)
+	}
+}
+
 // printSettings prints settings.NewSettings() as JSON, or its panic.
 func printSettings() {
 	encoder := json.NewEncoder(os.Stdout)
@@ -456,6 +492,7 @@ func main() {
 	printSnapshotOnly := flag.Bool("runtime-snapshot", false, "print the runtime loader's first snapshot as JSON and exit")
 	useFileProvider := flag.Bool("file-provider", false, "load the config with upstream's file provider")
 	decodeProtojson := flag.Bool("protojson", false, "decode each stdin line (hex) as /json does and exit")
+	prototext := flag.Bool("prototext", false, "print %+v of each stdin line's message (kind, then hex)")
 	encodeProtojson := flag.Bool("protojson-marshal", false, "encode each stdin line (hex) as /json does and exit")
 	sniff := flag.Bool("sniff", false, "print each stdin line's (hex) sniffed content type and JSON string, and exit")
 	flag.Parse()
@@ -469,6 +506,10 @@ func main() {
 	}
 	if *encodeProtojson {
 		printProtojsonMarshal()
+		return
+	}
+	if *prototext {
+		printPrototext()
 		return
 	}
 	if *printSettingsOnly {

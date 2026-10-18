@@ -429,6 +429,11 @@ fn to_value(node: &Node) -> Value {
 
 /// `ConfigFileContentToYaml` without the file name prefix: parse, validate keys, decode.
 pub(crate) fn parse_config(content: &str) -> Result<YamlRoot, String> {
+    // Upstream writes each error at debug level before it panics with it.
+    parsed_config(content).inspect_err(|e| crate::debug!("{e}"))
+}
+
+fn parsed_config(content: &str) -> Result<YamlRoot, String> {
     let loading = |e: String| format!("error loading config file: {e}");
     let root = super::yaml::parse(content).map_err(loading)?;
     match root.as_ref() {

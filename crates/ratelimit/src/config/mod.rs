@@ -132,8 +132,11 @@ pub fn load_bytes(
         .iter()
         .map(|(name, bytes)| {
             let loading = |e: String| ConfigError::new(name, e);
-            let content = yaml::decode(bytes)
-                .map_err(|e| loading(format!("error loading config file: {e}")))?;
+            let content = yaml::decode(bytes).map_err(|e| {
+                let e = format!("error loading config file: {e}");
+                crate::debug!("{e}");
+                loading(e)
+            })?;
             schema::parse_config(&content).map_err(loading)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -164,10 +167,22 @@ fn load_roots(
                 format!("duplicate domain '{}' in config file", root.domain),
             ));
         }
+        match config.domains.contains_key(&root.domain) {
+            true => crate::debug!("patching domain: {}", root.domain),
+            false => crate::debug!("loading domain: {}", root.domain),
+        }
         let domain = config.domains.entry(root.domain.clone()).or_default();
         domain.load_descriptors(name, &format!("{}.", root.domain), &root.descriptors)?;
     }
     Ok(config)
+}
+
+/// `RateLimitResponse_RateLimit_Unit.String()`: the name, or the number when it has none.
+pub fn unit_name(unit: i32) -> String {
+    crate::protojson::RESPONSE_UNITS
+        .iter()
+        .find(|(_, n)| *n == unit)
+        .map_or_else(|| unit.to_string(), |(name, _)| name.to_string())
 }
 
 /// A unit name as accepted by upstream: any case, `UNKNOWN` excluded.
@@ -197,6 +212,8 @@ fn load_limit(
             format!("invalid rate limit unit '{}'", rl.unit),
         ));
     }
+    // `NewRateLimit`'s `NewStats`.
+    crate::debug!("Creating stats for key: '{full_key}'");
     for replaced in &rl.replaces {
         if replaced.is_empty() {
             return Err(ConfigError::new(
@@ -263,6 +280,17 @@ impl Descriptor {
                 let parts = final_key.split('*').map(str::to_string).collect();
                 self.wildcards.push((final_key.clone(), parts));
             }
+            crate::debug!(
+                "loading descriptor: key={new_parent_key}{}",
+                limit.as_ref().map_or(String::new(), |l| format!(
+                    " ratelimit={{requests_per_unit={}, unit={}, unlimited={}, shadow_mode={}, quota_mode={}}}",
+                    l.limit.requests_per_unit,
+                    unit_name(l.limit.unit),
+                    l.unlimited,
+                    l.shadow_mode,
+                    l.quota_mode
+                ))
+            );
             let mut descriptor = Descriptor {
                 limit,
                 value_to_metric: config.value_to_metric,
@@ -292,13 +320,7 @@ impl RateLimitConfig {
     pub fn dump(&self) -> String {
         fn dump(descriptor: &Descriptor, out: &mut String) {
             if let Some(limit) = &descriptor.limit {
-                let unit = crate::protojson::RESPONSE_UNITS
-                    .iter()
-                    .find(|(_, n)| *n == limit.limit.unit)
-                    .map_or_else(
-                        || limit.limit.unit.to_string(),
-                        |(name, _)| name.to_string(),
-                    );
+                let unit = unit_name(limit.limit.unit);
                 out.push_str(&format!(
                     "{}: unit={unit} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
                     limit.full_key,
@@ -324,14 +346,18 @@ impl RateLimitConfig {
 
     /// `GetLimit`: the limit that applies to `descriptor` in `domain`.
     pub fn get_limit<'a>(&'a self, domain: &str, descriptor: &RateLimitDescriptor) -> LimitLookup {
+        crate::debug!("starting get limit lookup");
         let Some(mut current) = self.domains.get(domain) else {
+            crate::debug!("unknown domain '{domain}'");
             return LimitLookup::UnknownDomain;
         };
         if let Some(limit) = &descriptor.limit {
             // The override replaces the config entirely; shadow mode is deliberately off.
             // envoy.type.v3.RateLimitUnit shares its numbering with the response unit.
+            let key = self.descriptor_key(domain, descriptor);
+            crate::debug!("Creating stats for key: '{key}'");
             return LimitLookup::Limit(RateLimit::new(
-                self.descriptor_key(domain, descriptor),
+                key,
                 limit.requests_per_unit,
                 limit.unit,
                 String::new(),
@@ -349,6 +375,7 @@ impl RateLimitConfig {
                 self.sanitize(&entry.value)
             );
             let key_value = format!("{}_{}", entry.key, entry.value);
+            crate::debug!("looking up key: {key_value}");
             let mut matched_wildcard = None;
             let mut next = current.descriptors.get(&key_value);
             if next.is_none()
@@ -362,6 +389,7 @@ impl RateLimitConfig {
             }
             let matched_using_value = next.is_some();
             if next.is_none() {
+                crate::debug!("looking up key: {}", entry.key);
                 next = current.descriptors.get(&entry.key);
             }
 
@@ -375,7 +403,12 @@ impl RateLimitConfig {
                 matched_wildcard,
                 next.and_then(|n| n.share_threshold_pattern.as_deref()),
             ) {
-                share_patterns.insert(i, pattern_value(pattern).to_string());
+                let pattern = pattern_value(pattern);
+                crate::debug!(
+                    "tracking share_threshold for entry index {i} (key {}), wildcard pattern {pattern}",
+                    entry.key
+                );
+                share_patterns.insert(i, pattern.to_string());
             }
 
             value_to_metric_key += ".";
@@ -398,15 +431,39 @@ impl RateLimitConfig {
                 stopped_at_leaf = true;
                 break;
             };
-            if let Some(limit) = &next.limit
-                && i == descriptor.entries.len() - 1
-            {
-                found = Some(limit.clone());
+            if let Some(limit) = &next.limit {
+                let final_key = match matched_using_value {
+                    true => key_value.as_str(),
+                    false => entry.key.as_str(),
+                };
+                crate::debug!("found rate limit: {final_key}");
+                if i == descriptor.entries.len() - 1 {
+                    found = Some(limit.clone());
+                    // Upstream walks a Go map, in a random order (docs/parity.md §7).
+                    if crate::log::enabled(crate::log::Level::Debug) {
+                        let mut patterns: Vec<_> = share_patterns.iter().collect();
+                        patterns.sort();
+                        for (index, pattern) in patterns {
+                            crate::debug!(
+                                "share_threshold enabled for entry index {index}, using wildcard pattern {pattern}"
+                            );
+                        }
+                    }
+                } else {
+                    crate::debug!(
+                        "request depth does not match config depth, there are more entries in the request's descriptor"
+                    );
+                }
             }
             if next.descriptors.is_empty() {
                 stopped_at_leaf = true;
+                // A detailed limit is rebuilt with its stats.
+                if let Some(limit) = found.as_ref().filter(|l| l.detailed_metric) {
+                    crate::debug!("Creating stats for key: '{}'", limit.full_key);
+                }
                 break;
             }
+            crate::debug!("iterating to next level");
             current = next;
         }
         if let Some(limit) = &mut found {
@@ -427,13 +484,19 @@ impl RateLimitConfig {
             if rebuilt {
                 limit.metadata = None;
             }
-            limit.full_key = match &limit.share_threshold_key_pattern {
+            let full_key = match &limit.share_threshold_key_pattern {
                 Some(patterns) if limit.detailed_metric => {
                     self.share_threshold_key(domain, descriptor, patterns)
                 }
                 _ if limit.detailed_metric => detailed_key,
                 _ => value_to_metric_key,
             };
+            if crate::log::enabled(crate::log::Level::Debug)
+                && (limit.detailed_metric || full_key != limit.full_key)
+            {
+                crate::debug!("Creating stats for key: '{full_key}'");
+            }
+            limit.full_key = full_key;
         }
         found.map_or(LimitLookup::NoLimit, LimitLookup::Limit)
     }

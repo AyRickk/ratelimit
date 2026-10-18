@@ -191,13 +191,13 @@ fn count_outcome(
 /// the counter exceeds it (or the local cache says so); a rule in shadow mode then answers OK,
 /// keeping the remaining count of 0.
 pub(crate) fn descriptor_status(
-    limit: Option<(&RateLimit, &RateLimitStats)>,
+    limit: Option<(&RateLimit, &RateLimitStats, &str)>,
     near_limit_ratio: f32,
     hits: Hits,
     count: Count,
     now: i64,
 ) -> Result<DescriptorStatus, CacheError> {
-    let Some((limit, stats)) = limit else {
+    let Some((limit, stats, key)) = limit else {
         return Ok(DescriptorStatus {
             code: Code::Ok as i32,
             ..Default::default()
@@ -211,12 +211,16 @@ pub(crate) fn descriptor_status(
         Count::After(after) if hits.refund => {
             return status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now);
         }
-        Count::After(after) if !exceeds(limit, after) => {
-            return status(Code::Ok, limit, (threshold - after) as u32, now);
+        Count::After(after) => {
+            crate::debug!("cache key: {key} current: {after} limit: {threshold}");
+            if !exceeds(limit, after) {
+                return status(Code::Ok, limit, (threshold - after) as u32, now);
+            }
         }
-        Count::After(_) | Count::OverInLocalCache => {}
+        Count::OverInLocalCache => {}
     }
     let code = if limit.shadow_mode {
+        crate::debug!("Limit with key {}, is in shadow_mode", limit.full_key);
         Code::Ok
     } else {
         Code::OverLimit

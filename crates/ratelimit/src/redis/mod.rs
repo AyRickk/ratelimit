@@ -218,6 +218,7 @@ impl RateLimitCache for RedisCache {
         request: &RateLimitRequest,
         limits: &[Option<RateLimit>],
     ) -> Result<Vec<DescriptorStatus>, CacheError> {
+        crate::debug!("starting cache lookup");
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
 
@@ -240,6 +241,14 @@ impl RateLimitCache for RedisCache {
                     .local_cache
                     .as_ref()
                     .is_some_and(|cache| cache.contains(&key, now));
+            if over_in_local_cache {
+                match limit.shadow_mode {
+                    true => crate::debug!(
+                        "Cache key {key} would be rate limited but shadow mode is enabled on this rule"
+                    ),
+                    false => crate::debug!("cache key is over the limit: {key}"),
+                }
+            }
             checks.push(Check {
                 index,
                 limit,
@@ -272,6 +281,7 @@ impl RateLimitCache for RedisCache {
             if c.over_in_local_cache {
                 continue;
             }
+            crate::debug!("looking up cache key: {}", c.key);
             let expiration = limiter::window_seconds(c.limit)?.to_string();
             reply_of.push((c.index, commands.len()));
             if c.hits.refund {
@@ -318,9 +328,10 @@ impl RateLimitCache for RedisCache {
             }
         }
 
-        let mut checked: Vec<Option<(&RateLimit, &RateLimitStats)>> = vec![None; limits.len()];
+        let mut checked: Vec<Option<(&RateLimit, &RateLimitStats, &str)>> =
+            vec![None; limits.len()];
         for c in &checks {
-            checked[c.index] = Some((c.limit, &c.stats));
+            checked[c.index] = Some((c.limit, &c.stats, &c.key));
         }
         checked
             .into_iter()

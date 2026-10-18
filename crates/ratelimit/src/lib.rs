@@ -13,6 +13,7 @@ pub mod log;
 pub mod mux;
 pub mod net;
 pub mod protojson;
+pub mod prototext;
 pub mod redis;
 pub mod runner;
 pub mod runtime;

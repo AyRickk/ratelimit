@@ -265,8 +265,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let wait = !settings.force_start_without_initial_config;
     if wait {
         log::info("Waiting for initial ratelimit config update event");
+    } else {
+        // `NewService`'s update loop, which takes every event.
+        crate::debug!("Waiting for config update event");
     }
     let _provider = FileProvider::with_loader(loader, &settings, move |config| {
+        let mut first = first.lock().unwrap();
+        // The update loop takes every event but the initial one `NewService` waits for.
+        let looped = !wait || first.is_none();
+        if looped {
+            crate::debug!("Setting config retrieved from config provider");
+        }
+        // `SetConfig`.
         if let (true, Ok(config)) = (with_config, &config) {
             let _ = match config.is_empty_domains() {
                 false => config_health.ok(health::CONFIG),
@@ -274,13 +284,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             };
         }
         updated.update_config(config);
-        if let Some(first) = first.lock().unwrap().take() {
+        if looped {
+            crate::debug!("Waiting for config update event");
+        }
+        if let Some(first) = first.take() {
             let _ = first.send(());
         }
     });
     if wait {
         let _ = first_rx.await;
         log::info("Successfully loaded the initial ratelimit configs");
+        // The update loop starts.
+        crate::debug!("Waiting for config update event");
     }
 
     // Start: gRPC (with its keepalive settings and the health service), then HTTP. On a
