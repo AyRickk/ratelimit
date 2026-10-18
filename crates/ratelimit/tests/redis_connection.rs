@@ -175,6 +175,12 @@ fn the_per_second_pool_has_its_own_settings() {
         ),
         ("Single", "wait", 4)
     );
+    let file = RedisConnection::per_second_from_settings(&settings(&[
+        ("REDIS_AUTH_FILE", "/main"),
+        ("REDIS_PERSECOND_AUTH_FILE", "/fast"),
+    ]))
+    .unwrap();
+    assert_eq!(file.auth_file, "/fast");
     assert_eq!(
         RedisConnection::per_second_from_settings(&settings(&[(
             "REDIS_PERSECOND_POOL_SIZE",

@@ -4265,6 +4265,7 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
+        (vec![("REDIS_AUTH", "pw".into()), ("REDIS_AUTH_FILE", "/nowhere".into())], "REDIS_AUTH and REDIS_AUTH_FILE are mutually exclusive".into()),
         // Redis refuses the database: its error ends the message.
         (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
         (vec![("REDIS_URL", "::1:6379".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to ::1:6379 after ".into()),
@@ -7384,7 +7385,32 @@ async fn a_password_protected_redis_is_logged_like_upstream() {
         lines.dedup();
         lines
     };
-    for auth in ["pw", "default:pw", "wrong"] {
+    // REDIS_AUTH, or REDIS_AUTH_FILE (read at each connection, trimmed; missing or empty, the
+    // dial fails); `fails` when the service cannot start.
+    let files = runtime.join("auth");
+    std::fs::create_dir_all(&files).unwrap();
+    let file = |name: &str, contents: &str| {
+        let path = files.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let cases = vec![
+        ("REDIS_AUTH", "pw".to_string(), false),
+        ("REDIS_AUTH", "default:pw".to_string(), false),
+        ("REDIS_AUTH", "wrong".to_string(), true),
+        ("REDIS_AUTH_FILE", file("password", " pw\n"), false),
+        ("REDIS_AUTH_FILE", file("user", "default:pw"), false),
+        ("REDIS_AUTH_FILE", file("wrong", "wrong"), true),
+        ("REDIS_AUTH_FILE", file("empty", " \n"), true),
+        (
+            "REDIS_AUTH_FILE",
+            files.join("missing").to_string_lossy().into_owned(),
+            true,
+        ),
+    ];
+    let mask = |l: String| l.replace(&*files.to_string_lossy(), "FILES");
+    for (variable, auth, fails) in cases {
+        let auth = auth.as_str();
         let mut runs = Vec::new();
         for binary in [
             upstream_binary(),
@@ -7399,7 +7425,7 @@ async fn a_password_protected_redis_is_logged_like_upstream() {
                 ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
                 ("REDIS_SOCKET_TYPE", "tcp".into()),
                 ("REDIS_URL", redis.address.clone()),
-                ("REDIS_AUTH", auth.into()),
+                (variable, auth.into()),
                 ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
                 ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
                 ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
@@ -7412,14 +7438,127 @@ async fn a_password_protected_redis_is_logged_like_upstream() {
                 ("DEBUG_HOST", "127.0.0.1".into()),
                 ("DEBUG_PORT", reserved_port().to_string()),
             ];
-            let stderr = match auth {
-                "wrong" => startup_failure(&binary, &environment).await,
-                _ => logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await,
+            let stderr = match fails {
+                true => startup_failure(&binary, &environment).await,
+                false => {
+                    logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await
+                }
             };
-            runs.push(redis_lines(&stderr));
+            runs.push(
+                redis_lines(&stderr)
+                    .into_iter()
+                    .map(mask)
+                    .collect::<Vec<_>>(),
+            );
         }
         assert!(runs[0].len() > 2, "{auth}: {:?}", runs[0]);
         assert_eq!(runs[1], runs[0], "{auth}");
+    }
+}
+
+/// `REDIS_AUTH_FILE` is read at each connection: a password rotated in Redis and in the file
+/// is used by the connections made after it, as upstream's.
+#[tokio::test]
+async fn auth_files_are_reread_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("auth-rotation");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let config_set = |password: &'static str| {
+        move |redis: &Redis| {
+            let client = redis.client.clone();
+            async move {
+                let _: String = client
+                    .custom(
+                        CustomCommand::new_static("CONFIG", ClusterHash::Random, false),
+                        vec!["SET", "requirepass", password],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let redis = Redis::start().await;
+        config_set("one")(&redis).await;
+        let file = runtime.join(format!("auth-{}", reserved_port()));
+        std::fs::write(&file, "one").unwrap();
+        let grpc = reserved_port();
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", redis.address.clone()),
+            ("REDIS_POOL_SIZE", "2".into()),
+            ("REDIS_AUTH_FILE", file.to_string_lossy().into_owned()),
+            ("DISABLE_STATS", "true".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", reserved_port().to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        let _child = Command::new(&binary)
+            .env_clear()
+            .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the service");
+        let mut client = None;
+        for _ in 0..300 {
+            if let Ok(c) = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}")).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut client = client.expect("the service serves");
+        client
+            .should_rate_limit(request("llm", &[&[("user", "a")]]))
+            .await
+            .unwrap();
+        // The rotation: Redis's password, the file, then the service's connections gone.
+        config_set("two")(&redis).await;
+        std::fs::write(&file, "two\n").unwrap();
+        let _: i64 = redis
+            .client
+            .custom(
+                CustomCommand::new_static("CLIENT", ClusterHash::Random, false),
+                vec!["KILL", "SKIPME", "yes", "TYPE", "normal"],
+            )
+            .await
+            .unwrap();
+        // Requests may fail until the pool has connected again, with the new password.
+        let mut answered = false;
+        for _ in 0..100 {
+            if client
+                .should_rate_limit(request("llm", &[&[("user", "a")]]))
+                .await
+                .is_ok()
+            {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(answered, "{} after the rotation", binary.display());
     }
 }
 

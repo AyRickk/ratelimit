@@ -90,7 +90,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_URL` | `/var/run/nutcracker/ratelimit.sock` | ✅ | `tests/differential.rs`; `redis://` URLs (user, password, database): `tests/runner.rs` |
 | `REDIS_POOL_SIZE` | `10` | ✅ | `tests/runner.rs` (0 is radix's 4) |
 | `REDIS_AUTH` | — | ✅ | `user:password` or a password: `tests/runner.rs` |
-| `REDIS_AUTH_FILE` | — | ⬜ | |
+| `REDIS_AUTH_FILE` | — | ✅ | read at each connection (trimmed; missing or empty, the dial fails; with `REDIS_AUTH`, refused): `a_password_protected_redis_is_logged_like_upstream`, `auth_files_are_reread_like_upstream`, `the_binary_fails_to_start_like_upstream` |
 | `REDIS_AWS_IAM_AUTH` | `false` | ⬜ | |
 | `REDIS_AWS_IAM_CACHE_NAME` | — | ⬜ | |
 | `REDIS_AWS_IAM_USER_ID` | — | ⬜ | |
@@ -110,7 +110,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_URL` | `/var/run/nutcracker/ratelimitpersecond.sock` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_POOL_SIZE` | `10` | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AUTH` | — | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
-| `REDIS_PERSECOND_AUTH_FILE` | — | ⬜ | |
+| `REDIS_PERSECOND_AUTH_FILE` | — | ✅ | as `REDIS_AUTH_FILE`, for the per-second pool: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AWS_IAM_AUTH` | `false` | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_CACHE_NAME` | — | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_USER_ID` | — | ⬜ | |

@@ -34,6 +34,8 @@ pub struct RedisConnection {
     pub redis_type: String,
     /// The pool's variables' prefix (`REDIS`, `REDIS_PERSECOND`), for errors naming them.
     pub prefix: &'static str,
+    /// `REDIS_AUTH_FILE`: `user:password` or a password, read at each connection.
+    pub auth_file: String,
 }
 
 /// What `newClientImpl` takes for one pool, from its group of settings.
@@ -44,6 +46,7 @@ struct PoolSettings<'a> {
     url: &'a str,
     pool_size: i64,
     auth: &'a str,
+    auth_file: &'a str,
     timeout: i64,
     pool_on_empty_behavior: &'a str,
     redis_type: &'a str,
@@ -59,7 +62,6 @@ impl RedisConnection {
             // Upstream loads the TLS files for either pool, the per-second one enabled or not.
             (s.redis_persecond_tls, "REDIS_PERSECOND_TLS"),
             (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
-            (!s.redis_auth_file.is_empty(), "REDIS_AUTH_FILE"),
             (
                 s.redis_close_connection_on_readonly_error,
                 "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
@@ -71,6 +73,7 @@ impl RedisConnection {
             url: &s.redis_url,
             pool_size: s.redis_pool_size,
             auth: &s.redis_auth,
+            auth_file: &s.redis_auth_file,
             timeout: s.redis_timeout,
             pool_on_empty_behavior: &s.redis_pool_on_empty_behavior,
             redis_type: &s.redis_type,
@@ -86,10 +89,6 @@ impl RedisConnection {
                 s.redis_persecond_aws_iam_auth,
                 "REDIS_PERSECOND_AWS_IAM_AUTH",
             ),
-            (
-                !s.redis_persecond_auth_file.is_empty(),
-                "REDIS_PERSECOND_AUTH_FILE",
-            ),
         ])?;
         Self::new(PoolSettings {
             prefix: "REDIS_PERSECOND",
@@ -97,6 +96,7 @@ impl RedisConnection {
             url: &s.redis_persecond_url,
             pool_size: s.redis_persecond_pool_size,
             auth: &s.redis_persecond_auth,
+            auth_file: &s.redis_persecond_auth_file,
             timeout: s.redis_persecond_timeout,
             pool_on_empty_behavior: &s.redis_persecond_pool_on_empty_behavior,
             redis_type: &s.redis_persecond_type,
@@ -138,6 +138,7 @@ impl RedisConnection {
             pool_on_empty_behavior: p.pool_on_empty_behavior.to_string(),
             redis_type: p.redis_type.to_string(),
             prefix: p.prefix,
+            auth_file: p.auth_file.to_string(),
         })
     }
 
@@ -179,29 +180,49 @@ impl RedisConnection {
     }
 
     /// radix's AUTH arguments: with a user even when the password is empty.
-    fn auth_arguments(&self) -> Option<Vec<String>> {
-        match (self.username.is_empty(), self.password.is_empty()) {
-            (false, _) => Some(vec![self.username.clone(), self.password.clone()]),
-            (true, false) => Some(vec![self.password.clone()]),
+    fn auth_arguments((username, password): &(String, String)) -> Option<Vec<String>> {
+        match (username.is_empty(), password.is_empty()) {
+            (false, _) => Some(vec![username.clone(), password.clone()]),
+            (true, false) => Some(vec![password.clone()]),
             (true, true) => None,
         }
     }
 
+    /// The user and password to authenticate with: from `REDIS_AUTH` (or the URL), or from
+    /// the auth file, read now, what it leaves empty taken from the URL (radix's `Dial`).
+    fn credentials(&self) -> Result<(String, String), String> {
+        if self.auth_file.is_empty() {
+            return Ok((self.username.clone(), self.password.clone()));
+        }
+        let (mut username, mut password) = read_auth_file(&self.auth_file)?;
+        if username.is_empty() {
+            username = self.username.clone();
+        }
+        if password.is_empty() {
+            password = self.password.clone();
+        }
+        Ok((username, password))
+    }
+
     /// A client builder; the probe leaves the database to the dial (`probe`).
     fn builder(&self, server: ServerConfig, probe: bool) -> Builder {
-        let (username, password) = match self.auth_arguments() {
-            Some(mut arguments) => {
-                let password = arguments.pop();
-                (arguments.pop(), password)
-            }
-            None => (None, None),
+        // With an auth file, each connection reads it (the provider), as radix's dialer does.
+        let (username, password) = match self.auth_file.is_empty() {
+            true => fred_credentials(&(self.username.clone(), self.password.clone())),
+            false => (None, None),
         };
+        let credential_provider = (!self.auth_file.is_empty()).then(|| {
+            std::sync::Arc::new(FileCredentials {
+                connection: self.clone(),
+            }) as std::sync::Arc<dyn fred::types::config::CredentialProvider>
+        });
         let mut builder = Builder::from_config(Config {
             server,
             username,
             password,
             database: self.database.parse().ok().filter(|_| !probe),
             fail_fast: true,
+            credential_provider,
             ..Default::default()
         });
         let timeout = self.timeout;
@@ -234,10 +255,12 @@ impl RedisConnection {
     /// radix's `Dialer.Dial`: the connection, then AUTH and SELECT as it sends them, which
     /// Redis may refuse. Then the probe, which answers `PING`.
     async fn probe(&self) -> Result<(ServerConfig, Client), String> {
+        // The auth file is read before dialling (radix's `CustomConn`).
+        let credentials = self.credentials()?;
         let server = self.server().await?;
         let mut stream = self.dial(&server).await?;
         let mut commands = Vec::new();
-        commands.extend(self.auth_arguments().map(|a| ("AUTH", a)));
+        commands.extend(Self::auth_arguments(&credentials).map(|a| ("AUTH", a)));
         if !self.database.is_empty() {
             commands.push(("SELECT", vec![self.database.clone()]));
         }
@@ -338,6 +361,13 @@ impl RedisConnection {
         startup: &StartupBackoff,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<Pool, String> {
+        // `newCredentialProviderFromSettings`, before `newClientImpl` starts.
+        if !self.auth_file.is_empty() && !self.auth.is_empty() {
+            return Err(format!(
+                "{p}_AUTH and {p}_AUTH_FILE are mutually exclusive",
+                p = self.prefix
+            ));
+        }
         let masked = &self.masked_url;
         crate::log::warn(&format!(
             "connecting to redis on {masked} with pool size {}",
@@ -358,6 +388,11 @@ impl RedisConnection {
             crate::log::warn(&format!(
                 "REDIS_PIPELINE_LIMIT={} is deprecated and has no effect in radix v4. Write buffering is controlled solely by REDIS_PIPELINE_WINDOW.",
                 self.pipeline_limit
+            ));
+        }
+        if !self.auth_file.is_empty() {
+            crate::log::warn(&format!(
+                "Redis pool {masked}: resolving credentials on every connection attempt"
             ));
         }
         match self.pool_on_empty_behavior.to_uppercase().as_str() {
@@ -427,6 +462,58 @@ impl RedisConnection {
             }
         });
         Ok(pool)
+    }
+}
+
+/// fred's user and password for `credentials` (radix sends AUTH with a user even when the
+/// password is empty).
+fn fred_credentials((username, password): &(String, String)) -> (Option<String>, Option<String>) {
+    match (username.is_empty(), password.is_empty()) {
+        (false, _) => (Some(username.clone()), Some(password.clone())),
+        (true, false) => (None, Some(password.clone())),
+        (true, true) => (None, None),
+    }
+}
+
+/// `fileCredentialProvider.Credentials`: the file trimmed, `user:password` or a password;
+/// empty, it is an error.
+fn read_auth_file(path: &str) -> Result<(String, String), String> {
+    let contents = std::fs::read(path).map_err(|e| {
+        let op = if e.kind() == std::io::ErrorKind::IsADirectory {
+            "read"
+        } else {
+            "open"
+        };
+        format!("{op} {path}: {}", crate::go::errno_text(&e))
+    })?;
+    let contents = String::from_utf8_lossy(&contents);
+    let auth = contents.trim();
+    if auth.is_empty() {
+        return Err(format!("redis credential file {path} is empty"));
+    }
+    Ok(match auth.split_once(':') {
+        Some((user, password)) => (user.to_string(), password.to_string()),
+        None => (String::new(), auth.to_string()),
+    })
+}
+
+/// The pool's credentials, read from the auth file at each connection.
+#[derive(Debug)]
+struct FileCredentials {
+    connection: RedisConnection,
+}
+
+#[tonic::async_trait]
+impl fred::types::config::CredentialProvider for FileCredentials {
+    async fn fetch(
+        &self,
+        _server: Option<&Server>,
+    ) -> Result<(Option<String>, Option<String>), fred::error::Error> {
+        let credentials = self
+            .connection
+            .credentials()
+            .map_err(|e| fred::error::Error::new(fred::error::ErrorKind::Auth, e))?;
+        Ok(fred_credentials(&credentials))
     }
 }
 
