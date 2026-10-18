@@ -85,21 +85,12 @@ impl PoolStats {
     /// open at first); a failed reconnection, which names no server, changes nothing. With
     /// `health` (`REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`), Redis is healthy again on each new
     /// connection, and unhealthy once none is open.
-    fn follow(
-        &self,
-        pool: &fred::clients::Pool,
-        health: Option<Arc<HealthChecker>>,
-        failed_dial: bool,
-    ) {
+    fn follow(&self, pool: &fred::clients::Pool, health: Option<Arc<HealthChecker>>) {
         use fred::interfaces::EventInterface;
         use tokio::sync::broadcast::error::RecvError;
         let clients = pool.clients().len();
         self.total.add(clients as u64);
         self.active.add(clients as u64);
-        // The pool's first connection after a failed dial at startup.
-        if failed_dial {
-            log::info("redis connection re-established after previous error");
-        }
         let connected = Arc::new(Mutex::new(vec![true; clients]));
         // `hadConnError`: a failed connection since the last one made.
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -240,14 +231,14 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         }
     };
     let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
-    let (pool, failed_dial) = connection
+    let pool = connection
         .connect(
             &StartupBackoff::from_settings(&settings),
             shutting_down(signals.stop.clone()),
         )
         .await?;
     let active_health = settings.redis_health_check_active_connection;
-    pool_stats.follow(&pool, active_health.then(|| health.clone()), failed_dial);
+    pool_stats.follow(&pool, active_health.then(|| health.clone()));
     let _ = health.ok(health::REDIS);
     let clock = Arc::new(SystemClock);
     let cache = RedisCache::with_local_cache(
@@ -270,6 +261,11 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let (first_tx, first_rx) = tokio::sync::oneshot::channel();
     let first = std::sync::Mutex::new(Some(first_tx));
     let (updated, config_health) = (service.clone(), health.clone());
+    // Written before the provider's first event, as `NewService` waits for it.
+    let wait = !settings.force_start_without_initial_config;
+    if wait {
+        log::info("Waiting for initial ratelimit config update event");
+    }
     let _provider = FileProvider::with_loader(loader, &settings, move |config| {
         if let (true, Ok(config)) = (with_config, &config) {
             let _ = match config.is_empty_domains() {
@@ -282,8 +278,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             let _ = first.send(());
         }
     });
-    if !settings.force_start_without_initial_config {
-        log::info("Waiting for initial ratelimit config update event");
+    if wait {
         let _ = first_rx.await;
         log::info("Successfully loaded the initial ratelimit configs");
     }
@@ -316,7 +311,10 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     log::warn(&format!("Listening for debug on '{debug_address}'"));
     let debug = match crate::net::listen(&debug_address, true).await {
         Ok(listener) => {
-            let address = debug_address.clone();
+            // Go names the socket's own address: `[::]:6070` for the dual-stack wildcard.
+            let address = listener
+                .local_addr()
+                .map_or(debug_address.clone(), |a| a.to_string());
             let stopped = stopped(grpc_stopped.clone());
             let service = service.clone();
             Some(tokio::spawn(async move {

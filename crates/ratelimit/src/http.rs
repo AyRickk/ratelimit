@@ -76,8 +76,12 @@ async fn json<C: RateLimitCache>(
         Ok(response) => response,
         Err(error) => return bad_request(error.to_string()),
     };
-    let Ok(body) = crate::protojson::encode_response(&response) else {
-        return Answer::error(500, "Internal Server Error");
+    let body = match crate::protojson::encode_response(&response) {
+        Ok(body) => body,
+        Err(error) => {
+            crate::log::error(&format!("error marshaling proto3 to json: {error}"));
+            return Answer::error(500, "Internal Server Error");
+        }
     };
     let status = match response.overall_code() {
         Code::Unknown => 500,

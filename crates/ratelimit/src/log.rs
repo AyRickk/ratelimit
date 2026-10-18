@@ -100,10 +100,6 @@ pub fn error(message: &str) {
     log(Level::Error, message);
 }
 
-pub fn debug(message: &str) {
-    log(Level::Debug, message);
-}
-
 /// `Fatal`: the line if the level lets it through, then exit 1 whatever the level.
 pub fn fatal(message: &str) -> ! {
     log(Level::Fatal, message);
@@ -239,6 +235,30 @@ fn local_time_zone() -> jiff::tz::TimeZone {
     zone.unwrap_or(jiff::tz::TimeZone::UTC)
 }
 
+/// How a failure stops the process: upstream's `logger.Fatal` (a fatal line the level may
+/// hide), or what upstream panics on (a fatal line always written, docs/parity.md §7).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Failure {
+    Fatal(String),
+    Panic(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure::Panic(message)
+    }
+}
+
+impl Failure {
+    /// Writes the line and exits 1.
+    pub fn exit(self) -> ! {
+        match self {
+            Failure::Fatal(message) => fatal(&message),
+            Failure::Panic(message) => panic_exit(&message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,29 +286,5 @@ mod tests {
         let line = colored_line(Level::Warn, "hello\n");
         assert!(line.starts_with("\x1b[33mWARN\x1b[0m[000"), "{line:?}");
         assert!(line.ends_with(&format!("] {:<44} \n", "hello")), "{line:?}");
-    }
-}
-
-/// How a failure stops the process: upstream's `logger.Fatal` (a fatal line the level may
-/// hide), or what upstream panics on (a fatal line always written, docs/parity.md §7).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Failure {
-    Fatal(String),
-    Panic(String),
-}
-
-impl From<String> for Failure {
-    fn from(message: String) -> Self {
-        Failure::Panic(message)
-    }
-}
-
-impl Failure {
-    /// Writes the line and exits 1.
-    pub fn exit(self) -> ! {
-        match self {
-            Failure::Fatal(message) => fatal(&message),
-            Failure::Panic(message) => panic_exit(&message),
-        }
     }
 }

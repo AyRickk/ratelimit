@@ -6450,7 +6450,8 @@ async fn logs_are_written_like_upstream() {
                 ("GRPC_PORT", grpc.to_string()),
                 ("HOST", "127.0.0.1".into()),
                 ("PORT", http.to_string()),
-                ("DEBUG_HOST", "127.0.0.1".into()),
+                // The wildcard: Go names the dual-stack socket `[::]` once it closes.
+                ("DEBUG_HOST", "0.0.0.0".into()),
                 ("DEBUG_PORT", debug.to_string()),
             ]);
             if let Some(tz) = tz {
@@ -6479,8 +6480,9 @@ async fn logs_are_written_like_upstream() {
     }
 }
 
-/// Upstream's Redis startup lines: the pool, the authentication, each retry (its wait and
-/// elapsed time masked: they are random), then the fatal line once it gives up.
+/// Upstream's Redis startup lines: the pool, the authentication, each failed connection
+/// (unreachable, or refused by Redis: AUTH, the database), each retry (its wait and elapsed
+/// time masked: they are random), then the fatal line once it gives up.
 #[tokio::test]
 async fn redis_startup_is_logged_like_upstream() {
     if !tools_available() {
@@ -6495,9 +6497,16 @@ async fn redis_startup_is_logged_like_upstream() {
         ],
     );
     let unreachable = format!("127.0.0.1:{}", reserved_port());
+    let redis = Redis::start().await;
+    let refused_database = format!("redis://{}/abc", redis.address);
     let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
     let after = regex::Regex::new(r"after [^:]+:").unwrap();
-    for (auth, behavior) in [("user:secret", "wait"), ("secret", "other")] {
+    for (url, auth, behavior) in [
+        (&unreachable, "user:secret", "wait"),
+        (&unreachable, "secret", "other"),
+        (&redis.address, "secret", "wait"),
+        (&refused_database, "", "wait"),
+    ] {
         let environment = vec![
             (
                 "RUNTIME_ROOT",
@@ -6505,9 +6514,10 @@ async fn redis_startup_is_logged_like_upstream() {
             ),
             ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
             ("REDIS_SOCKET_TYPE", "tcp".into()),
-            ("REDIS_URL", unreachable.clone()),
+            ("REDIS_URL", url.clone()),
             ("REDIS_AUTH", auth.into()),
             ("REDIS_POOL_SIZE", "3".into()),
+            ("REDIS_PIPELINE_LIMIT", "8".into()),
             ("REDIS_POOL_ON_EMPTY_BEHAVIOR", behavior.into()),
             ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
             ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
@@ -6538,7 +6548,91 @@ async fn redis_startup_is_logged_like_upstream() {
             upstream.iter().any(|l| l.contains("Retrying")),
             "{upstream:?}"
         );
-        assert_eq!(ours, upstream, "{auth} {behavior}");
+        assert_eq!(ours, upstream, "{url} {auth} {behavior}");
+    }
+}
+
+/// A Redis with a password: the right one serves (the startup probe authenticates too), a
+/// wrong one is refused at each attempt, as upstream logs it.
+#[tokio::test]
+async fn a_password_protected_redis_is_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("redis-password");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    // Set once the harness's connections are open: they stay authenticated.
+    let mut stream = tokio::net::TcpStream::connect(&redis.address)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$11\r\nrequirepass\r\n$2\r\npw\r\n",
+    )
+    .await
+    .unwrap();
+    let mut reply = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut reply)
+        .await
+        .unwrap();
+    assert_eq!(reply, "+OK\r\n");
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let after = regex::Regex::new(r"after [^:]+:").unwrap();
+    let redis_lines = |stderr: &str| {
+        let mut lines: Vec<String> = logrus_lines(stderr, &[])
+            .into_iter()
+            .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+            .filter(|l| l.contains("redis") || l.contains("Redis"))
+            .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+            .map(|l| after.replace(&l, "after ELAPSED:").into_owned())
+            .collect();
+        lines.dedup();
+        lines
+    };
+    for auth in ["pw", "default:pw", "wrong"] {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let grpc = reserved_port();
+            let environment = vec![
+                (
+                    "RUNTIME_ROOT",
+                    runtime.join("current").to_string_lossy().into_owned(),
+                ),
+                ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+                ("REDIS_SOCKET_TYPE", "tcp".into()),
+                ("REDIS_URL", redis.address.clone()),
+                ("REDIS_AUTH", auth.into()),
+                ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
+                ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
+                ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+                ("DISABLE_STATS", "true".into()),
+                ("LOG_LEVEL", "info".into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", reserved_port().to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ];
+            let stderr = match auth {
+                "wrong" => startup_failure(&binary, &environment).await,
+                _ => logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await,
+            };
+            runs.push(redis_lines(&stderr));
+        }
+        assert!(runs[0].len() > 2, "{auth}: {:?}", runs[0]);
+        assert_eq!(runs[1], runs[0], "{auth}");
     }
 }
 
