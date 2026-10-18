@@ -28,8 +28,61 @@ impl Clock for SystemClock {
 }
 
 /// The length of a fixed window, in seconds (a month is 30 days, a year 365).
-pub(crate) fn window_seconds(limit: &RateLimit) -> Result<i64, CacheError> {
-    unit_seconds(limit.limit.unit())
+/// The start of the window containing `now`: a multiple of the unit since the epoch, or with
+/// `USE_CALENDAR_MONTH_RATE_LIMIT` for a month, the first of the UTC calendar month.
+pub(crate) fn window_start(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
+    if calendar && unit == Unit::Month {
+        return Ok(month_start(now));
+    }
+    let window = unit_seconds(unit)?;
+    Ok(now / window * window)
+}
+
+/// `ExpirationSeconds`: a key's TTL, the unit's length, or with
+/// `USE_CALENDAR_MONTH_RATE_LIMIT` for a month, the seconds until the next month.
+pub(crate) fn expiration_seconds(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
+    if calendar && unit == Unit::Month {
+        return Ok(next_month_start(now) - now);
+    }
+    unit_seconds(unit)
+}
+
+/// `CalculateReset`: the seconds until the window containing `now` ends.
+pub(crate) fn reset_seconds(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
+    if calendar && unit == Unit::Month {
+        return Ok(next_month_start(now) - now);
+    }
+    let window = unit_seconds(unit)?;
+    Ok(window - now % window)
+}
+
+/// The UTC calendar month of `now`: its year and month.
+fn utc_month(now: i64) -> (i16, i8) {
+    let date = jiff::Timestamp::from_second(now)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date();
+    (date.year(), date.month())
+}
+
+/// `MonthStartUnix`: the first of `now`'s UTC month, at midnight.
+fn month_start(now: i64) -> i64 {
+    let (year, month) = utc_month(now);
+    midnight(year, month)
+}
+
+/// The first of the month after `now`'s, at midnight UTC.
+fn next_month_start(now: i64) -> i64 {
+    match utc_month(now) {
+        (year, 12) => midnight(year + 1, 1),
+        (year, month) => midnight(year, month + 1),
+    }
+}
+
+fn midnight(year: i16, month: i8) -> i64 {
+    jiff::civil::date(year, month, 1)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_or(0, |z| z.timestamp().as_second())
 }
 
 /// The length of one `unit`, in seconds (a month is 30 days, a year 365).
@@ -56,6 +109,7 @@ pub fn cache_key(
     descriptor: &RateLimitDescriptor,
     limit: &RateLimit,
     now: i64,
+    calendar: bool,
 ) -> Result<String, CacheError> {
     let mut key = format!("{prefix}{domain}_");
     for (i, entry) in descriptor.entries.iter().enumerate() {
@@ -69,8 +123,7 @@ pub fn cache_key(
         key += shared.unwrap_or(&entry.value);
         key += "_";
     }
-    let window = window_seconds(limit)?;
-    key += &(now / window * window).to_string();
+    key += &window_start(limit.limit.unit(), now, calendar)?.to_string();
     Ok(key)
 }
 
@@ -101,14 +154,14 @@ fn status(
     limit: &RateLimit,
     limit_remaining: u32,
     now: i64,
+    calendar: bool,
 ) -> Result<DescriptorStatus, CacheError> {
-    let window = window_seconds(limit)?;
     Ok(DescriptorStatus {
         code: code as i32,
         current_limit: Some(limit.limit.clone()),
         limit_remaining,
         duration_until_reset: Some(prost_types::Duration {
-            seconds: window - now % window,
+            seconds: reset_seconds(limit.limit.unit(), now, calendar)?,
             nanos: 0,
         }),
         quota: None,
@@ -196,6 +249,7 @@ pub(crate) fn descriptor_status(
     hits: Hits,
     count: Count,
     now: i64,
+    calendar: bool,
 ) -> Result<DescriptorStatus, CacheError> {
     let Some((limit, stats, key)) = limit else {
         return Ok(DescriptorStatus {
@@ -209,12 +263,18 @@ pub(crate) fn descriptor_status(
     let threshold = u64::from(limit.limit.requests_per_unit);
     match count {
         Count::After(after) if hits.refund => {
-            return status(Code::Ok, limit, threshold.saturating_sub(after) as u32, now);
+            return status(
+                Code::Ok,
+                limit,
+                threshold.saturating_sub(after) as u32,
+                now,
+                calendar,
+            );
         }
         Count::After(after) => {
             crate::debug!("cache key: {key} current: {after} limit: {threshold}");
             if !exceeds(limit, after) {
-                return status(Code::Ok, limit, (threshold - after) as u32, now);
+                return status(Code::Ok, limit, (threshold - after) as u32, now, calendar);
             }
         }
         Count::OverInLocalCache => {}
@@ -225,7 +285,7 @@ pub(crate) fn descriptor_status(
     } else {
         Code::OverLimit
     };
-    status(code, limit, 0, now)
+    status(code, limit, 0, now, calendar)
 }
 
 /// What a request's keys look like before counting, for

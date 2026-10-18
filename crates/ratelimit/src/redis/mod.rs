@@ -40,6 +40,11 @@ pub struct RedisCacheSettings {
     /// `NEAR_LIMIT_RATIO`: the share of a limit past which hits count as `near_limit`
     /// (upstream's default: 0.8).
     pub near_limit_ratio: f32,
+    /// `EXPIRATION_JITTER_MAX_SECONDS`: each key's TTL gets a random extra in `[0, max)`,
+    /// so that keys do not all expire at once; none at 0 or less.
+    pub expiration_jitter_max_seconds: i64,
+    /// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month is the UTC calendar month, not 30 days.
+    pub use_calendar_month: bool,
 }
 
 impl Default for RedisCacheSettings {
@@ -49,6 +54,8 @@ impl Default for RedisCacheSettings {
             local_cache_size_in_bytes: 0,
             stop_cache_key_increment_when_overlimit: false,
             near_limit_ratio: 0.8,
+            expiration_jitter_max_seconds: 0,
+            use_calendar_month: false,
         }
     }
 }
@@ -231,6 +238,7 @@ impl RateLimitCache for RedisCache {
                 &request.descriptors[index],
                 limit,
                 now,
+                self.settings.use_calendar_month,
             )?;
             let hits = hits[index];
             let stats = self.stats.rate_limit(&limit.full_key);
@@ -282,7 +290,13 @@ impl RateLimitCache for RedisCache {
                 continue;
             }
             crate::debug!("looking up cache key: {}", c.key);
-            let expiration = limiter::window_seconds(c.limit)?.to_string();
+            let calendar = self.settings.use_calendar_month;
+            let mut expiration = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
+            let jitter = self.settings.expiration_jitter_max_seconds;
+            if jitter > 0 {
+                expiration += crate::random::below(jitter as u64) as i64;
+            }
+            let expiration = expiration.to_string();
             reply_of.push((c.index, commands.len()));
             if c.hits.refund {
                 let amount = (c.hits.value as i64).to_string();
@@ -341,7 +355,9 @@ impl RateLimitCache for RedisCache {
                 && limiter::exceeds(c.limit, after)
             {
                 // Cached for a whole window, shadow rules included, as upstream.
-                if !cache.insert(&c.key, limiter::window_seconds(c.limit)?, now) {
+                let calendar = self.settings.use_calendar_month;
+                let ttl = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
+                if !cache.insert(&c.key, ttl, now) {
                     crate::log::error(&format!("Failing to set local cache key: {}", c.key));
                 }
             }
@@ -358,7 +374,8 @@ impl RateLimitCache for RedisCache {
             .zip(counts)
             .map(|((limit, hits), count)| {
                 let ratio = self.settings.near_limit_ratio;
-                limiter::descriptor_status(limit, ratio, *hits, count, now)
+                let calendar = self.settings.use_calendar_month;
+                limiter::descriptor_status(limit, ratio, *hits, count, now, calendar)
             })
             .collect()
     }

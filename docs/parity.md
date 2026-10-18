@@ -68,13 +68,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `RUNTIME_APPDIRECTORY` | `config` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `RUNTIME_IGNOREDOTFILES` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `RUNTIME_WATCH_ROOT` | `true` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
-| `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ⬜ | |
+| `EXPIRATION_JITTER_MAX_SECONDS` | `300` | ✅ | `expirations_are_jittered_like_upstream` (the extras' range; 0 is none) |
 | `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `NEAR_LIMIT_RATIO` | `0.8` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `CACHE_KEY_PREFIX` | — | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `BACKEND_TYPE` | `redis` | 🚧 | `redis`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `memcache` not supported yet |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
-| `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ⬜ | |
+| `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ✅ | `calendar_months_are_counted_like_upstream`: keys, TTLs, resets and the reset header across short, leap and year-end months |
 | `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `LIMIT_LIMIT_HEADER` | `RateLimit-Limit` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `LIMIT_REMAINING_HEADER` | `RateLimit-Remaining` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
@@ -201,8 +201,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 
 | Item | Status | Test |
 |---|---|---|
-| Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | 🚧 | `tests/differential.rs` (calendar month missing) |
-| Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | 🚧 | `tests/differential.rs` (jitter missing) |
+| Key `prefix + domain_key_value_…_bucketStart`, epoch-aligned; UTC calendar month | ✅ | `tests/differential.rs` (calendar month: `calendar_months_are_counted_like_upstream`) |
+| Redis: `INCRBY` + `EXPIRE (unit + jitter)` pipeline | ✅ | `tests/differential.rs` (jitter: `expirations_are_jittered_like_upstream`) |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
 | Local cache of over-limit keys (set before the shadow check, TTL = unit), freecache's size limits and eviction | ✅ | `tests/differential.rs`, `tests/freecache.rs` |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ✅ | `tests/differential.rs` |
@@ -322,6 +322,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Export errors are written by Go's standard logger with OTel's texts | the same logger format, this exporter's texts | best effort (D3) |
 | An invalid `OTEL_EXPORTER_OTLP_HEADERS` entry or endpoint is written whole in the error | the entry's position or the header's name, the variable's name | header values and URLs can hold credentials |
 | A `TRACING_SAMPLING_RATE` of `NaN` samples depending on the platform (Go's `uint64(NaN)`) | never | deterministic |
+| The expiration jitter of each key is drawn from `math/rand` seeded with the start's second | another random source | the extras are random either way; their range is the same |
 | `OTEL_BSP_MAX_QUEUE_SIZE=0` lets a span through when the processor happens to wait for one; a negative size panics at startup | every span dropped | D1; nobody sets either |
 | The exporter's `User-Agent` is `OTel OTLP Exporter Go/1.45.0` (and grpc-go's) | `ratelimit/<version>` (and tonic's) | it names the software that sends |
 | The HTTP exporter honours `HTTPS_PROXY`/`HTTP_PROXY` and negotiates HTTP/2 over TLS | no proxy; HTTP/1.1 | best effort (D3) |
