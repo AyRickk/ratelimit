@@ -12,7 +12,7 @@ pub mod propagation;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use export::Protocol;
+use export::Protocol;
 
 /// A span's identity, as it is propagated: the parent of the spans started under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,18 +80,81 @@ pub struct Settings {
     pub sampling_rate: f64,
 }
 
-/// What was started: the sampler, the resource and the batch queue.
+/// What was started: the sampler, the span limits and the batch queue.
 struct Tracer {
     /// `TraceIDRatioBased`: a root span is sampled when the low 63 bits of its trace ID are
     /// below this bound (`u64::MAX` always, 0 never).
     bound: u64,
+    limits: Limits,
     queue: export::Queue,
+}
+
+/// `NewSpanLimits`: how many attributes a span keeps (128), and how many characters of a
+/// string value (all); negative is no limit. `OTEL_SPAN_ATTRIBUTE_*_LIMIT`, else
+/// `OTEL_ATTRIBUTE_*_LIMIT`; the first one set is the value, its default if not a number.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    count: i64,
+    value_length: i64,
+}
+
+impl Limits {
+    fn from_env() -> Self {
+        let first = |names: [&str; 2], default: i64| {
+            names
+                .iter()
+                .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+                .map_or(default, |v| crate::go::atoi(&v).unwrap_or(default))
+        };
+        Limits {
+            count: first(
+                [
+                    "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
+                    "OTEL_ATTRIBUTE_COUNT_LIMIT",
+                ],
+                128,
+            ),
+            value_length: first(
+                [
+                    "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT",
+                    "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT",
+                ],
+                -1,
+            ),
+        }
+    }
+
+    /// `SetAttributes` of one attribute: an existing key is replaced; a new one beyond the
+    /// count is dropped; a string is truncated to the length, in characters.
+    fn set(&self, span: &mut export::SpanData, key: String, value: Value) {
+        let value = match value {
+            Value::Str(s) if self.value_length >= 0 => {
+                Value::Str(s.chars().take(self.value_length as usize).collect())
+            }
+            value => value,
+        };
+        let known = span.attributes.iter().any(|(k, _)| *k == key);
+        if !known && self.count >= 0 && span.attributes.len() as i64 >= self.count {
+            span.dropped_attributes += 1;
+            return;
+        }
+        upsert(&mut span.attributes, key, value);
+    }
+}
+
+/// Sets `key` in `entries`, replacing its value where it is.
+fn upsert<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
+    match entries.iter_mut().find(|(k, _)| *k == key) {
+        Some(existing) => existing.1 = value,
+        None => entries.push((key, value)),
+    }
 }
 
 static TRACER: OnceLock<Tracer> = OnceLock::new();
 
-/// `InitProductionTraceProvider`: an unknown protocol is fatal; with no instance ID, a
-/// random UUID. Starts the exporter and logs the parameters.
+/// `InitProductionTraceProvider`: an unknown protocol is fatal, as is an HTTP exporter
+/// told to use TLS on an insecure endpoint; with no instance ID, a random UUID. Starts the
+/// exporter and logs the parameters.
 pub fn init(settings: &Settings) -> Result<(), crate::log::Failure> {
     let protocol = match settings.protocol.as_str() {
         "http" | "" => Protocol::Http,
@@ -102,6 +165,13 @@ pub fn init(settings: &Settings) -> Result<(), crate::log::Failure> {
             )));
         }
     };
+    let config = export::Config::from_env(protocol);
+    if protocol == Protocol::Http && config.insecure && config.has_tls_settings() {
+        return Err(crate::log::Failure::Fatal(
+            "creating OTLP trace exporter: insecure HTTP endpoint cannot use TLS client configuration"
+                .into(),
+        ));
+    }
     let instance_id = match settings.service_instance_id.as_str() {
         "" => random_uuid(),
         id => id.to_string(),
@@ -113,8 +183,12 @@ pub fn init(settings: &Settings) -> Result<(), crate::log::Failure> {
     );
     let rate = settings.sampling_rate;
     let bound = ratio_bound(rate);
-    let queue = export::start(protocol, resource);
-    let _ = TRACER.set(Tracer { bound, queue });
+    let queue = export::start(protocol, config, resource);
+    let _ = TRACER.set(Tracer {
+        bound,
+        limits: Limits::from_env(),
+        queue,
+    });
     crate::log::info(&format!(
         "TracerProvider initialized with following parameters: protocol: {}, serviceName: {}, serviceNamespace: {}, serviceInstanceId: {instance_id}, samplingRate: {}",
         settings.protocol,
@@ -159,13 +233,10 @@ impl Span {
         self.recording.is_some()
     }
 
-    /// Sets an attribute, replacing one with the same key.
+    /// Sets an attribute, replacing one with the same key, within the span limits.
     pub fn set_attribute(&mut self, key: &str, value: Value) {
-        if let Some(span) = &mut self.recording {
-            match span.attributes.iter_mut().find(|(k, _)| k == key) {
-                Some(existing) => existing.1 = value,
-                None => span.attributes.push((key.to_string(), value)),
-            }
+        if let (Some(span), Some(tracer)) = (&mut self.recording, TRACER.get()) {
+            tracer.limits.set(span, key.to_string(), value);
         }
     }
 
@@ -223,19 +294,26 @@ pub fn start(
         trace_state: parent.map(|p| p.trace_state.clone()).unwrap_or_default(),
         remote: false,
     };
-    let recording = sampled.then(|| export::SpanData {
-        scope,
-        context: context.clone(),
-        parent_span_id: parent.map(|p| p.span_id),
-        // otelgrpc marks what it extracted as remote, even nothing: a server span's parent
-        // is always remote.
-        parent_remote: kind == Kind::Server || parent.is_some_and(|p| p.remote),
-        name: name.to_string(),
-        kind,
-        start: now(),
-        end: 0,
-        attributes: attributes(),
-        status: None,
+    let recording = sampled.then(|| {
+        let mut span = export::SpanData {
+            scope,
+            context: context.clone(),
+            parent_span_id: parent.map(|p| p.span_id),
+            // otelgrpc marks what it extracted as remote, even nothing: a server span's
+            // parent is always remote.
+            parent_remote: kind == Kind::Server || parent.is_some_and(|p| p.remote),
+            name: name.to_string(),
+            kind,
+            start: now(),
+            end: 0,
+            attributes: Vec::new(),
+            dropped_attributes: 0,
+            status: None,
+        };
+        for (key, value) in attributes() {
+            tracer.limits.set(&mut span, key, value);
+        }
+        span
     });
     Span {
         context: Some(context),
@@ -279,13 +357,20 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-/// Random bytes from a per-thread generator (splitmix64), seeded from the system.
+/// Random bytes from a per-thread generator (splitmix64), seeded from the system (or, if
+/// it fails, from the time and the thread).
 fn random_bytes(out: &mut [u8]) {
     thread_local! {
         static STATE: std::cell::Cell<u64> = std::cell::Cell::new({
             let mut seed = [0u8; 8];
-            let _ = getrandom::fill(&mut seed);
-            u64::from_ne_bytes(seed)
+            match getrandom::fill(&mut seed) {
+                Ok(()) => u64::from_ne_bytes(seed),
+                Err(_) => {
+                    use std::hash::BuildHasher;
+                    std::collections::hash_map::RandomState::new()
+                        .hash_one((now(), std::thread::current().id()))
+                }
+            }
         });
     }
     for chunk in out.chunks_mut(8) {
@@ -301,30 +386,31 @@ fn random_bytes(out: &mut [u8]) {
     }
 }
 
-fn random_trace_id() -> [u8; 16] {
+/// A random ID, never all zeros (an invalid one).
+fn random_id<const N: usize>() -> [u8; N] {
     loop {
-        let mut id = [0u8; 16];
+        let mut id = [0u8; N];
         random_bytes(&mut id);
-        if id != [0; 16] {
+        if id != [0; N] {
             return id;
         }
     }
 }
 
+fn random_trace_id() -> [u8; 16] {
+    random_id()
+}
+
 fn random_span_id() -> [u8; 8] {
-    loop {
-        let mut id = [0u8; 8];
-        random_bytes(&mut id);
-        if id != [0; 8] {
-            return id;
-        }
-    }
+    random_id()
 }
 
 /// `uuid.NewRandom().String()`: a version 4 UUID.
 fn random_uuid() -> String {
     let mut bytes = [0u8; 16];
-    let _ = getrandom::fill(&mut bytes);
+    if getrandom::fill(&mut bytes).is_err() {
+        random_bytes(&mut bytes);
+    }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();

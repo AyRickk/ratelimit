@@ -32,6 +32,8 @@ pub(super) struct SpanData {
     pub start: u64,
     pub end: u64,
     pub attributes: Vec<(String, Value)>,
+    /// Attributes beyond the span limit.
+    pub dropped_attributes: u32,
     /// `Error` with this message; unset otherwise.
     pub status: Option<String>,
 }
@@ -54,9 +56,17 @@ pub(super) fn resource(name: &str, namespace: &str, instance_id: &str) -> Resour
                 invalid.push(pair);
                 continue;
             };
-            let value =
-                crate::go::unescape(value.trim(), false).unwrap_or_else(|| value.to_string());
-            attributes.insert(key.trim().to_string(), value);
+            let value = crate::go::unescape(value.trim(), false).unwrap_or_else(|| {
+                otel_error(&format!(
+                    "invalid URL escape in the value of {}",
+                    key.trim()
+                ));
+                value.to_string()
+            });
+            // An empty key is not a valid attribute.
+            if !key.trim().is_empty() {
+                attributes.insert(key.trim().to_string(), value);
+            }
         }
     }
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_default();
@@ -105,14 +115,17 @@ fn otel_error(message: &str) {
 
 /// The batch span processor's queue.
 pub(super) struct Queue {
-    spans: mpsc::Sender<SpanData>,
+    /// None when the queue has no room at all.
+    spans: Option<mpsc::Sender<SpanData>>,
     shutdown: mpsc::Sender<oneshot::Sender<Result<(), String>>>,
 }
 
 impl Queue {
     /// Queues a span, dropped when the queue is full.
     pub fn push(&self, span: SpanData) {
-        let _ = self.spans.try_send(span);
+        if let Some(spans) = &self.spans {
+            let _ = spans.try_send(span);
+        }
     }
 
     /// Exports what is queued and stops.
@@ -125,25 +138,62 @@ impl Queue {
     }
 }
 
-/// `OTEL_BSP_*`: a positive integer, else the default.
-fn bsp(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .map_or(default, |v| v as u64)
+/// The batch span processor's settings: `OTEL_BSP_*`, read with `strconv.Atoi` (a value
+/// that is not a number is the default; 0 and negative values are kept).
+struct BatchSettings {
+    /// Spans past it are dropped; none fit at 0 or less.
+    queue_size: i64,
+    /// Larger than the queue, it is the smaller of 512 and the queue.
+    batch_size: i64,
+    /// At 0 or less, each span leaves at once.
+    delay: Duration,
+    /// At 0 or less, none.
+    timeout: Option<Duration>,
+}
+
+impl BatchSettings {
+    fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let int = |name: &str, default: i64| match lookup(name) {
+            Some(v) if !v.is_empty() => crate::go::atoi(&v).unwrap_or(default),
+            _ => default,
+        };
+        let queue_size = int("OTEL_BSP_MAX_QUEUE_SIZE", 2048);
+        let mut batch_size = int("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512);
+        if batch_size > queue_size {
+            batch_size = queue_size.min(512);
+        }
+        let millis = |v: i64| Duration::from_millis(v.max(0) as u64);
+        let timeout = int("OTEL_BSP_EXPORT_TIMEOUT", 30000);
+        BatchSettings {
+            queue_size,
+            batch_size,
+            delay: millis(int("OTEL_BSP_SCHEDULE_DELAY", 5000)),
+            timeout: (timeout > 0).then(|| millis(timeout)),
+        }
+    }
 }
 
 /// Starts the batch span processor and its exporter.
-pub(super) fn start(protocol: Protocol, resource: Resource) -> Queue {
-    let queue_size = bsp("OTEL_BSP_MAX_QUEUE_SIZE", 2048) as usize;
-    let batch_size = (bsp("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512) as usize).min(queue_size);
-    let delay = Duration::from_millis(bsp("OTEL_BSP_SCHEDULE_DELAY", 5000));
-    let export_timeout = Duration::from_millis(bsp("OTEL_BSP_EXPORT_TIMEOUT", 30000));
-    let (spans, mut queued) = mpsc::channel::<SpanData>(queue_size);
+pub(super) fn start(protocol: Protocol, config: Config, resource: Resource) -> Queue {
+    let settings = BatchSettings::from_env();
+    let batch_size = settings.batch_size.max(1) as usize;
+    let timeout = settings.timeout;
+    // A queue of 0 drops every span: a channel needs room for one.
+    let (spans, mut queued) = mpsc::channel::<SpanData>(settings.queue_size.max(1) as usize);
     let (shutdown, mut stop) = mpsc::channel::<oneshot::Sender<Result<(), String>>>(1);
-    let exporter = Exporter::new(protocol);
+    let exporter = Exporter::new(protocol, config);
+    let delay = settings.delay.max(Duration::from_millis(1));
     tokio::spawn(async move {
+        // Export errors go to the error handler (also while shutting down).
+        let export = async |spans: Vec<SpanData>| {
+            if let Err(e) = exporter.export(&resource, spans, timeout).await {
+                otel_error(&e);
+            }
+        };
         let mut batch = Vec::new();
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + delay, delay);
         loop {
@@ -152,41 +202,32 @@ pub(super) fn start(protocol: Protocol, resource: Resource) -> Queue {
                     let Some(span) = span else { break };
                     batch.push(span);
                     if batch.len() >= batch_size {
-                        let spans = std::mem::take(&mut batch);
-                        log_failure(exporter.export(&resource, spans, export_timeout).await);
+                        export(std::mem::take(&mut batch)).await;
                     }
                 }
                 _ = ticks.tick() => {
                     if !batch.is_empty() {
-                        let spans = std::mem::take(&mut batch);
-                        log_failure(exporter.export(&resource, spans, export_timeout).await);
+                        export(std::mem::take(&mut batch)).await;
                     }
                 }
                 done = stop.recv() => {
                     while let Ok(span) = queued.try_recv() {
                         batch.push(span);
                     }
-                    let mut result = Ok(());
-                    for spans in std::mem::take(&mut batch).chunks(batch_size.max(1)) {
-                        let exported = exporter.export(&resource, spans.to_vec(), export_timeout).await;
-                        if let Err(e) = exported {
-                            result = Err(e);
-                        }
+                    for spans in std::mem::take(&mut batch).chunks(batch_size) {
+                        export(spans.to_vec()).await;
                     }
                     if let Some(done) = done {
-                        let _ = done.send(result);
+                        let _ = done.send(Ok(()));
                     }
                     break;
                 }
             }
         }
     });
-    Queue { spans, shutdown }
-}
-
-fn log_failure(exported: Result<(), String>) {
-    if let Err(e) = exported {
-        otel_error(&e);
+    Queue {
+        spans: (settings.queue_size > 0).then_some(spans),
+        shutdown,
     }
 }
 
@@ -248,6 +289,7 @@ fn otlp_span(span: SpanData) -> Span {
             .into_iter()
             .map(|(k, v)| key_value(k, v))
             .collect(),
+        dropped_attributes_count: span.dropped_attributes,
         status: Some(Status {
             message,
             code: code as i32,
@@ -275,6 +317,11 @@ pub(super) struct Config {
 }
 
 impl Config {
+    /// Whether a CA or a client certificate is configured.
+    pub fn has_tls_settings(&self) -> bool {
+        self.ca.is_some() || self.identity.is_some()
+    }
+
     pub fn from_env(protocol: Protocol) -> Self {
         Self::from_lookup(protocol, |name| std::env::var(name).ok())
     }
@@ -303,7 +350,8 @@ impl Config {
         for (name, signal) in [("ENDPOINT", false), ("TRACES_ENDPOINT", true)] {
             let Some(value) = env(name) else { continue };
             let Some(url) = parse_url(&value) else {
-                otel_error(&format!("parse url: {value}"));
+                // Credentials can be in a URL: it is not written.
+                otel_error(&format!("parse url: invalid OTEL_EXPORTER_OTLP_{name}"));
                 continue;
             };
             config.insecure = matches!(url.scheme.to_lowercase().as_str(), "http" | "unix");
@@ -321,8 +369,12 @@ impl Config {
         }
         for name in ["CERTIFICATE", "TRACES_CERTIFICATE"] {
             if let Some(file) = env(name) {
+                // A file with no certificate leaves the configuration as it is.
                 match std::fs::read(&file) {
-                    Ok(pem) => config.ca = Some(pem),
+                    Ok(pem) if !certificates(&pem).is_empty() => config.ca = Some(pem),
+                    Ok(_) => otel_error(
+                        "create tls cert pool: failed to append certificate to the cert pool",
+                    ),
                     Err(e) => otel_error(&format!("read tls ca cert file: {e}")),
                 }
             }
@@ -333,7 +385,10 @@ impl Config {
         ] {
             if let (Some(cert), Some(key)) = (env(cert), env(key)) {
                 match (std::fs::read(&cert), std::fs::read(&key)) {
-                    (Ok(cert), Ok(key)) => config.identity = Some((cert, key)),
+                    (Ok(cert), Ok(key)) if key_pair(&cert, &key).is_some() => {
+                        config.identity = Some((cert, key))
+                    }
+                    (Ok(_), Ok(_)) => otel_error("create tls client key pair: invalid PEM"),
                     (Err(e), _) | (_, Err(e)) => otel_error(&format!("read tls client cert: {e}")),
                 }
             }
@@ -378,12 +433,16 @@ fn clean_path(path: &str) -> String {
 }
 
 /// `stringToHeader`: `key=value` pairs separated by commas, the key a token, the value
-/// percent-decoded; trimmed. A later key replaces an earlier one.
+/// percent-decoded; trimmed. A later key replaces an earlier one. Values, which can be
+/// credentials, are never written in errors.
 fn headers(value: &str) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
-    for pair in value.split(',') {
+    for (index, pair) in value.split(',').enumerate() {
         let Some((key, value)) = pair.split_once('=') else {
-            otel_error(&format!("parse headers: missing '=': {pair}"));
+            otel_error(&format!(
+                "parse headers: missing '=' in entry {}",
+                index + 1
+            ));
             continue;
         };
         let key = key.trim();
@@ -393,14 +452,10 @@ fn headers(value: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some(value) = crate::go::unescape(value, false) else {
-            otel_error(&format!("escape header value: {value}"));
+            otel_error(&format!("escape header value: invalid escape in {key}"));
             continue;
         };
-        let value = value.trim().to_string();
-        match headers.iter_mut().find(|(k, _)| k == key) {
-            Some(existing) => existing.1 = value,
-            None => headers.push((key.to_string(), value)),
-        }
+        super::upsert(&mut headers, key.to_string(), value.trim().to_string());
     }
     headers
 }
@@ -438,6 +493,16 @@ fn parse_url(value: &str) -> Option<Url> {
                 None => (authority_path, ""),
             };
             let host = authority.rsplit('@').next().unwrap_or_default();
+            // A port must be digits; no control character anywhere.
+            let port = match host.rsplit_once(']') {
+                Some((_, rest)) => rest.strip_prefix(':'),
+                None => host.rsplit_once(':').map(|(_, p)| p),
+            };
+            if port.is_some_and(|p| !p.bytes().all(|b| b.is_ascii_digit()))
+                || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+            {
+                return None;
+            }
             Some(Url {
                 scheme: scheme.into(),
                 host: host.into(),
@@ -465,11 +530,15 @@ fn parse_url(value: &str) -> Option<Url> {
 }
 
 /// Sends batches to the collector.
-struct Exporter {
-    protocol: Protocol,
-    config: Config,
-    http: Option<HttpClient>,
-    grpc: tokio::sync::OnceCell<Result<tonic::transport::Channel, String>>,
+enum Exporter {
+    Grpc {
+        config: Config,
+        channel: tokio::sync::OnceCell<Result<tonic::transport::Channel, String>>,
+    },
+    Http {
+        config: Config,
+        client: Box<HttpClient>,
+    },
 }
 
 type HttpClient = hyper_util::client::legacy::Client<
@@ -478,108 +547,146 @@ type HttpClient = hyper_util::client::legacy::Client<
 >;
 
 impl Exporter {
-    fn new(protocol: Protocol) -> Self {
-        let config = Config::from_env(protocol);
-        let http = (protocol == Protocol::Http).then(|| http_client(&config));
-        Exporter {
-            protocol,
-            config,
-            http,
-            grpc: tokio::sync::OnceCell::new(),
+    fn new(protocol: Protocol, config: Config) -> Self {
+        match protocol {
+            Protocol::Grpc => Exporter::Grpc {
+                config,
+                channel: tokio::sync::OnceCell::new(),
+            },
+            Protocol::Http => Exporter::Http {
+                client: Box::new(http_client(&config)),
+                config,
+            },
         }
     }
 
+    /// Sends `spans`, within the exporter's timeout and the batch processor's.
     async fn export(
         &self,
         resource: &Resource,
         spans: Vec<SpanData>,
-        batch_timeout: Duration,
+        batch_timeout: Option<Duration>,
     ) -> Result<(), String> {
         let request = request(resource, spans);
-        let timeout = self.config.timeout.min(batch_timeout);
-        let sent = match self.protocol {
-            Protocol::Grpc => tokio::time::timeout(timeout, self.export_grpc(request)).await,
-            Protocol::Http => tokio::time::timeout(timeout, self.export_http(request)).await,
+        let (config, sent) = match self {
+            Exporter::Grpc { config, channel } => (
+                config,
+                Box::pin(export_grpc(config, channel, request)) as Sending<'_>,
+            ),
+            Exporter::Http { config, client } => (
+                config,
+                Box::pin(export_http(config, client, request)) as Sending<'_>,
+            ),
         };
-        sent.unwrap_or_else(|_| Err("traces export: context deadline exceeded".into()))
+        let timeout = batch_timeout.map_or(config.timeout, |t| t.min(config.timeout));
+        tokio::time::timeout(timeout, sent)
+            .await
+            .unwrap_or_else(|_| Err("traces export: context deadline exceeded".into()))
     }
+}
 
-    async fn export_grpc(&self, request: ExportTraceServiceRequest) -> Result<(), String> {
-        let channel = self
-            .grpc
-            .get_or_init(|| async { grpc_channel(&self.config) })
-            .await
-            .clone()?;
-        let mut client = TraceServiceClient::new(channel);
-        if self.config.gzip {
-            client = client.send_compressed(tonic::codec::CompressionEncoding::Gzip);
-        }
-        let mut request = tonic::Request::new(request);
-        request.set_timeout(self.config.timeout);
-        for (key, value) in &self.config.headers {
-            let (Ok(key), Ok(value)) = (
-                tonic::metadata::MetadataKey::from_bytes(key.to_lowercase().as_bytes()),
-                tonic::metadata::MetadataValue::try_from(value.as_str()),
-            ) else {
-                continue;
-            };
-            request.metadata_mut().insert(key, value);
-        }
-        client
-            .export(request)
-            .await
-            .map(drop)
-            .map_err(|status| format!("traces export: {}", status.message()))
-    }
+type Sending<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 
-    async fn export_http(&self, request: ExportTraceServiceRequest) -> Result<(), String> {
-        let scheme = if self.config.insecure {
-            "http"
-        } else {
-            "https"
-        };
-        let url = format!("{scheme}://{}{}", self.config.endpoint, self.config.path);
-        let body = prost::Message::encode_to_vec(&request);
-        let mut builder = hyper::Request::post(&url)
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "application/x-protobuf");
-        for (key, value) in &self.config.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let body = if self.config.gzip {
-            use std::io::Write;
-            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            let _ = gz.write_all(&body);
-            builder = builder.header("Content-Encoding", "gzip");
-            gz.finish().unwrap_or_default()
-        } else {
-            body
-        };
-        let request = builder
-            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-            .map_err(|e| format!("traces export: {e}"))?;
-        let client = self.http.as_ref().expect("an HTTP exporter");
-        let response = client
-            .request(request)
-            .await
-            .map_err(|e| format!("traces export: Post \"{url}\": {e}"))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let body = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .map(|b| String::from_utf8_lossy(&b.to_bytes()).trim().to_string())
-            .unwrap_or_default();
-        let body = if body.is_empty() {
-            "(empty)".into()
-        } else {
-            body
-        };
-        Err(format!(
-            "traces export: failed to send to {url}: {status} (body: {body})"
-        ))
+async fn export_grpc(
+    config: &Config,
+    channel: &tokio::sync::OnceCell<Result<tonic::transport::Channel, String>>,
+    request: ExportTraceServiceRequest,
+) -> Result<(), String> {
+    let channel = channel
+        .get_or_init(|| async { grpc_channel(config) })
+        .await
+        .clone()?;
+    let mut client = TraceServiceClient::new(channel);
+    if config.gzip {
+        client = client.send_compressed(tonic::codec::CompressionEncoding::Gzip);
     }
+    let mut request = tonic::Request::new(request);
+    request.set_timeout(config.timeout);
+    for (key, value) in &config.headers {
+        let (Ok(key), Ok(value)) = (
+            tonic::metadata::MetadataKey::from_bytes(key.to_lowercase().as_bytes()),
+            tonic::metadata::MetadataValue::try_from(value.as_str()),
+        ) else {
+            continue;
+        };
+        request.metadata_mut().insert(key, value);
+    }
+    client
+        .export(request)
+        .await
+        .map(drop)
+        .map_err(|status| format!("traces export: {}", status.message()))
+}
+
+async fn export_http(
+    config: &Config,
+    client: &HttpClient,
+    request: ExportTraceServiceRequest,
+) -> Result<(), String> {
+    let scheme = if config.insecure { "http" } else { "https" };
+    let url = format!("{scheme}://{}{}", config.endpoint, config.path);
+    let body = prost::Message::encode_to_vec(&request);
+    let mut builder = hyper::Request::post(&url)
+        .header("User-Agent", USER_AGENT)
+        .header("Content-Type", "application/x-protobuf");
+    for (key, value) in &config.headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+    let body = if config.gzip {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let _ = gz.write_all(&body);
+        builder = builder.header("Content-Encoding", "gzip");
+        gz.finish().unwrap_or_default()
+    } else {
+        body
+    };
+    let request = builder
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .map_err(|e| format!("traces export: {e}"))?;
+    let response = client
+        .request(request)
+        .await
+        .map_err(|e| format!("traces export: Post \"{url}\": {e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .map(|b| String::from_utf8_lossy(&b.to_bytes()).trim().to_string())
+        .unwrap_or_default();
+    let body = if body.is_empty() {
+        "(empty)".into()
+    } else {
+        body
+    };
+    Err(format!(
+        "traces export: failed to send to {url}: {status} (body: {body})"
+    ))
+}
+
+/// The PEM certificates of `pem` (none if it has none or one does not parse).
+fn certificates(pem: &[u8]) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
+}
+
+/// A client certificate chain and its key, if both parse.
+fn key_pair(
+    cert: &[u8],
+    key: &[u8],
+) -> Option<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use rustls::pki_types::pem::PemObject;
+    let certs = certificates(cert);
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key).ok()?;
+    (!certs.is_empty()).then_some((certs, key))
 }
 
 /// This exporter's `User-Agent`.
@@ -587,12 +694,10 @@ const USER_AGENT: &str = concat!("ratelimit/", env!("CARGO_PKG_VERSION"));
 
 /// The TLS configuration: the system's roots or `CERTIFICATE`, and the client certificate.
 fn tls_config(config: &Config) -> Result<rustls::ClientConfig, String> {
-    use rustls::pki_types::pem::PemObject;
     let mut roots = rustls::RootCertStore::empty();
     match &config.ca {
         Some(pem) => {
-            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
-                let cert = cert.map_err(|e| e.to_string())?;
+            for cert in certificates(pem) {
                 roots.add(cert).map_err(|e| e.to_string())?;
             }
         }
@@ -608,17 +713,10 @@ fn tls_config(config: &Config) -> Result<rustls::ClientConfig, String> {
     .with_safe_default_protocol_versions()
     .map_err(|e| e.to_string())?
     .with_root_certificates(roots);
-    match &config.identity {
-        Some((cert, key)) => {
-            let certs = rustls::pki_types::CertificateDer::pem_slice_iter(cert)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            let key =
-                rustls::pki_types::PrivateKeyDer::from_pem_slice(key).map_err(|e| e.to_string())?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| e.to_string())
-        }
+    match config.identity.as_ref().and_then(|(c, k)| key_pair(c, k)) {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| e.to_string()),
         None => Ok(builder.with_no_client_auth()),
     }
 }
@@ -645,7 +743,7 @@ fn http_client(config: &Config) -> HttpClient {
 /// Whether gRPC goes over TLS: unless insecure, and always with a certificate configured
 /// (Go's TLS credentials win over `INSECURE` and an `http` endpoint).
 fn grpc_tls(config: &Config) -> bool {
-    !config.insecure || config.ca.is_some() || config.identity.is_some()
+    !config.insecure || config.has_tls_settings()
 }
 
 /// A lazily connected channel to the collector, over TLS as [`grpc_tls`] says.
@@ -764,6 +862,45 @@ mod tests {
         );
         assert_eq!((grpc.endpoint.as_str(), grpc.insecure), ("h:3/p", false));
         assert!(config(Protocol::Grpc, &[("ENDPOINT", "unix://h:3")]).insecure);
+    }
+
+    #[test]
+    fn batches_are_set_up_like_go() {
+        let settings = |vars: &[(&str, &str)]| {
+            BatchSettings::from_lookup(|name| {
+                vars.iter()
+                    .find(|(k, _)| format!("OTEL_BSP_{k}") == name)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        let default = settings(&[]);
+        assert_eq!(
+            (
+                default.queue_size,
+                default.batch_size,
+                default.delay,
+                default.timeout
+            ),
+            (
+                2048,
+                512,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(30))
+            )
+        );
+        // Not trimmed: not a number, so the default; 0 and negative values are kept.
+        let odd = settings(&[
+            ("MAX_QUEUE_SIZE", "100"),
+            ("MAX_EXPORT_BATCH_SIZE", "1000"),
+            ("SCHEDULE_DELAY", " 10"),
+            ("EXPORT_TIMEOUT", "0"),
+        ]);
+        assert_eq!(
+            (odd.queue_size, odd.batch_size, odd.delay, odd.timeout),
+            (100, 100, Duration::from_secs(5), None)
+        );
+        assert_eq!(settings(&[("MAX_QUEUE_SIZE", "1000")]).batch_size, 512);
+        assert_eq!(settings(&[("MAX_QUEUE_SIZE", "-1")]).batch_size, -1);
     }
 
     #[test]

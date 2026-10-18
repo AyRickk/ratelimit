@@ -19,6 +19,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 prost.workspace = true
+pin-project-lite.workspace = true
 prost-types.workspace = true
 ratelimit-proto.workspace = true
 regex.workspace = true
@@ -38,6 +39,7 @@ inotify.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
+tonic-prost.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 hyper-util.workspace = true
 tower.workspace = true

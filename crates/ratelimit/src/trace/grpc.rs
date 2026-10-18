@@ -68,37 +68,35 @@ pub struct Traced<S> {
     layer: Layer,
 }
 
+/// The methods the server registers: grpc-go starts a span only for them (an unknown one
+/// gets a span that never ends, so is never exported).
+const METHODS: [&str; 4] = [
+    "/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit",
+    "/grpc.health.v1.Health/Check",
+    "/grpc.health.v1.Health/List",
+    "/grpc.health.v1.Health/Watch",
+];
+
 /// The span's name and the method's attributes (`ParseFullMethod`, `ParseFullMethodOld`).
 fn method(full: &str, conventions: Conventions) -> (String, Vec<(String, Value)>) {
     let Some(name) = full.strip_prefix('/') else {
         return (full.to_string(), Vec::new());
     };
     let string = |k: &str, v: &str| (k.to_string(), Value::Str(v.to_string()));
-    let current = vec![string("rpc.method", name)];
-    let previous = match name.split_once('/') {
-        Some((service, method)) => {
-            let method = method.split('/').next().unwrap_or_default();
-            vec![
-                string("rpc.system", "grpc"),
-                string("rpc.service", service),
-                string("rpc.method", method),
-            ]
-        }
-        None => vec![string("rpc.system", "grpc")],
-    };
+    let current = string("rpc.method", name);
     let system_name = string("rpc.system.name", "grpc");
+    let mut previous = vec![string("rpc.system", "grpc")];
+    if let Some((service, method)) = name.split_once('/') {
+        let method = method.split('/').next().unwrap_or_default();
+        previous.extend([string("rpc.service", service), string("rpc.method", method)]);
+    }
     let attributes = match conventions {
-        Conventions::Current => [current, vec![system_name]].concat(),
+        Conventions::Current => vec![current, system_name],
         Conventions::Previous => previous,
         // The current `rpc.method` replaces the previous one.
         Conventions::Both => {
             let mut attributes = previous;
-            for (key, value) in current {
-                match attributes.iter_mut().find(|(k, _)| *k == key) {
-                    Some(existing) => existing.1 = value,
-                    None => attributes.push((key, value)),
-                }
-            }
+            super::upsert(&mut attributes, current.0, current.1);
             attributes.push(system_name);
             attributes
         }
@@ -119,78 +117,95 @@ fn server_address(address: &str) -> Vec<(String, Value)> {
     attributes
 }
 
+/// The connection's local address as Go prints it: an IPv4-mapped address as IPv4.
+fn local_address<B>(request: &http::Request<B>) -> Option<String> {
+    let address = request
+        .extensions()
+        .get::<tonic::transport::server::TcpConnectInfo>()?
+        .local_addr()?;
+    let ip = match address.ip() {
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(address.ip(), Into::into),
+        ip => ip,
+    };
+    Some(std::net::SocketAddr::from((ip, address.port())).to_string())
+}
+
 impl<S, B, R> tower::Service<http::Request<B>> for Traced<S>
 where
     S: tower::Service<http::Request<B>, Response = http::Response<R>>,
-    S::Future: Send + 'static,
-    S::Error: Send + 'static,
     R: http_body::Body + Unpin,
 {
     type Response = http::Response<TracedBody<R>>;
     type Error = S::Error;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>> + Send>>;
+    type Future = TracedFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
-        if !super::enabled() {
-            let response = self.inner.call(request);
-            return Box::pin(async move {
-                let (parts, body) = response.await?.into_parts();
-                Ok(http::Response::from_parts(
-                    parts,
-                    TracedBody {
-                        body,
-                        span: None,
-                        status: None,
-                    },
-                ))
-            });
+        let path = request.uri().path();
+        if !super::enabled() || !METHODS.contains(&path) {
+            return TracedFuture {
+                response: self.inner.call(request),
+                span: None,
+            };
         }
         let parent = super::propagation::extract(request.headers());
-        let (name, attributes) = method(request.uri().path(), self.layer.conventions);
-        let mut span = super::start(SCOPE, &name, Kind::Server, parent.as_ref(), || attributes);
-        let local = match &self.layer.uds {
-            Some(path) => Some(path.clone()),
-            None => request
-                .extensions()
-                .get::<tonic::transport::server::TcpConnectInfo>()
-                .and_then(|info| info.local_addr())
-                .map(|address| match address.ip() {
-                    // Go prints an IPv4-mapped address as IPv4.
-                    std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                        Some(v4) => std::net::SocketAddr::from((v4, address.port())).to_string(),
-                        None => address.to_string(),
-                    },
-                    std::net::IpAddr::V4(_) => address.to_string(),
-                }),
-        };
-        if let Some(local) = local {
-            for (key, value) in server_address(&local) {
+        let conventions = self.layer.conventions;
+        let full = path.to_string();
+        let name = full.strip_prefix('/').unwrap_or(&full).to_string();
+        let mut span = super::start(SCOPE, &name, Kind::Server, parent.as_ref(), || {
+            method(&full, conventions).1
+        });
+        if span.is_recording() {
+            let local = match &self.layer.uds {
+                Some(path) => Some(path.clone()),
+                None => local_address(&request),
+            };
+            for (key, value) in local.as_deref().map(server_address).unwrap_or_default() {
                 span.set_attribute(&key, value);
             }
         }
         if let Some(context) = span.context() {
             request.extensions_mut().insert(context.clone());
         }
-        let response = self.inner.call(request);
-        Box::pin(async move {
-            let response = response.await?;
-            let (parts, body) = response.into_parts();
-            // A trailers-only answer has its status in the headers.
-            let status = grpc_status(&parts.headers);
-            Ok(http::Response::from_parts(
-                parts,
-                TracedBody {
-                    body,
-                    span: Some(span),
-                    status,
-                },
-            ))
-        })
+        TracedFuture {
+            response: self.inner.call(request),
+            span: Some(span),
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The inner service's answer, its body wrapped to end the span.
+    pub struct TracedFuture<F> {
+        #[pin]
+        response: F,
+        span: Option<Span>,
+    }
+}
+
+impl<F, R, E> std::future::Future for TracedFuture<F>
+where
+    F: std::future::Future<Output = Result<http::Response<R>, E>>,
+{
+    type Output = Result<http::Response<TracedBody<R>>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let response = std::task::ready!(this.response.poll(cx))?;
+        let (parts, body) = response.into_parts();
+        // A trailers-only answer has its status in the headers.
+        let status = this.span.as_ref().and_then(|_| grpc_status(&parts.headers));
+        Poll::Ready(Ok(http::Response::from_parts(
+            parts,
+            TracedBody {
+                body,
+                span: this.span.take(),
+                status,
+            },
+        )))
     }
 }
 
@@ -205,31 +220,46 @@ fn grpc_status(headers: &http::HeaderMap) -> Option<(i32, String)> {
     Some((code, message))
 }
 
+/// gRPC's status codes, by number.
+const CODES: [&str; 17] = [
+    "OK",
+    "CANCELLED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+];
+
 /// `canonicalString` of a gRPC status code.
 fn canonical(code: i32) -> String {
-    const NAMES: [&str; 17] = [
-        "OK",
-        "CANCELLED",
-        "UNKNOWN",
-        "INVALID_ARGUMENT",
-        "DEADLINE_EXCEEDED",
-        "NOT_FOUND",
-        "ALREADY_EXISTS",
-        "PERMISSION_DENIED",
-        "RESOURCE_EXHAUSTED",
-        "FAILED_PRECONDITION",
-        "ABORTED",
-        "OUT_OF_RANGE",
-        "UNIMPLEMENTED",
-        "INTERNAL",
-        "UNAVAILABLE",
-        "DATA_LOSS",
-        "UNAUTHENTICATED",
-    ];
     usize::try_from(code)
         .ok()
-        .and_then(|c| NAMES.get(c))
+        .and_then(|c| CODES.get(c))
         .map_or_else(|| format!("CODE({code})"), |name| name.to_string())
+}
+
+/// `serverStatus`: the codes that are the server's fault make the span an error.
+fn server_fault(code: i32) -> bool {
+    matches!(
+        canonical(code).as_str(),
+        "UNKNOWN"
+            | "DEADLINE_EXCEEDED"
+            | "UNIMPLEMENTED"
+            | "INTERNAL"
+            | "UNAVAILABLE"
+            | "DATA_LOSS"
+    )
 }
 
 /// The answer's body, which ends the span once the call's status is known.
@@ -240,14 +270,14 @@ pub struct TracedBody<B> {
 }
 
 impl<B> TracedBody<B> {
-    /// `stats.End`: the status code attribute, and an error status for the codes that are
-    /// the server's fault (`serverStatus`).
-    fn end(&mut self) {
+    /// `stats.End`: the status code attribute, and an error status for the server's faults.
+    /// With no status, `code`: the call stopped before its end.
+    fn end(&mut self, code: i32) {
         let Some(mut span) = self.span.take() else {
             return;
         };
-        let (code, message) = self.status.take().unwrap_or((0, String::new()));
-        if matches!(code, 2 | 4 | 12 | 13 | 14 | 15) {
+        let (code, message) = self.status.take().unwrap_or((code, String::new()));
+        if server_fault(code) {
             span.set_error(&message);
         }
         span.set_attribute("rpc.response.status_code", Value::Str(canonical(code)));
@@ -255,8 +285,9 @@ impl<B> TracedBody<B> {
 }
 
 impl<B> Drop for TracedBody<B> {
+    /// A call dropped before its trailers was cancelled.
     fn drop(&mut self) {
-        self.end();
+        self.end(1);
     }
 }
 
@@ -273,10 +304,11 @@ impl<B: http_body::Body + Unpin> http_body::Body for TracedBody<B> {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(status) = frame.trailers_ref().and_then(grpc_status) {
                     self.status = Some(status);
-                    self.end();
+                    self.end(0);
                 }
             }
-            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => self.end(),
+            Poll::Ready(None) => self.end(0),
+            Poll::Ready(Some(Err(_))) => self.end(2),
             Poll::Pending => {}
         }
         polled

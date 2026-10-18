@@ -4096,6 +4096,7 @@ async fn the_binary_fails_to_start_like_upstream() {
     let redis = Redis::start().await;
     let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let busy_port = busy.local_addr().unwrap().port().to_string();
+    let ca = pki(&runtime.join("pki")).ca.to_string_lossy().into_owned();
     let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
         (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
         (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
@@ -4105,6 +4106,8 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("RUNTIME_WATCH_ROOT", "false".into()), ("RUNTIME_APPDIRECTORY", "missing".into())], format!("unable to watch file ({}/ratelimit/missing)", runtime.join("current").display())),
         (vec![("BACKEND_TYPE", "bogus".into())], "Invalid setting for BackendType: bogus".into()),
         (vec![("TRACING_ENABLED", "true".into()), ("TRACING_EXPORTER_PROTOCOL", "bogus".into())], "Invalid otlptrace client protocol: bogus".into()),
+        // An HTTP exporter given a CA for an insecure endpoint.
+        (vec![("TRACING_ENABLED", "true".into()), ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1".into()), ("OTEL_EXPORTER_OTLP_CERTIFICATE", ca.clone())], "creating OTLP trace exporter: insecure HTTP endpoint cannot use TLS client configuration".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
@@ -7428,7 +7431,7 @@ fn received_spans(collected: &Collected, known: &[(&str, [u8; 16], [u8; 8])]) ->
         attributes.sort();
         let status = span.status.clone().unwrap_or_default();
         spans.push(format!(
-            "{} {:?} {} | {} kind {} flags {:#x} state {:?} | {} | parent {} | status {} {:?} | {:?}",
+            "{} {:?} {} | {} kind {} flags {:#x} state {:?} | {} | parent {} | status {} {:?} | {:?} dropped {}",
             scope.name,
             scope.version,
             schema,
@@ -7440,7 +7443,8 @@ fn received_spans(collected: &Collected, known: &[(&str, [u8; 16], [u8; 8])]) ->
             name_of(&span.parent_span_id),
             status.code,
             status.message,
-            attributes
+            attributes,
+            span.dropped_attributes_count
         ));
     }
     spans.sort();
@@ -7486,12 +7490,13 @@ async fn traces_are_exported_like_upstream() {
     // Over TLS, the collector verified with `OTEL_EXPORTER_OTLP_CERTIFICATE`, the exporter
     // with its client certificate.
     let pki = pki(&runtime.join("pki"));
-    for (protocol, compression, conventions, rate, tls) in [
-        ("grpc", "gzip", "", "1", false),
-        ("http", "none", "rpc/old", "1", false),
-        ("http", "gzip", "x, rpc/dup", "0", false),
-        ("grpc", "none", "", "1", true),
-        ("http", "none", "", "1", true),
+    // With span limits: strings cut to 10 characters, at most 4 attributes.
+    for (protocol, compression, conventions, rate, tls, limits) in [
+        ("grpc", "gzip", "", "1", false, false),
+        ("http", "none", "rpc/old", "1", false, true),
+        ("http", "gzip", "x, rpc/dup", "0", false, false),
+        ("grpc", "none", "", "1", true, false),
+        ("http", "none", "", "1", true, false),
     ] {
         let mut runs = Vec::new();
         for binary in [
@@ -7523,7 +7528,7 @@ async fn traces_are_exported_like_upstream() {
                 ("OTEL_SERVICE_NAME", "ignored".into()),
                 (
                     "OTEL_RESOURCE_ATTRIBUTES",
-                    "deployment= test%20env ,team=rl,team=limits".into(),
+                    "deployment= test%20env ,team=rl,team=limits,=empty".into(),
                 ),
                 (
                     "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -7542,6 +7547,13 @@ async fn traces_are_exported_like_upstream() {
                 ("DEBUG_PORT", reserved_port().to_string()),
             ];
             let mut environment = environment;
+            if limits {
+                environment.extend([
+                    ("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "10".to_string()),
+                    ("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "4".to_string()),
+                    ("OTEL_ATTRIBUTE_COUNT_LIMIT", "1".to_string()),
+                ]);
+            }
             if tls {
                 environment.extend([
                     (
@@ -7612,12 +7624,25 @@ async fn traces_are_exported_like_upstream() {
             let _ = client
                 .should_rate_limit(tonic::Request::new(request("", &[&[("user", "t")]])))
                 .await;
-            HealthClient::new(channel)
+            HealthClient::new(channel.clone())
                 .check(HealthCheckRequest {
                     service: "ratelimit".into(),
                 })
                 .await
                 .unwrap();
+            // A method no service has: no span.
+            let mut unknown = tonic::client::Grpc::new(channel);
+            unknown.ready().await.unwrap();
+            let codec =
+                tonic_prost::ProstCodec::<HealthCheckRequest, HealthCheckRequest>::default();
+            let answer = unknown
+                .unary(
+                    tonic::Request::new(HealthCheckRequest::default()),
+                    http::uri::PathAndQuery::from_static("/grpc.health.v1.Health/Nope"),
+                    codec,
+                )
+                .await;
+            assert_eq!(answer.unwrap_err().code(), tonic::Code::Unimplemented);
             let json =
                 r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"j"}]}]}"#;
             let answer = send_raw(
