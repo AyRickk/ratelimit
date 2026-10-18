@@ -519,7 +519,7 @@ fn enumeration(decoder: &mut Decoder, names: &[(&str, i32)]) -> Result<i32> {
 }
 
 /// The request's units (`envoy.type.v3.RateLimitUnit`), which stop at `YEAR`.
-const UNITS: &[(&str, i32)] = &[
+pub(crate) const UNITS: &[(&str, i32)] = &[
     ("UNKNOWN", 0),
     ("SECOND", 1),
     ("MINUTE", 2),
@@ -696,7 +696,7 @@ fn enum_value(e: &mut Encoder, number: i32, names: &[(&str, i32)]) {
     }
 }
 
-const CODES: &[(&str, i32)] = &[("UNKNOWN", 0), ("OK", 1), ("OVER_LIMIT", 2)];
+pub(crate) const CODES: &[(&str, i32)] = &[("UNKNOWN", 0), ("OK", 1), ("OVER_LIMIT", 2)];
 /// The response's units (`RateLimitResponse.RateLimit.Unit`), which also have `WEEK`.
 pub(crate) const RESPONSE_UNITS: &[(&str, i32)] = &[
     ("UNKNOWN", 0),

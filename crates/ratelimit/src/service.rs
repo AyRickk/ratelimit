@@ -6,9 +6,7 @@ use crate::limiter::{Clock, unit_seconds};
 use crate::stats::Stats;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use ratelimit_proto::envoy::config::core::v3::HeaderValue;
-use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
-    RateLimitDescriptor, rate_limit_descriptor::RateLimitOverride,
-};
+use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse,
     rate_limit_response::{Code, DescriptorStatus, rate_limit::Unit},
@@ -444,7 +442,7 @@ fn descriptor_metadata(descriptor: &RateLimitDescriptor) -> Value {
         .collect();
     fields.insert("entries".into(), list(entries));
     if let Some(limit) = &descriptor.limit {
-        fields.insert("limit".into(), string(&limit_text(limit)));
+        fields.insert("limit".into(), string(&crate::prototext::limit(limit)));
     }
     if let Some(hits) = descriptor.hits_addend {
         fields.insert("hitsAddend".into(), number(hits as f64));
@@ -456,28 +454,6 @@ fn struct_value(value: Struct) -> Value {
     Value {
         kind: Some(Kind::StructValue(value)),
     }
-}
-
-/// A client-sent limit in protobuf's text format, as Go's `String()` writes it but always with
-/// one space between fields (Go's is randomised): `requests_per_unit:10 unit:MINUTE`, zero
-/// fields left out.
-fn limit_text(limit: &RateLimitOverride) -> String {
-    let mut fields = Vec::new();
-    if limit.requests_per_unit != 0 {
-        fields.push(format!("requests_per_unit:{}", limit.requests_per_unit));
-    }
-    if limit.unit != 0 {
-        let unit = Unit::try_from(limit.unit)
-            .map_or_else(|_| limit.unit.to_string(), |u| u.as_str_name().to_string());
-        fields.push(format!("unit:{unit}"));
-    }
-    if let Some(multiplier) = limit.unit_multiplier {
-        fields.push(match multiplier {
-            0 => "unit_multiplier:{}".to_string(),
-            value => format!("unit_multiplier:{{value:{value}}}"),
-        });
-    }
-    fields.join(" ")
 }
 
 fn string(value: &str) -> Value {

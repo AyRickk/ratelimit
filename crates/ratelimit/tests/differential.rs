@@ -5093,6 +5093,143 @@ fn json_responses_are_encoded_like_upstream() {
     if !tools_available() {
         return;
     }
+    let responses = sample_responses();
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-protojson-marshal")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let lines: String = responses
+        .iter()
+        .map(|response| format!("{}\n", hex(&prost::Message::encode_to_vec(response))))
+        .collect();
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(without_go_spaces)
+        .collect();
+    assert_eq!(upstream.len(), responses.len());
+    for (response, upstream) in responses.iter().zip(&upstream) {
+        let ours = match ratelimit::protojson::encode_response(response) {
+            Ok(json) => format!("ok {json}"),
+            Err(_) => "error".to_string(),
+        };
+        assert_eq!(&ours, upstream, "{response:?}");
+    }
+}
+
+/// The debug lines print requests, responses and statuses as Go's `%+v` does (prototext, with
+/// the oracle's random second space between fields turned off): every field, defaults left out, wrappers
+/// and oneofs set to their defaults, escapes, enum numbers with no name.
+#[test]
+fn messages_are_printed_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
+        RateLimitDescriptor,
+        rate_limit_descriptor::{Entry, RateLimitOverride},
+    };
+    let entry = |key: &str, value: &str| Entry {
+        key: key.into(),
+        value: value.into(),
+    };
+    let requests = vec![
+        RateLimitRequest::default(),
+        RateLimitRequest {
+            domain: "d \"q\" \\ \n\r\t\u{0}\u{1f}\u{7f}\u{80}\u{85}\u{9f}\u{a0}é\u{2028}😀".into(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![entry("k", "v"), entry("", ""), entry("only", "")],
+                    limit: Some(RateLimitOverride {
+                        requests_per_unit: 10,
+                        unit: 2,
+                        unit_multiplier: None,
+                    }),
+                    hits_addend: Some(5),
+                    is_negative_hits: true,
+                },
+                RateLimitDescriptor::default(),
+                RateLimitDescriptor {
+                    entries: vec![entry("a", "b")],
+                    limit: Some(RateLimitOverride {
+                        requests_per_unit: 0,
+                        unit: 9,
+                        unit_multiplier: None,
+                    }),
+                    hits_addend: Some(0),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    limit: Some(RateLimitOverride::default()),
+                    ..Default::default()
+                },
+            ],
+            hits_addend: 7,
+        },
+    ];
+    let responses = sample_responses();
+    let mut lines = String::new();
+    for request in &requests {
+        lines += &format!("request {}\n", hex(&prost::Message::encode_to_vec(request)));
+    }
+    for response in &responses {
+        let encoded = hex(&prost::Message::encode_to_vec(response));
+        lines += &format!("response {encoded}\nstatuses {encoded}\n");
+    }
+    let mut oracle = std::process::Command::new(oracle_binary())
+        .arg("-prototext")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the oracle");
+    let mut stdin = oracle.stdin.take().unwrap();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
+    let output = oracle.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    let upstream: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut ours: Vec<String> = requests.iter().map(ratelimit::prototext::request).collect();
+    for response in &responses {
+        ours.push(ratelimit::prototext::response(response));
+        ours.push(ratelimit::prototext::statuses(&response.statuses));
+    }
+    assert_eq!(upstream.len(), ours.len());
+    for (ours, upstream) in ours.iter().zip(&upstream) {
+        assert_eq!(ours, upstream);
+    }
+    // `unit_multiplier`, unknown to upstream (its field number there), is an extension here.
+    let mut request = requests[1].clone();
+    request.descriptors[0]
+        .limit
+        .as_mut()
+        .unwrap()
+        .unit_multiplier = Some(3);
+    request.descriptors[2]
+        .limit
+        .as_mut()
+        .unwrap()
+        .unit_multiplier = Some(0);
+    let text = ratelimit::prototext::request(&request);
+    assert!(
+        text.contains("unit:MINUTE unit_multiplier:{value:3}}"),
+        "{text}"
+    );
+    assert!(text.contains("unit:9 unit_multiplier:{}}"), "{text}");
+}
+
+/// Responses with every field, enum numbers with no name, Duration and Timestamp fractions
+/// and ranges, bytes, numbers in the metadata, and what protojson refuses to write.
+fn sample_responses() -> Vec<RateLimitResponse> {
     use prost_types::{ListValue, Struct, Timestamp, Value, value::Kind};
     use ratelimit_proto::envoy::config::core::v3::HeaderValue;
     use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::{
@@ -5301,34 +5438,7 @@ fn json_responses_are_encoded_like_upstream() {
         responses.push(with_metadata(vec![("n", number(n))]));
     }
 
-    let mut oracle = std::process::Command::new(oracle_binary())
-        .arg("-protojson-marshal")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start the oracle");
-    let lines: String = responses
-        .iter()
-        .map(|response| format!("{}\n", hex(&prost::Message::encode_to_vec(response))))
-        .collect();
-    let mut stdin = oracle.stdin.take().unwrap();
-    let writer =
-        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, lines.as_bytes()));
-    let output = oracle.wait_with_output().unwrap();
-    writer.join().unwrap().unwrap();
-    let upstream: Vec<String> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(without_go_spaces)
-        .collect();
-    assert_eq!(upstream.len(), responses.len());
-    for (response, upstream) in responses.iter().zip(&upstream) {
-        let ours = match ratelimit::protojson::encode_response(response) {
-            Ok(json) => format!("ok {json}"),
-            Err(_) => "error".to_string(),
-        };
-        assert_eq!(&ours, upstream, "{response:?}");
-    }
+    responses
 }
 
 /// `text` without the spaces Go's protojson may put after commas, outside strings.
