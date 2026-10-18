@@ -6024,13 +6024,15 @@ async fn server_stats_are_reported_like_upstream() {
                     })
                     .map(String::from)
                     .collect();
-                // 6 calls counted, and 6 timed.
+                // 6 calls counted, and 6 timed; the rate limit's counters, which can come in
+                // a later flush, too.
                 let total: f64 = lines
                     .iter()
                     .filter(|l| !l.starts_with('#'))
                     .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
                     .sum();
-                if total >= 12.0 || std::time::Instant::now() > deadline {
+                let over_limit = lines.iter().any(|l| l.contains("over_limit"));
+                if (total >= 12.0 && over_limit) || std::time::Instant::now() > deadline {
                     break lines;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
