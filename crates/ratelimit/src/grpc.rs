@@ -29,7 +29,13 @@ impl<C: RateLimitCache> rate_limit_service_server::RateLimitService for GrpcServ
         request: Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, Status> {
         // Upstream returns plain Go errors, which grpc-go sends as UNKNOWN with the error text.
-        let call = self.service.should_rate_limit(request.get_ref());
+        // The server span is the parent of the request's spans.
+        let parent = request
+            .extensions()
+            .get::<crate::trace::SpanContext>()
+            .cloned();
+        let call =
+            crate::trace::with_parent(parent, self.service.should_rate_limit(request.get_ref()));
         self.stats
             .record("ShouldRateLimit", call)
             .await

@@ -76,6 +76,19 @@ async fn json<C: RateLimitCache>(
         Ok(response) => response,
         Err(error) => return bad_request(error.to_string()),
     };
+    // A trace of its own: `/json` passes no context on.
+    let _span = crate::trace::start(
+        crate::trace::SERVER,
+        "NewJsonHandler Remaining Execution",
+        crate::trace::Kind::Internal,
+        None,
+        || {
+            vec![(
+                "response".into(),
+                crate::trace::Value::Str(crate::prototext::response(&response)),
+            )]
+        },
+    );
     crate::debug!("resp:{}", crate::prototext::response(&response));
     let body = match crate::protojson::encode_response(&response) {
         Ok(body) => body,

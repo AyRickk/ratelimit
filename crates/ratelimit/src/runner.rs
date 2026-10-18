@@ -169,11 +169,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
 
     // Run: the signals, then tracing.
     let signals = signals()?;
-    crate::settings::refuse_unsupported(&[
-        (settings.tracing_enabled, "TRACING_ENABLED"),
-        (settings.grpc_server_use_tls, "GRPC_SERVER_USE_TLS"),
-    ])?;
-    log::info("Tracing disabled");
+    crate::settings::refuse_unsupported(&[(settings.grpc_server_use_tls, "GRPC_SERVER_USE_TLS")])?;
+    if settings.tracing_enabled {
+        crate::trace::init(&crate::trace::Settings {
+            protocol: settings.tracing_exporter_protocol.clone(),
+            service_name: settings.tracing_service_name.clone(),
+            service_namespace: settings.tracing_service_namespace.clone(),
+            service_instance_id: settings.tracing_service_instance_id.clone(),
+            sampling_rate: settings.tracing_sampling_rate,
+        })?;
+    } else {
+        log::info("Tracing disabled");
+    }
 
     // NewServer: the config provider, the health checker (SIGTERM makes it fail).
     let loader = match settings.config_type.as_str() {
@@ -309,7 +316,10 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     if !grace.is_zero() {
         builder = builder.max_connection_age_grace(grace);
     }
+    // otelgrpc's handler, on every service.
+    let uds = (!settings.grpc_uds.is_empty()).then(|| settings.grpc_uds.clone());
     let server = builder
+        .layer(crate::trace::grpc::Layer::new(uds))
         .add_service(health_service.server())
         .add_service(grpc::server(service.clone(), server_stats));
     // handleGracefulShutdown: on a signal, the server stops.
@@ -396,6 +406,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         let _ = debug.await;
     }
     let _ = http.await;
+    crate::trace::shutdown().await;
     served.map_err(Failure::from)
 }
 

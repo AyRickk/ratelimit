@@ -144,14 +144,14 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `QUOTA_MODE` | `false` | ✅ | `tests/service.rs`, `tests/differential.rs`; read by the binary: `tests/settings.rs` |
 | `RESPONSE_DYNAMIC_METADATA` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `MERGE_DOMAIN_CONFIG` | `false` | ✅ | `tests/config.rs`; read by the binary: `tests/settings.rs` |
-| `TRACING_ENABLED` | `false` | ⬜ | |
-| `TRACING_SERVICE_NAME` | `RateLimit` | ⬜ | |
-| `TRACING_SERVICE_NAMESPACE` | — | ⬜ | |
-| `TRACING_SERVICE_INSTANCE_ID` | — | ⬜ | |
-| `TRACING_EXPORTER_PROTOCOL` | `http` | ⬜ | |
-| `TRACING_SAMPLING_RATE` | `1` | ⬜ | |
+| `TRACING_ENABLED` | `false` | ✅ | `traces_are_exported_like_upstream`; `Tracing disabled` otherwise |
+| `TRACING_SERVICE_NAME` | `RateLimit` | ✅ | `traces_are_exported_like_upstream` (over `OTEL_SERVICE_NAME`) |
+| `TRACING_SERVICE_NAMESPACE` | — | ✅ | `traces_are_exported_like_upstream` |
+| `TRACING_SERVICE_INSTANCE_ID` | — | ✅ | `traces_are_exported_like_upstream`; a random version 4 UUID by default: `trace/mod.rs` unit test |
+| `TRACING_EXPORTER_PROTOCOL` | `http` | ✅ | `traces_are_exported_like_upstream`; an unknown one is fatal: `the_binary_fails_to_start_like_upstream` |
+| `TRACING_SAMPLING_RATE` | `1` | ✅ | `traces_are_exported_like_upstream` (1, 0); the ratio's bound: `trace/mod.rs` unit test |
 | `GRPC_SERVER_TLS_CA_CERT` | (injected by Envoy Gateway, read by no upstream code) | — ignored, as upstream | |
-| `OTEL_EXPORTER_OTLP_*` | (read by the OpenTelemetry SDK) | ⬜ | |
+| `OTEL_EXPORTER_OTLP_*` | (read by the OpenTelemetry SDK) | ✅ | `ENDPOINT`, `HEADERS`, `COMPRESSION`, `CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`: `traces_are_exported_like_upstream`; their `TRACES_` forms, `INSECURE`, `TIMEOUT`, URL and header parsing: `trace/export.rs` unit tests |
 
 ## 2. YAML configuration
 
@@ -230,7 +230,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | logrus' text (and terminal) and JSON (`@timestamp`, `@message`) formats, in Go's local time zone; the info, warning, error and fatal lines of the features ported (runner, sinks, runtime directory, Redis startup and pool, config, listeners, `/json`, local cache) | ✅ | `tests/differential.rs` (`logs_are_written_like_upstream`, `redis_startup_is_logged_like_upstream`, `a_late_redis_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`), `log.rs` unit tests |
 | Debug lines (`LOG_LEVEL=debug`), best effort (D3): config loading, each lookup, the cache and local cache, requests, statuses and responses as Go's `%+v` (prototext), errors, `/json`, the runtime and config update loops, health, Prometheus flushes. Today they match upstream's; they may change for the extensions | ✅ | `tests/differential.rs` (`debug_lines_are_written_like_upstream`, `prometheus_flushes_are_logged_like_upstream`, `messages_are_printed_like_upstream`) |
-| OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
+| OTLP traces, over gRPC or HTTP (gzip, TLS, client certificates): the resource (semconv 1.7 schema, `service.*`, `OTEL_RESOURCE_ATTRIBUTES`); otelgrpc 0.70's server span on every gRPC method (semconv 1.43 attributes, `OTEL_SEMCONV_STABILITY_OPT_IN` `rpc/old` and `rpc/dup`, status code and error status, flags); `ShouldRateLimit Execution` and `Redis Pipeline Execution` beside it; `/json`'s three root spans with `NewJsonHandler Remaining Execution`; W3C TraceContext (with `tracestate`) and B3 (single and multiple, winning, deferred not sampled) extraction; `ParentBased(TraceIDRatioBased)` sampling; the batch processor (`OTEL_BSP_*`) and the shutdown flush | ✅ | `traces_are_exported_like_upstream` in `tests/differential.rs`; parsing: unit tests in `trace/propagation.rs`, `trace/export.rs`, `trace/grpc.rs` |
 
 ## 6. Image and deployment
 
@@ -316,4 +316,12 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `share_threshold enabled for entry index …` lines come in Go's random map order | by entry index | deterministic |
 | The config files usually load while Redis is still being connected to (the provider starts with the server, before the limiter): their debug lines come before Redis's health line and `Waiting for initial ratelimit config update event` | Redis first, then the config | the order of two independent startup steps |
 | The config update loop and the runtime provider are separate goroutines: their debug lines (`Waiting for config update event`, `waiting for runtime update`, the reload's lines) interleave in a racy order | the provider's thread runs the update, then waits | one of upstream's orders |
+| Span attributes holding a message (`request string`, `response`) have one space between fields or two, depending on the build (prototext's `detrand`) | always one | Go randomises it on purpose |
+| A span's start and end follow Go's code paths (the Redis span also covers building the statuses) | the same points of ours, so durations differ slightly | different code; names, parents and attributes are the same |
+| A failed export is retried with backoff (429, 502, 503, 504, gRPC's retryable codes) for up to a minute | not retried: the batch is dropped | best effort (D3); the next batches go out as usual |
+| Export errors are written by Go's standard logger with OTel's texts | the same logger format, this exporter's texts | best effort (D3) |
+| The exporter's `User-Agent` is `OTel OTLP Exporter Go/1.45.0` (and grpc-go's) | `ratelimit/<version>` (and tonic's) | it names the software that sends |
+| The HTTP exporter honours `HTTPS_PROXY`/`HTTP_PROXY` and negotiates HTTP/2 over TLS | no proxy; HTTP/1.1 | best effort (D3) |
+| Baggage is extracted and the propagators can inject | neither | nothing reads baggage and the service makes no traced call |
+| Memcached's `Memcached Fetch Execution` span and the CLI client's tracing | not yet | with Memcached and the client |
 | On what upstream panics on (D1), the debug lines it writes before the panic (the cache's, for a client limit with an unknown unit) | the request stops at its check, after `caught error during call: <error>` | D1 |

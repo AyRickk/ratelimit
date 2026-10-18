@@ -307,6 +307,25 @@ impl RateLimitCache for RedisCache {
                 });
             }
         }
+        // Until the statuses are built.
+        let _span = crate::trace::start(
+            crate::trace::REDIS,
+            "Redis Pipeline Execution",
+            crate::trace::Kind::Internal,
+            crate::trace::parent().as_ref(),
+            || {
+                vec![
+                    (
+                        "pipeline length".into(),
+                        crate::trace::Value::Int(commands.len() as i64),
+                    ),
+                    (
+                        "perSecondPipeline length".into(),
+                        crate::trace::Value::Int(0),
+                    ),
+                ]
+            },
+        );
         let mut counts = vec![Count::After(0); limits.len()];
         if !commands.is_empty() {
             let replies = send(self.pool.next(), &commands).await?;
