@@ -14,7 +14,7 @@ pub mod mux;
 pub mod net;
 pub mod protojson;
 pub mod prototext;
-pub mod random;
+pub(crate) mod random;
 pub mod redis;
 pub mod runner;
 pub mod runtime;

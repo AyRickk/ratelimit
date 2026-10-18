@@ -29,7 +29,8 @@ pub fn fill(out: &mut [u8]) {
     }
 }
 
-/// A random number in `[0, n)` (`n` > 0), as `rand.Int63n` draws one.
+/// A random number in `[0, n)`, by modulo (slightly biased, unlike `rand.Int63n`'s
+/// rejection): `n` must not be 0.
 pub fn below(n: u64) -> u64 {
     let mut bytes = [0u8; 8];
     fill(&mut bytes);

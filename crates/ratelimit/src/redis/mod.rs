@@ -294,7 +294,8 @@ impl RateLimitCache for RedisCache {
             let mut expiration = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
             let jitter = self.settings.expiration_jitter_max_seconds;
             if jitter > 0 {
-                expiration += crate::random::below(jitter as u64) as i64;
+                // Go's int64 addition wraps.
+                expiration = expiration.wrapping_add(crate::random::below(jitter as u64) as i64);
             }
             let expiration = expiration.to_string();
             reply_of.push((c.index, commands.len()));

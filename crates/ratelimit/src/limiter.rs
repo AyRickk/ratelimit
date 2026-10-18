@@ -32,7 +32,7 @@ impl Clock for SystemClock {
 /// `USE_CALENDAR_MONTH_RATE_LIMIT` for a month, the first of the UTC calendar month.
 pub(crate) fn window_start(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
     if calendar && unit == Unit::Month {
-        return Ok(month_start(now));
+        return month_start(now);
     }
     let window = unit_seconds(unit)?;
     Ok(now / window * window)
@@ -42,7 +42,7 @@ pub(crate) fn window_start(unit: Unit, now: i64, calendar: bool) -> Result<i64, 
 /// `USE_CALENDAR_MONTH_RATE_LIMIT` for a month, the seconds until the next month.
 pub(crate) fn expiration_seconds(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
     if calendar && unit == Unit::Month {
-        return Ok(next_month_start(now) - now);
+        return Ok(next_month_start(now)? - now);
     }
     unit_seconds(unit)
 }
@@ -50,39 +50,41 @@ pub(crate) fn expiration_seconds(unit: Unit, now: i64, calendar: bool) -> Result
 /// `CalculateReset`: the seconds until the window containing `now` ends.
 pub(crate) fn reset_seconds(unit: Unit, now: i64, calendar: bool) -> Result<i64, CacheError> {
     if calendar && unit == Unit::Month {
-        return Ok(next_month_start(now) - now);
+        return Ok(next_month_start(now)? - now);
     }
     let window = unit_seconds(unit)?;
     Ok(window - now % window)
 }
 
 /// The UTC calendar month of `now`: its year and month.
-fn utc_month(now: i64) -> (i16, i8) {
+fn utc_month(now: i64) -> Result<(i16, i8), CacheError> {
     let date = jiff::Timestamp::from_second(now)
-        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .map_err(|e| CacheError(format!("calendar month of {now}: {e}")))?
         .to_zoned(jiff::tz::TimeZone::UTC)
         .date();
-    (date.year(), date.month())
+    Ok((date.year(), date.month()))
 }
 
 /// `MonthStartUnix`: the first of `now`'s UTC month, at midnight.
-fn month_start(now: i64) -> i64 {
-    let (year, month) = utc_month(now);
+fn month_start(now: i64) -> Result<i64, CacheError> {
+    let (year, month) = utc_month(now)?;
     midnight(year, month)
 }
 
 /// The first of the month after `now`'s, at midnight UTC.
-fn next_month_start(now: i64) -> i64 {
-    match utc_month(now) {
+fn next_month_start(now: i64) -> Result<i64, CacheError> {
+    match utc_month(now)? {
         (year, 12) => midnight(year + 1, 1),
         (year, month) => midnight(year, month + 1),
     }
 }
 
-fn midnight(year: i16, month: i8) -> i64 {
-    jiff::civil::date(year, month, 1)
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .map_or(0, |z| z.timestamp().as_second())
+/// Midnight UTC on the first of a month (years beyond 9999 are not dates here).
+fn midnight(year: i16, month: i8) -> Result<i64, CacheError> {
+    jiff::civil::Date::new(year, month, 1)
+        .and_then(|date| date.to_zoned(jiff::tz::TimeZone::UTC))
+        .map(|z| z.timestamp().as_second())
+        .map_err(|e| CacheError(format!("calendar month {year}-{month}: {e}")))
 }
 
 /// The length of one `unit`, in seconds (a month is 30 days, a year 365).

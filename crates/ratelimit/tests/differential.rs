@@ -1368,9 +1368,9 @@ descriptors:
 }
 
 /// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month limit counts in the UTC calendar month (its
-/// key, its TTL, its reset, the local cache's TTL and the reset header), across short,
-/// leap and year-end months; off, a month is 30 days from the epoch. Other units are not
-/// affected.
+/// key, its TTL, its reset, refunds included, and the response's and request's reset
+/// headers), across short, leap and year-end months; off, a month is 30 days from the epoch.
+/// Other units are not affected.
 #[tokio::test]
 async fn calendar_months_are_counted_like_upstream() {
     if !tools_available() {
@@ -1393,6 +1393,11 @@ descriptors:
             },
             service: ServiceSettings {
                 response_headers: Some(LimitHeaders::default()),
+                request_headers: Some(LimitHeaders {
+                    limit: "X-Limit".into(),
+                    remaining: "X-Remaining".into(),
+                    reset: "X-Reset".into(),
+                }),
                 use_calendar_month: calendar,
                 ..Default::default()
             },
@@ -1413,6 +1418,9 @@ descriptors:
                     .await
                     .unwrap();
             }
+            h.call(refund(request("d", &[&[("monthly", "m")]]), 1))
+                .await
+                .unwrap();
         }
         h.assert_same_redis().await;
     }
@@ -6887,7 +6895,7 @@ async fn prometheus_flushes_are_logged_like_upstream() {
 }
 
 /// `EXPIRATION_JITTER_MAX_SECONDS`: each key's TTL is its window plus a random extra below
-/// the maximum, on both sides (the extras themselves are random); none at 0.
+/// the maximum, on both sides (the extras themselves are random), refunds' too; none at 0.
 #[tokio::test]
 async fn expirations_are_jittered_like_upstream() {
     if !tools_available() {
@@ -6926,10 +6934,16 @@ async fn expirations_are_jittered_like_upstream() {
                 ("DEBUG_PORT", reserved_port().to_string()),
             ];
             let users: Vec<String> = (0..20).map(|i| format!("u{i}")).collect();
-            let requests: Vec<RateLimitRequest> = users
+            // Each key counted then refunded: its TTL is the refund script's, jittered too.
+            let mut requests: Vec<RateLimitRequest> = users
                 .iter()
                 .map(|user| request("llm", &[&[("user", user)]]))
                 .collect();
+            requests.extend(
+                users
+                    .iter()
+                    .map(|user| refund(request("llm", &[&[("user", user)]]), 1)),
+            );
             requested_run(
                 &binary,
                 &environment,
