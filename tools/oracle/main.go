@@ -478,6 +478,7 @@ func main() {
 	grpcAddr := flag.String("grpc", "127.0.0.1:0", "gRPC listen address")
 	controlAddr := flag.String("control", "127.0.0.1:0", "control HTTP listen address")
 	redisURL := flag.String("redis", "127.0.0.1:6379", "Redis address")
+	perSecondURL := flag.String("redis-per-second", "", "REDIS_PERSECOND_URL: per-second limits in this Redis")
 	prefix := flag.String("cache-key-prefix", "", "CACHE_KEY_PREFIX")
 	localCacheSize := flag.Int("local-cache-size", 0, "LOCAL_CACHE_SIZE_IN_BYTES (0 disables the local cache)")
 	calendarMonth := flag.Bool("calendar-month", false, "USE_CALENDAR_MONTH_RATE_LIMIT for the cache")
@@ -569,6 +570,11 @@ func main() {
 
 	client := redis.NewClientImpl(ctx, store.Scope("redis"), false, "", "tcp", "SINGLE", *redisURL, 10,
 		0, 0, nil, false, nil, 10*time.Second, "", "", time.Second, time.Second, 10*time.Second, false)
+	var perSecondClient redis.Client
+	if *perSecondURL != "" {
+		perSecondClient = redis.NewClientImpl(ctx, store.Scope("redis_per_second"), false, "", "tcp", "SINGLE", *perSecondURL, 10,
+			0, 0, nil, false, nil, 10*time.Second, "", "", time.Second, time.Second, 10*time.Second, false)
+	}
 	// As in the upstream runner: no local cache unless a size is configured.
 	var localCache *freecache.Cache
 	if *localCacheSize > 0 {
@@ -576,7 +582,7 @@ func main() {
 		// same thing for a test, and keeps eviction (which compares access times) deterministic.
 		localCache = freecache.NewCacheCustomTimer(*localCacheSize, freecacheTimer{clk})
 	}
-	cache := redis.NewFixedRateLimitCacheImpl(client, nil, clk, rand.New(utils.NewLockedSource(1)), 0,
+	cache := redis.NewFixedRateLimitCacheImpl(client, perSecondClient, clk, rand.New(utils.NewLockedSource(1)), 0,
 		localCache, float32(*nearLimitRatio), *prefix, statsManager, *stopIncrement, *calendarMonth)
 
 	// Nothing is sent on it: PUT /config calls SetConfig directly. NewService needs a provider.

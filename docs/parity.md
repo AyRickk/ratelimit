@@ -101,15 +101,15 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_TLS_CLIENT_KEY` | — | ⬜ | |
 | `REDIS_TLS_CACERT` | — | ⬜ | |
 | `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
-| `REDIS_PIPELINE_WINDOW` | `0` | ⬜ | |
-| `REDIS_PIPELINE_LIMIT` | `0` | ⬜ | |
+| `REDIS_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream (radix v4's write buffering is cluster-only); `CLUSTER` is not supported yet |
+| `REDIS_PIPELINE_LIMIT` | `0` | ✅ | no effect; upstream's deprecation warning: `redis_startup_is_logged_like_upstream` |
 | `REDIS_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
-| `REDIS_PERSECOND` | `false` | ⬜ | |
-| `REDIS_PERSECOND_SOCKET_TYPE` | `unix` | ⬜ | |
-| `REDIS_PERSECOND_TYPE` | `SINGLE` | ⬜ | |
-| `REDIS_PERSECOND_URL` | `/var/run/nutcracker/ratelimitpersecond.sock` | ⬜ | |
-| `REDIS_PERSECOND_POOL_SIZE` | `10` | ⬜ | |
-| `REDIS_PERSECOND_AUTH` | — | ⬜ | |
+| `REDIS_PERSECOND` | `false` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream` |
+| `REDIS_PERSECOND_SOCKET_TYPE` | `unix` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
+| `REDIS_PERSECOND_TYPE` | `SINGLE` | 🚧 | `SINGLE`: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs`; `CLUSTER`, `SENTINEL` not supported yet |
+| `REDIS_PERSECOND_URL` | `/var/run/nutcracker/ratelimitpersecond.sock` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
+| `REDIS_PERSECOND_POOL_SIZE` | `10` | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
+| `REDIS_PERSECOND_AUTH` | — | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AUTH_FILE` | — | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_AUTH` | `false` | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_CACHE_NAME` | — | ⬜ | |
@@ -119,15 +119,15 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_TLS` | `false` | ⬜ | |
 | `REDIS_SENTINEL_AUTH` | — | ⬜ | |
 | `REDIS_PERSECOND_SENTINEL_AUTH` | — | ⬜ | |
-| `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ⬜ | |
-| `REDIS_PERSECOND_PIPELINE_LIMIT` | `0` | ⬜ | |
+| `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream; `CLUSTER` is not supported yet |
+| `REDIS_PERSECOND_PIPELINE_LIMIT` | `0` | ✅ | no effect; the warning, as the main pool's: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
 | `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | `false` | ✅ | `redis_connections_drive_health_like_upstream` in `tests/differential.rs` |
 | `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR` | `false` | ⬜ | |
 | `REDIS_TIMEOUT` | `10s` | ✅ | the connection timeout, as radix's dialer: `tests/runner.rs` |
-| `REDIS_PERSECOND_TIMEOUT` | `10s` | ⬜ | |
+| `REDIS_PERSECOND_TIMEOUT` | `10s` | ✅ | `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ✅ | `CREATE`/`ERROR` refused at startup: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream` |
-| `REDIS_PERSECOND_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ⬜ | |
+| `REDIS_PERSECOND_POOL_ON_EMPTY_BEHAVIOR` | `WAIT` | ✅ | `a_per_second_redis_starts_like_upstream` (its warning); `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_STARTUP_INITIAL_INTERVAL` | `1s` | ✅ | `tests/runner.rs` |
 | `REDIS_STARTUP_MAX_INTERVAL` | `30s` | ✅ | `tests/runner.rs` |
 | `REDIS_STARTUP_MAX_ELAPSED_TIME` | `0` | ✅ | `the_binary_fails_to_start_like_upstream` |

@@ -131,3 +131,81 @@ fn startup_retries_back_off_like_upstream() {
     };
     assert_eq!(inverted.duration(3), Duration::from_secs(1));
 }
+
+/// The per-second pool reads the `REDIS_PERSECOND_*` variables, with the same rules.
+#[test]
+fn the_per_second_pool_has_its_own_settings() {
+    let settings = |environment: &[(&str, &str)]| {
+        Settings::from_lookup(&|key| {
+            environment
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+        .unwrap()
+    };
+    let default = RedisConnection::per_second_from_settings(&settings(&[])).unwrap();
+    assert_eq!(
+        (default.network.as_str(), default.address.as_str()),
+        ("unix", "/var/run/nutcracker/ratelimitpersecond.sock")
+    );
+    let c = RedisConnection::per_second_from_settings(&settings(&[
+        ("REDIS_URL", "main:1"),
+        ("REDIS_POOL_SIZE", "7"),
+        ("REDIS_PERSECOND_SOCKET_TYPE", "tcp"),
+        ("REDIS_PERSECOND_URL", "redis://u:p@fast:2/3"),
+        ("REDIS_PERSECOND_POOL_SIZE", "0"),
+        ("REDIS_PERSECOND_AUTH", "secret"),
+        ("REDIS_PERSECOND_TIMEOUT", "2s"),
+        ("REDIS_PERSECOND_TYPE", "Single"),
+        ("REDIS_PERSECOND_POOL_ON_EMPTY_BEHAVIOR", "wait"),
+        ("REDIS_PERSECOND_PIPELINE_LIMIT", "4"),
+    ]))
+    .unwrap();
+    assert_eq!(
+        (c.network.as_str(), credentials(&c)),
+        ("tcp", ("fast:2", "u", "secret", "3"))
+    );
+    assert_eq!((c.pool_size, c.timeout), (4, Duration::from_secs(2)));
+    assert_eq!(
+        (
+            c.redis_type.as_str(),
+            c.pool_on_empty_behavior.as_str(),
+            c.pipeline_limit
+        ),
+        ("Single", "wait", 4)
+    );
+    assert_eq!(
+        RedisConnection::per_second_from_settings(&settings(&[(
+            "REDIS_PERSECOND_POOL_SIZE",
+            "-1"
+        )]))
+        .unwrap_err(),
+        "invalid REDIS_PERSECOND_POOL_SIZE -1"
+    );
+}
+
+/// The per-second pool's refusals name its own variables.
+#[test]
+fn per_second_errors_name_its_variables() {
+    let settings = Settings::from_lookup(&|key| match key {
+        "REDIS_PERSECOND_POOL_SIZE" => Some("-2".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(
+        RedisConnection::per_second_from_settings(&settings).unwrap_err(),
+        "invalid REDIS_PERSECOND_POOL_SIZE -2"
+    );
+    // TLS files are loaded for either pool upstream, whether the per-second one is on or not.
+    let tls = Settings::from_lookup(&|key| match key {
+        "REDIS_PERSECOND_TLS" => Some("true".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert!(
+        RedisConnection::from_settings(&tls)
+            .unwrap_err()
+            .contains("REDIS_PERSECOND_TLS")
+    );
+}
