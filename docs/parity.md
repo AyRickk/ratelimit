@@ -26,8 +26,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `GRPC_SERVER_TLS_KEY` | — | ⬜ | |
 | `GRPC_CLIENT_TLS_CACERT` | — | ⬜ | |
 | `GRPC_CLIENT_TLS_SAN` | — | ⬜ | |
-| `LOG_LEVEL` | `WARN` | 🚧 | an invalid value fails at startup like upstream (`the_binary_fails_to_start_like_upstream`); logging itself not yet |
-| `LOG_FORMAT` | `text` | ⬜ | |
+| `LOG_LEVEL` | `WARN` | ✅ | `tests/differential.rs` (`the_binary_fails_to_start_like_upstream`, `logs_are_written_like_upstream`), `log.rs` unit tests |
+| `LOG_FORMAT` | `text` | ✅ | `logs_are_written_like_upstream` in `tests/differential.rs` |
 | `CONFIG_TYPE` | `FILE` | 🚧 | `FILE`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `GRPC_XDS_SOTW` not supported yet |
 | `FORCE_START_WITHOUT_INITIAL_CONFIG` | `false` | ✅ | the service waits for the file provider's first load unless set (the end state is the same, as upstream) |
 | `CONFIG_GRPC_XDS_NODE_ID` | `default` | ⬜ | |
@@ -228,7 +228,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Prometheus summaries (observers not mapped to a histogram): statsd_exporter's quantiles and options, client_golang's age buckets and buffers, perks' CKMS estimates | ✅ | `summaries_reach_prometheus_like_upstream` and, with `EXTRA_TAGS`, `server_stats_are_reported_like_upstream` in `tests/differential.rs`; age buckets: unit tests in `stats/prometheus/summary.rs` |
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
-| `LOG_FORMAT=json` (`@timestamp`, `@message`) | ⬜ | |
+| logrus' text (and terminal) and JSON (`@timestamp`, `@message`) formats, in Go's local time zone; the info, warning, error and fatal lines of the features ported (runner, sinks, runtime directory, Redis startup and pool, config, listeners, `/json`, local cache) | ✅ | `tests/differential.rs` (`logs_are_written_like_upstream`, `redis_startup_is_logged_like_upstream`, `a_late_redis_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`), `log.rs` unit tests |
+| Debug lines (`LOG_LEVEL=debug`) | ⬜ | |
 | OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
 ## 6. Image and deployment
@@ -274,11 +275,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | U+2028 and U+2029 also break lines in YAML 1.1 (kept as characters in scalars) | characters only | the Rust parser is YAML 1.2; converting them would change scalars |
 | yaml.v2 reads only the first YAML document of a file: a control character or invalid byte after a later `---` (and beyond its 512-byte read-ahead) is not seen; and it decodes as it parses, so a syntax error before a bad byte further on is reported first | the whole file is checked first | rare inputs; the file is refused either way in the second case |
 | A snapshot's files are loaded in Go's random map order (which decides which error is reported, or the merge order) | in key order | one of upstream's orders, deterministic |
-| A startup failure is a logrus `level=fatal` line (exit status 1) or a Go panic with its stack trace (exit status 2) | the message alone on stderr, exit status 1 | the message is the same; the log format comes with `LOG_FORMAT` |
+| What upstream panics on at startup prints Go's panic and its stack trace, exit status 2 | a logrus `level=fatal` line with the panic's message, written whatever `LOG_LEVEL`, exit status 1 | D1: crashes are not reproduced; the stack trace has no equivalent |
 | radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |
-| Redis connection errors read as Go's `net` errors (`dial tcp 127.0.0.1:1: connect: connection refused`) | as fred's | different libraries; the messages around them are upstream's |
+| Redis connection errors read as Go's `net` errors | the startup dial's errors as Go's and radix's (`dial tcp 127.0.0.1:1: connect: connection refused`, `i/o timeout`, `response returned from Conn: <Redis' refusal of AUTH or SELECT>`); later ones (a failed reconnection, a command) as fred's; a name that does not resolve reads as the system resolver's error. Each startup attempt dials, authenticates and selects the database on a connection of its own, as radix's dial, before fred connects | different libraries; the messages around them are upstream's |
 | `GRPC_MAX_CONNECTION_AGE` gets ±10% of jitter (grpc-go) | applied as it is (tonic) | spreads reconnections only |
-| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info) | masked too | keeps secrets out of logs |
+| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info), and `Creating single with urls %v` prints `REDIS_URL` as given | masked too | keeps secrets out of logs |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
@@ -306,3 +307,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `/json` bodies over 2048 bytes are chunked (HTTP/1.1) or ended by closing the connection (HTTP/1.0), with no `Content-Length` | always a `Content-Length` | Different HTTP server; the bodies read alike |
 | `/json` answers with a space after every comma, or after none, depending on the build (protojson's `detrand`) | never | Go randomises it on purpose |
 | `/json` reads a body of any length | a body over 4 MiB (grpc-go's largest message) gets `400 Bad Request` | D1: an unbounded body can exhaust the memory and get the process killed |
+| `/json`'s `error: %s` warning names protojson's decoding error (`proto: (line 1:2): unknown field \"x\"`) or the body's read error | the Rust decoder's and hyper's texts | Only logged; every such request gets the same answer |
+| grpc-go's own logger writes what `GRPC_GO_LOG_SEVERITY_LEVEL` and `GRPC_GO_LOG_VERBOSITY_LEVEL` ask for | nothing | Nothing reaches it in a normal run at its default level (errors) |
+| A listener that fails for another reason than its bind names that system call | `bind` | Only the bind fails in practice |
+| A listener that fails names a host that is a name (`localhost`) by its resolved IP | the host as configured | Listen hosts are IPs or the wildcard in practice, which read as upstream's |

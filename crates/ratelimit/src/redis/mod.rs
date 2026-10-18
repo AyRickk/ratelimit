@@ -312,7 +312,9 @@ impl RateLimitCache for RedisCache {
                 && limiter::exceeds(c.limit, after)
             {
                 // Cached for a whole window, shadow rules included, as upstream.
-                cache.insert(&c.key, limiter::window_seconds(c.limit)?, now);
+                if !cache.insert(&c.key, limiter::window_seconds(c.limit)?, now) {
+                    crate::log::error(&format!("Failing to set local cache key: {}", c.key));
+                }
             }
         }
 

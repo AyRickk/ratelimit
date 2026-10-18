@@ -140,12 +140,17 @@ impl<C: RateLimitCache> RateLimitService<C> {
     /// `SetConfig`: uses a configuration that loaded; one that did not leaves the current one
     /// in place.
     pub fn update_config(&self, update: Result<RateLimitConfig, ConfigError>) {
-        let Ok(config) = update else {
-            self.stats.config_load_error().inc();
-            return;
+        let config = match update {
+            Ok(config) => config,
+            Err(e) => {
+                self.stats.config_load_error().inc();
+                crate::log::error(&format!("Error loading new configuration: {e}"));
+                return;
+            }
         };
         self.stats.config_load_success().inc();
         *self.config.write().unwrap() = Some(Arc::new(config));
+        crate::log::info("Successfully loaded new configuration");
     }
 
     pub async fn should_rate_limit(

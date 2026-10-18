@@ -732,3 +732,17 @@ pub fn json_string(bytes: &[u8]) -> String {
     out.push('"');
     out
 }
+
+/// A `syscall.Errno`'s text: glibc's with a lower-case first letter.
+pub fn errno_text(error: &std::io::Error) -> String {
+    let code = error.raw_os_error().unwrap_or(0);
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    let text = text
+        .strip_suffix(&format!(" (os error {code})"))
+        .unwrap_or(&text);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}

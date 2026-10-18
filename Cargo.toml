@@ -9,6 +9,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+jiff = "0.2"
 fred = { version = "10.1", default-features = false, features = ["i-keys", "i-scripts", "i-server", "unix-sockets"] }
 prost = "0.14"
 prost-types = "0.14"

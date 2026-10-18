@@ -65,3 +65,15 @@ pub fn join_host_port(host: &str, port: i64) -> String {
 fn libc_eafnosupport() -> i32 {
     if cfg!(target_os = "linux") { 97 } else { 47 }
 }
+
+/// Go's `*net.OpError` for a listener that could not bind: `listen <network> <address>: bind:
+/// <errno>`; other errors (an address that does not parse) keep their text.
+pub fn listen_error(network: &str, address: &str, error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(_) => format!(
+            "listen {network} {address}: bind: {}",
+            crate::go::errno_text(error)
+        ),
+        None => error.to_string(),
+    }
+}

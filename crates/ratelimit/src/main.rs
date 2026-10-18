@@ -8,12 +8,12 @@ fn environment(key: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
+    ratelimit::log::init();
     let result = match Settings::from_lookup(&environment) {
         Ok(settings) => ratelimit::runner::run(settings, &environment).await,
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.to_string().into()),
     };
-    if let Err(e) = result {
-        eprintln!("{}", e.trim_end());
-        std::process::exit(1);
+    if let Err(failure) = result {
+        failure.exit();
     }
 }

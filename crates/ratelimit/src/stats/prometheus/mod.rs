@@ -163,7 +163,9 @@ impl PrometheusSink {
         };
         let addr = addr.to_string();
         let server = sink.clone();
+        let starting = format!("Starting prometheus sink on {addr}{path}");
         tokio::spawn(async move {
+            crate::log::info(&starting);
             if let Ok(listener) = crate::net::listen(&addr, false).await {
                 server.serve(listener).await;
             }
