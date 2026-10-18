@@ -413,7 +413,12 @@ impl FileProvider {
                 update(config::load_bytes(&files, &options));
             };
             send_event();
-            while refreshed.recv().is_ok() {
+            loop {
+                crate::debug!("waiting for runtime update");
+                if refreshed.recv().is_err() {
+                    break;
+                }
+                crate::debug!("got runtime update and reloading config");
                 send_event();
             }
         });

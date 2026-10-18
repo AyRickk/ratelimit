@@ -375,7 +375,15 @@ impl DogStatsdSink {
             Some((short, tags)) => (
                 short.to_string(),
                 tags.split(".__")
-                    .filter_map(|pair| pair.split_once('='))
+                    .filter_map(|pair| {
+                        let tag = pair.split_once('=');
+                        if tag.is_none() {
+                            crate::debug!(
+                                "godogstats sink found malformed extra tag: {pair}, string: {name}"
+                            );
+                        }
+                        tag
+                    })
                     .map(|(key, value)| format!("{key}:{value}"))
                     .collect(),
             ),

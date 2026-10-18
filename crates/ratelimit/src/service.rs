@@ -155,7 +155,15 @@ impl<C: RateLimitCache> RateLimitService<C> {
         &self,
         request: &RateLimitRequest,
     ) -> Result<RateLimitResponse, ServiceError> {
+        crate::debug!("ShouldRateLimit: {}", crate::prototext::request(request));
         let response = self.decide(request).await;
+        match &response {
+            Ok(response) => crate::debug!(
+                "returning normal response: {}",
+                crate::prototext::response(response)
+            ),
+            Err(error) => crate::debug!("caught error during call: {error}"),
+        }
         match &response {
             Err(ServiceError::Service(_)) => self.stats.service_error().inc(),
             Err(ServiceError::Cache(_)) => self.stats.redis_error().inc(),
@@ -194,6 +202,10 @@ impl<C: RateLimitCache> RateLimitService<C> {
             })
             .collect();
         let mut statuses = self.cache.do_limit(request, &limits).await?;
+        crate::debug!(
+            "descriptor statuses: {}",
+            crate::prototext::statuses(&statuses)
+        );
         if statuses.len() != checks.len() {
             // Upstream asserts here and crashes; this is a backend bug, reported as such.
             return Err(CacheError(format!(
@@ -502,8 +514,31 @@ fn descriptor_checks(
     let mut checks: Vec<Check> = request
         .descriptors
         .iter()
-        .map(
-            |descriptor| match config.get_limit(&request.domain, descriptor) {
+        .map(|descriptor| {
+            crate::debug!(
+                "got descriptor: {}",
+                descriptor
+                    .entries
+                    .iter()
+                    .map(|e| format!("({}={})", e.key, e.value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let lookup = config.get_limit(&request.domain, descriptor);
+            match &lookup {
+                LimitLookup::Limit(limit) if limit.unlimited => {
+                    crate::debug!("descriptor is unlimited, not passing to the cache")
+                }
+                LimitLookup::Limit(limit) => crate::debug!(
+                    "applying limit: {} requests per {}, shadow_mode: {}, quota: {}",
+                    limit.limit.requests_per_unit,
+                    crate::config::unit_name(limit.limit.unit),
+                    limit.shadow_mode,
+                    limit.quota_mode
+                ),
+                _ => crate::debug!("descriptor does not match any limit, no limits applied"),
+            }
+            match lookup {
                 LimitLookup::Limit(limit) => {
                     replaced.extend(limit.replaces.iter().cloned());
                     if limit.unlimited {
@@ -518,8 +553,8 @@ fn descriptor_checks(
                     Check::Limit(None)
                 }
                 LimitLookup::NoLimit => Check::Limit(None),
-            },
-        )
+            }
+        })
         .collect();
     for check in &mut checks {
         if let Check::Limit(limit) = check
@@ -527,6 +562,7 @@ fn descriptor_checks(
                 .as_ref()
                 .is_some_and(|l| !l.name.is_empty() && replaced.contains(&l.name))
         {
+            crate::debug!("replacing {}", limit.as_ref().unwrap().name);
             *limit = None;
         }
     }

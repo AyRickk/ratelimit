@@ -6590,6 +6590,333 @@ async fn logs_are_written_like_upstream() {
     }
 }
 
+/// With `LOG_LEVEL=debug`, upstream's debug lines: the configs loaded (a domain patched),
+/// each request's lookup (exact, default, wildcard with share_threshold, detailed, value_to_metric,
+/// unlimited, replaced, shadow, override, unknown domain, no match, too deep), the cache and the
+/// local cache, statuses and responses as `%+v`, errors, `/json`. Times, cache key windows and
+/// resets are masked; lines upstream writes from other goroutines, in a racy order, are compared
+/// as a set.
+#[tokio::test]
+async fn debug_lines_are_written_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    const DEBUG_CONFIG: &[u8] = b"domain: dbg
+descriptors:
+  - key: k1
+    rate_limit: {unit: minute, requests_per_unit: 2}
+  - key: k2
+    value: v2
+    detailed_metric: true
+    rate_limit: {unit: hour, requests_per_unit: 5, name: named}
+    descriptors:
+      - key: inner
+        rate_limit: {unit: second, requests_per_unit: 100}
+  - key: wild
+    value: pre*
+    share_threshold: true
+    detailed_metric: true
+    rate_limit: {unit: day, requests_per_unit: 3}
+  - key: vtm
+    value_to_metric: true
+    rate_limit: {unit: minute, requests_per_unit: 10}
+  - key: free
+    rate_limit: {unlimited: true}
+  - key: rep
+    rate_limit:
+      unit: minute
+      requests_per_unit: 1
+      replaces: [{name: named}]
+  - key: shadow
+    shadow_mode: true
+    rate_limit: {unit: minute, requests_per_unit: 1}
+";
+    const PATCH_CONFIG: &[u8] =
+        b"domain: dbg\ndescriptors:\n  - key: extra\n    rate_limit: {unit: second, requests_per_unit: 1}\n";
+    let runtime = temp_dir("debug-logs");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/a.yaml", DEBUG_CONFIG),
+            ("v1/ratelimit/config/b.yaml", PATCH_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let requests = vec![
+        request("dbg", &[&[("k1", "a")]]),
+        request("dbg", &[&[("k1", "a")]]),
+        request("dbg", &[&[("k1", "a")]]),
+        request("dbg", &[&[("k1", "a")]]),
+        request("dbg", &[&[("k2", "v2")], &[("k2", "v2"), ("inner", "x")]]),
+        request("dbg", &[&[("wild", "prefix1")]]),
+        request("dbg", &[&[("vtm", "val")]]),
+        request("dbg", &[&[("free", "x")], &[("rep", "1")], &[("k2", "v2")]]),
+        request("dbg", &[&[("shadow", "s")]]),
+        request("dbg", &[&[("shadow", "s")]]),
+        request("dbg", &[&[("shadow", "s")]]),
+        request("nope", &[&[("a", "b")]]),
+        request("dbg", &[&[("zzz", "1")], &[("k2", "v2"), ("inner", "x"), ("deep", "y")]]),
+        RateLimitRequest {
+            descriptors: vec![RateLimitDescriptor {
+                limit: Some(
+                    ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride {
+                        requests_per_unit: 7,
+                        unit: 1,
+                        unit_multiplier: None,
+                    },
+                ),
+                ..request("dbg", &[&[("o", "v")]]).descriptors[0].clone()
+            }],
+            ..request("dbg", &[])
+        },
+        request("", &[&[("a", "b")]]),
+    ];
+    let json = r#"{"domain":"dbg","descriptors":[{"entries":[{"key":"k1","value":"json"}]}]}"#;
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let redis = Redis::start().await;
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", redis.address.clone()),
+            ("MERGE_DOMAIN_CONFIG", "true".into()),
+            ("LOCAL_CACHE_SIZE_IN_BYTES", "1048576".into()),
+            ("DISABLE_STATS", "true".into()),
+            ("LOG_LEVEL", "debug".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        let stderr = requested_run(
+            &binary,
+            &environment,
+            (grpc, http),
+            &requests,
+            Some(json),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        runs.push(debug_lines(&stderr));
+    }
+    let (upstream, ours) = (&runs[0], &runs[1]);
+    assert!(upstream.0.len() > 50, "{:?}", upstream.0);
+    for (i, (u, o)) in upstream.0.iter().zip(&ours.0).enumerate() {
+        assert_eq!(o, u, "line {i}");
+    }
+    assert_eq!(
+        ours.0.len(),
+        upstream.0.len(),
+        "{:?}",
+        &ours.0[upstream.0.len().min(ours.0.len())..]
+    );
+    assert_eq!(ours.1, upstream.1);
+}
+
+/// With Prometheus and `LOG_LEVEL=debug`, each stat flushed is logged (`FlushCounter`,
+/// `FlushGauge`, `FlushTimer`): the same stats, values formatted like Go's (timers' values,
+/// which are timings, by their shape). Go's runtime stats are upstream's only.
+#[tokio::test]
+async fn prometheus_flushes_are_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("prometheus-debug");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let timer = regex::Regex::new(r"^FlushTimer: (\S+) (\S+)$").unwrap();
+    let go_float = regex::Regex::new(r"^\d+(\.\d+)?(e[-+]\d\d+)?$").unwrap();
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let redis = Redis::start().await;
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", redis.address.clone()),
+            ("USE_STATSD", "false".into()),
+            ("USE_PROMETHEUS", "true".into()),
+            ("PROMETHEUS_ADDR", format!("127.0.0.1:{}", reserved_port())),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+            ("LOG_LEVEL", "debug".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        let requests = vec![request("llm", &[&[("user", "a")]]); 3];
+        let stderr = requested_run(
+            &binary,
+            &environment,
+            (grpc, http),
+            &requests,
+            None,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        // Counters summed: a flush may split them.
+        let mut flushed = std::collections::BTreeSet::new();
+        let mut counters = std::collections::BTreeMap::<String, u64>::new();
+        for line in logrus_lines(&stderr, &[]) {
+            let Some(message) = line
+                .split_once("level=debug msg=\"")
+                .and_then(|(_, m)| m.strip_suffix('"'))
+            else {
+                continue;
+            };
+            if let Some(c) = timer.captures(message) {
+                assert!(go_float.is_match(&c[2]), "{message}");
+                flushed.insert(format!("FlushTimer: {}", &c[1]));
+            } else if message.contains(" ratelimit.go.") {
+            } else if let Some(counter) = message.strip_prefix("FlushCounter: ") {
+                let (name, value) = counter.rsplit_once(' ').unwrap();
+                *counters.entry(name.to_string()).or_default() += value.parse::<u64>().unwrap();
+            } else if message.starts_with("Flush") {
+                flushed.insert(message.to_string());
+            }
+        }
+        runs.push((flushed, counters));
+    }
+    assert!(
+        runs[0].0.iter().any(|l| l.starts_with("FlushTimer: ")),
+        "{:?}",
+        runs[0]
+    );
+    assert!(runs[0].1.len() > 3, "{:?}", runs[0]);
+    assert_eq!(runs[1], runs[0]);
+}
+
+/// The stderr of `binary` run with `environment`, serving gRPC and HTTP on `ports`: once it
+/// serves, each request in turn (errors ignored), then `json` on `/json` (answered with 200),
+/// then `linger`, then SIGTERM.
+async fn requested_run(
+    binary: &std::path::Path,
+    environment: &[(&str, String)],
+    (grpc, http): (u16, u16),
+    requests: &[RateLimitRequest],
+    json: Option<&str>,
+    linger: std::time::Duration,
+) -> String {
+    let child = Command::new(binary)
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the service");
+    let mut client = None;
+    for _ in 0..300 {
+        if let Ok(c) = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut client = client.expect("the service serves");
+    for request in requests {
+        let _ = client.should_rate_limit(request.clone()).await;
+    }
+    if let Some(json) = json {
+        let answer = send_raw(
+            &format!("127.0.0.1:{http}"),
+            &format!(
+                "POST /json HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            ),
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+    drop(client);
+    tokio::time::sleep(linger).await;
+    let pid = child.id().unwrap().to_string();
+    std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("the service stops")
+        .unwrap();
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The debug lines of `stderr` (time masked, Go's second space between message fields, cache
+/// key windows and resets masked): those written in request order, then the others sorted:
+/// the startup's (upstream loads the files in a random order, docs/parity.md §7) and those
+/// written from other goroutines.
+fn debug_lines(stderr: &str) -> (Vec<String>, Vec<String>) {
+    let window = regex::Regex::new(r"_\d{10}\b").unwrap();
+    let reset = regex::Regex::new(r"duration_until_reset:\{seconds:\d+\}").unwrap();
+    let racy = [
+        "msg=\"waiting for runtime update\"",
+        "msg=\"Waiting for config update event\"",
+        "msg=\"Setting config retrieved from config provider\"",
+        "msg=\"Health status of components",
+        "msg=\"got runtime update",
+    ];
+    let (mut ordered, mut others) = (Vec::new(), Vec::new());
+    for line in stderr.lines().filter(|l| l.contains(" level=debug ")) {
+        let line = line.split_once(" level=").map_or(line, |(_, rest)| rest);
+        let line = window.replace_all(line, "_WINDOW");
+        let line = reset.replace_all(&line, "duration_until_reset:{seconds:S}");
+        let line = without_text_spaces(&line);
+        let started = !ordered.is_empty() || line.contains("msg=\"ShouldRateLimit: ");
+        match !started || racy.iter().any(|r| line.contains(r)) {
+            true => others.push(line),
+            false => ordered.push(line),
+        }
+    }
+    others.sort();
+    (ordered, others)
+}
+
+/// `text` with the second space Go's prototext may put between fields left out, outside
+/// strings (logrus quotes the message, so its own quotes are escaped).
+fn without_text_spaces(text: &str) -> String {
+    let (mut out, mut in_string, mut escaped) = (String::new(), false, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_string && c == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        out.push(c);
+        // Inside logrus' quoted message a string of the message is `\"…\"`.
+        if c == '\\' && chars.peek() == Some(&'"') && !escaped {
+            out.push(chars.next().unwrap());
+            in_string = !in_string;
+            continue;
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    out
+}
+
 /// Upstream's Redis startup lines: the pool, the authentication, each failed connection
 /// (unreachable, or refused by Redis: AUTH, the database), each retry (its wait and elapsed
 /// time masked: they are random), then the fatal line once it gives up.

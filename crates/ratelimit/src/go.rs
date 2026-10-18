@@ -51,8 +51,8 @@ pub fn to_upper(s: &str) -> String {
         .collect()
 }
 
-/// `strconv.FormatFloat(v, 'g', -1, 64)`: the shortest digits, in exponent form below 1e-4
-/// and from 1e6 (`1e+06`); `+Inf`, `-Inf`, `NaN`.
+/// `strconv.FormatFloat(v, 'g', -1, 64)`, which is also `fmt`'s `%v`: the shortest digits,
+/// in exponent form below 1e-4 and from 1e6 (`1e+06`); `+Inf`, `-Inf`, `NaN`.
 pub fn format_float(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();

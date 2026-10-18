@@ -188,14 +188,17 @@ impl PrometheusSink {
     }
 
     pub fn flush_counter(&self, name: &str, value: u64) {
+        crate::debug!("FlushCounter: {name} {value}");
         self.handle(name, Event::Counter(value as f64));
     }
 
     pub fn flush_gauge(&self, name: &str, value: u64) {
+        crate::debug!("FlushGauge: {name} {value}");
         self.handle(name, Event::Gauge(value as f64));
     }
 
     pub fn flush_timer(&self, name: &str, value: f64) {
+        crate::debug!("FlushTimer: {name} {}", crate::go::format_float(value));
         self.handle(name, Event::Observer(value));
     }
 

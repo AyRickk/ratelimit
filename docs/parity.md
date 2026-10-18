@@ -229,7 +229,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `SanitizeStatName` | ✅ | `tests/differential.rs` |
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | logrus' text (and terminal) and JSON (`@timestamp`, `@message`) formats, in Go's local time zone; the info, warning, error and fatal lines of the features ported (runner, sinks, runtime directory, Redis startup and pool, config, listeners, `/json`, local cache) | ✅ | `tests/differential.rs` (`logs_are_written_like_upstream`, `redis_startup_is_logged_like_upstream`, `a_late_redis_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`), `log.rs` unit tests |
-| Debug lines (`LOG_LEVEL=debug`) | ⬜ | |
+| Debug lines (`LOG_LEVEL=debug`): config loading, each lookup, the cache and local cache, requests, statuses and responses as Go's `%+v` (prototext), errors, `/json`, the runtime and config update loops, health, Prometheus flushes | ✅ | `tests/differential.rs` (`debug_lines_are_written_like_upstream`, `prometheus_flushes_are_logged_like_upstream`, `messages_are_printed_like_upstream`) |
 | OTLP traces: spans `ShouldRateLimit Execution`, `Redis Pipeline Execution` and their attributes | ⬜ | |
 
 ## 6. Image and deployment
@@ -311,3 +311,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | grpc-go's own logger writes what `GRPC_GO_LOG_SEVERITY_LEVEL` and `GRPC_GO_LOG_VERBOSITY_LEVEL` ask for | nothing | Nothing reaches it in a normal run at its default level (errors) |
 | A listener that fails for another reason than its bind names that system call | `bind` | Only the bind fails in practice |
 | A listener that fails names a host that is a name (`localhost`) by its resolved IP | the host as configured | Listen hosts are IPs or the wildcard in practice, which read as upstream's |
+| Debug lines print messages (`%+v`) with one space between fields or two, depending on the build (prototext's `detrand`) | always one | Go randomises it on purpose |
+| Debug lines print a request's fields unknown to upstream's protos by number (`3:"\x08\x03"` for a limit's `unit_multiplier`) | known fields of the current Envoy proto by name (`unit_multiplier:{value:3}`); other unknown fields are dropped | `unit_multiplier` is an extension; prost keeps no unknown fields |
+| `share_threshold enabled for entry index …` lines come in Go's random map order | by entry index | deterministic |
+| The config update loop and the runtime provider are separate goroutines: their debug lines (`Waiting for config update event`, `waiting for runtime update`, the reload's lines) interleave in a racy order | the provider's thread runs the update, then waits | one of upstream's orders |
+| On what upstream panics on (D1), the debug lines it writes before the panic (the cache's, for a client limit with an unknown unit) | the request stops at its check, after `caught error during call: <error>` | D1 |
