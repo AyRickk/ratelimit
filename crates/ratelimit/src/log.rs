@@ -123,6 +123,15 @@ pub fn panic_exit(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// What Go's standard logger writes (`log.Print`): the local date and time, then the
+/// message, on stderr whatever the level.
+pub fn stdlib(message: &str) {
+    let now = jiff::Timestamp::now().to_zoned(LOCAL.clone());
+    let line = format!("{} {message}\n", now.strftime("%Y/%m/%d %H:%M:%S"));
+    let _guard = OUTPUT.lock().unwrap();
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 /// A line at `level`, if enabled.
 pub fn log(level: Level, message: &str) {
     if enabled(level) {

@@ -4096,6 +4096,7 @@ async fn the_binary_fails_to_start_like_upstream() {
     let redis = Redis::start().await;
     let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let busy_port = busy.local_addr().unwrap().port().to_string();
+    let ca = pki(&runtime.join("pki")).ca.to_string_lossy().into_owned();
     let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
         (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
         (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
@@ -4104,6 +4105,9 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("CONFIG_TYPE", "bogus".into())], "Invalid setting for ConfigType: bogus".into()),
         (vec![("RUNTIME_WATCH_ROOT", "false".into()), ("RUNTIME_APPDIRECTORY", "missing".into())], format!("unable to watch file ({}/ratelimit/missing)", runtime.join("current").display())),
         (vec![("BACKEND_TYPE", "bogus".into())], "Invalid setting for BackendType: bogus".into()),
+        (vec![("TRACING_ENABLED", "true".into()), ("TRACING_EXPORTER_PROTOCOL", "bogus".into())], "Invalid otlptrace client protocol: bogus".into()),
+        // An HTTP exporter given a CA for an insecure endpoint.
+        (vec![("TRACING_ENABLED", "true".into()), ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1".into()), ("OTEL_EXPORTER_OTLP_CERTIFICATE", ca.clone())], "creating OTLP trace exporter: insecure HTTP endpoint cannot use TLS client configuration".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
@@ -6020,13 +6024,15 @@ async fn server_stats_are_reported_like_upstream() {
                     })
                     .map(String::from)
                     .collect();
-                // 6 calls counted, and 6 timed.
+                // 6 calls counted, and 6 timed; the rate limit's counters, which can come in
+                // a later flush, too.
                 let total: f64 = lines
                     .iter()
                     .filter(|l| !l.starts_with('#'))
                     .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
                     .sum();
-                if total >= 12.0 || std::time::Instant::now() > deadline {
+                let over_limit = lines.iter().any(|l| l.contains("over_limit"));
+                if (total >= 12.0 && over_limit) || std::time::Instant::now() > deadline {
                     break lines;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -7146,4 +7152,546 @@ async fn late_redis_runs(runtime: &std::path::Path, waits: &regex::Regex) -> Vec
         runs.push(lines);
     }
     runs
+}
+
+/// What a fake OTLP collector received: each export's spans and the HTTP or gRPC headers
+/// that came with it.
+#[derive(Default)]
+struct Collected {
+    requests:
+        Vec<ratelimit_proto::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest>,
+    headers: Vec<(String, String)>,
+    paths: Vec<String>,
+}
+
+/// A certificate authority, a server certificate for 127.0.0.1 and a client certificate it
+/// issued, as PEM files in `dir`.
+struct Pki {
+    ca: PathBuf,
+    server: (String, String),
+    client_cert: PathBuf,
+    client_key: PathBuf,
+}
+
+fn pki(dir: &std::path::Path) -> Pki {
+    use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
+    let issue = |name: &str, purpose| {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.extended_key_usages = vec![purpose];
+        let cert = params.signed_by(&key, &ca).unwrap();
+        (cert.pem(), key.serialize_pem())
+    };
+    let server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth);
+    let (client_cert, client_key) = issue("client", ExtendedKeyUsagePurpose::ClientAuth);
+    std::fs::create_dir_all(dir).unwrap();
+    let write = |name: &str, pem: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, pem).unwrap();
+        path
+    };
+    Pki {
+        ca: write("ca.pem", &ca.pem()),
+        server,
+        client_cert: write("client.pem", &client_cert),
+        client_key: write("client-key.pem", &client_key),
+    }
+}
+
+/// A fake OTLP collector on `port`: gRPC's `TraceService/Export` (gzip accepted), or HTTP's
+/// `POST /v1/traces` with a protobuf body (gzipped or not); over TLS with `pki`, requiring a
+/// client certificate it issued.
+async fn otlp_collector(
+    port: u16,
+    grpc: bool,
+    pki: Option<&Pki>,
+) -> Arc<std::sync::Mutex<Collected>> {
+    use ratelimit_proto::opentelemetry::proto::collector::trace::v1::{
+        ExportTraceServiceRequest, ExportTraceServiceResponse,
+        trace_service_server::{TraceService, TraceServiceServer},
+    };
+    let collected = Arc::new(std::sync::Mutex::new(Collected::default()));
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    if grpc {
+        struct Collector(Arc<std::sync::Mutex<Collected>>);
+        #[tonic::async_trait]
+        impl TraceService for Collector {
+            async fn export(
+                &self,
+                request: tonic::Request<ExportTraceServiceRequest>,
+            ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+                let mut collected = self.0.lock().unwrap();
+                for (key, value) in request.metadata().clone().into_headers() {
+                    if let (Some(key), Ok(value)) = (key, value.to_str()) {
+                        collected.headers.push((key.to_string(), value.to_string()));
+                    }
+                }
+                collected.requests.push(request.into_inner());
+                Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+            }
+        }
+        let service = TraceServiceServer::new(Collector(collected.clone()))
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let mut server = tonic::transport::Server::builder();
+        if let Some(pki) = pki {
+            let tls = tonic::transport::ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(
+                    &pki.server.0,
+                    &pki.server.1,
+                ))
+                .client_ca_root(tonic::transport::Certificate::from_pem(
+                    std::fs::read(&pki.ca).unwrap(),
+                ));
+            server = server.tls_config(tls).unwrap();
+        }
+        tokio::spawn(
+            server
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+    } else {
+        let sink = collected.clone();
+        let acceptor = pki.map(|pki| {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_file_iter(&pki.ca).unwrap() {
+                roots.add(cert.unwrap()).unwrap();
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider.clone(),
+            )
+            .build()
+            .unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    CertificateDer::pem_slice_iter(pki.server.0.as_bytes())
+                        .map(Result::unwrap)
+                        .collect(),
+                    PrivateKeyDer::from_pem_slice(pki.server.1.as_bytes()).unwrap(),
+                )
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        });
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sink = sink.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let sink = sink.clone();
+                            async move {
+                                use http_body_util::BodyExt;
+                                let headers: Vec<(String, String)> = request
+                                    .headers()
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (k.to_string(), v.to_str().unwrap_or_default().to_string())
+                                    })
+                                    .collect();
+                                let path = request.uri().path().to_string();
+                                let gzip = request
+                                    .headers()
+                                    .get("content-encoding")
+                                    .is_some_and(|v| v == "gzip");
+                                let mut body = request
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .unwrap()
+                                    .to_bytes()
+                                    .to_vec();
+                                if gzip {
+                                    let mut plain = Vec::new();
+                                    std::io::Read::read_to_end(
+                                        &mut flate2::read::GzDecoder::new(&body[..]),
+                                        &mut plain,
+                                    )
+                                    .unwrap();
+                                    body = plain;
+                                }
+                                let decoded =
+                                    <ExportTraceServiceRequest as prost::Message>::decode(
+                                        &body[..],
+                                    )
+                                    .unwrap();
+                                let mut collected = sink.lock().unwrap();
+                                collected.headers.extend(headers);
+                                collected.paths.push(path);
+                                collected.requests.push(decoded);
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::new()),
+                                ))
+                            }
+                        },
+                    );
+                    let http = hyper::server::conn::http1::Builder::new();
+                    let _ = match acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(tls) => {
+                                http.serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                                    .await
+                            }
+                            Err(_) => return,
+                        },
+                        None => {
+                            http.serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                .await
+                        }
+                    };
+                });
+            }
+        });
+    }
+    collected
+}
+
+/// The spans a collector received, comparable across binaries: the resource and schema, then
+/// each span's scope, name, kind, flags, trace state, status, sorted attributes (the port and
+/// the instance ID masked, Go's prototext spacing left out), and its trace and parent by what
+/// they are (the request's, another span's by name, a new trace). Resets are masked.
+fn received_spans(collected: &Collected, known: &[(&str, [u8; 16], [u8; 8])]) -> Vec<String> {
+    use ratelimit_proto::opentelemetry::proto::common::v1::any_value::Value as V;
+    let value = |v: &Option<ratelimit_proto::opentelemetry::proto::common::v1::AnyValue>| match v
+        .as_ref()
+        .and_then(|v| v.value.clone())
+    {
+        Some(V::StringValue(s)) => {
+            let reset = regex::Regex::new(r"duration_until_reset:\{seconds:\d+\}").unwrap();
+            let s = reset.replace_all(&s, "duration_until_reset:{seconds:S}");
+            format!("{:?}", without_text_spaces(&s))
+        }
+        Some(V::IntValue(i)) => format!("int {i}"),
+        other => format!("{other:?}"),
+    };
+    let mut spans = Vec::new();
+    let mut all = Vec::new();
+    for request in &collected.requests {
+        for resource_spans in &request.resource_spans {
+            let resource: Vec<String> = resource_spans
+                .resource
+                .iter()
+                .flat_map(|r| &r.attributes)
+                .map(|kv| format!("{}={}", kv.key, value(&kv.value)))
+                .collect();
+            spans.push(format!(
+                "resource {} {:?}",
+                resource_spans.schema_url, resource
+            ));
+            for scope_spans in &resource_spans.scope_spans {
+                for span in &scope_spans.spans {
+                    all.push((
+                        scope_spans.scope.clone().unwrap_or_default(),
+                        scope_spans.schema_url.clone(),
+                        span.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let name_of = |id: &[u8]| {
+        all.iter()
+            .find(|(_, _, s)| s.span_id == id)
+            .map(|(_, _, s)| format!("span {}", s.name))
+            .or_else(|| {
+                known
+                    .iter()
+                    .find(|(_, _, s)| s[..] == *id)
+                    .map(|(n, _, _)| format!("{n}'s parent"))
+            })
+            .unwrap_or_else(|| {
+                if id.is_empty() {
+                    "none".into()
+                } else {
+                    "unknown".into()
+                }
+            })
+    };
+    for (scope, schema, span) in &all {
+        let trace = known
+            .iter()
+            .find(|(_, t, _)| t[..] == span.trace_id[..])
+            .map_or("a new trace".to_string(), |(n, _, _)| {
+                format!("{n}'s trace")
+            });
+        let mut attributes: Vec<String> = span
+            .attributes
+            .iter()
+            .map(|kv| match kv.key.as_str() {
+                "server.port" => "server.port=PORT".to_string(),
+                _ => format!("{}={}", kv.key, value(&kv.value)),
+            })
+            .collect();
+        attributes.sort();
+        let status = span.status.clone().unwrap_or_default();
+        spans.push(format!(
+            "{} {:?} {} | {} kind {} flags {:#x} state {:?} | {} | parent {} | status {} {:?} | {:?} dropped {}",
+            scope.name,
+            scope.version,
+            schema,
+            span.name,
+            span.kind,
+            span.flags,
+            span.trace_state,
+            trace,
+            name_of(&span.parent_span_id),
+            status.code,
+            status.message,
+            attributes,
+            span.dropped_attributes_count
+        ));
+    }
+    spans.sort();
+    spans.dedup();
+    spans
+}
+
+/// With `TRACING_ENABLED`, both binaries export the same spans, over gRPC (gzipped) and
+/// over HTTP: the resource (`TRACING_SERVICE_*` over `OTEL_RESOURCE_ATTRIBUTES` and
+/// `OTEL_SERVICE_NAME`), otelgrpc's server spans (the health check's too) under the caller's
+/// trace (W3C, or B3 when both are sent; a deferred B3 decision is not sampled), the service's
+/// and Redis's spans beside them, `/json`'s three traces, and the configured headers; the
+/// semantic conventions `OTEL_SEMCONV_STABILITY_OPT_IN` chooses; `TRACING_SAMPLING_RATE`.
+#[tokio::test]
+async fn traces_are_exported_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::grpc::health::v1::{HealthCheckRequest, health_client::HealthClient};
+    let runtime = temp_dir("traces");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let w3c_trace = [0x4b; 16];
+    let w3c_span = [0x0f; 8];
+    let b3_trace = [0x0a; 16];
+    let b3_span = [0x0b; 8];
+    let deferred_trace = [0x0c; 16];
+    let known = [
+        ("traceparent", w3c_trace, w3c_span),
+        ("b3", b3_trace, b3_span),
+        ("deferred b3", deferred_trace, [0x0d; 8]),
+    ];
+    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let traceparent = format!("00-{}-{}-01", hex(&w3c_trace), hex(&w3c_span));
+    let b3 = format!("{}-{}-1", hex(&b3_trace), hex(&b3_span));
+    // Each protocol, compressed or not; the previous and both semantic conventions; a rate
+    // of 0, which keeps only what a sampled caller's trace asks for.
+    // Over TLS, the collector verified with `OTEL_EXPORTER_OTLP_CERTIFICATE`, the exporter
+    // with its client certificate.
+    let pki = pki(&runtime.join("pki"));
+    // With span limits: strings cut to 10 characters, at most 4 attributes.
+    for (protocol, compression, conventions, rate, tls, limits) in [
+        ("grpc", "gzip", "", "1", false, false),
+        ("http", "none", "rpc/old", "1", false, true),
+        ("http", "gzip", "x, rpc/dup", "0", false, false),
+        ("grpc", "none", "", "1", true, false),
+        ("http", "none", "", "1", true, false),
+    ] {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let redis = Redis::start().await;
+            let collector_port = reserved_port();
+            let collected =
+                otlp_collector(collector_port, protocol == "grpc", tls.then_some(&pki)).await;
+            let scheme = if tls { "https" } else { "http" };
+            let (grpc, http) = (reserved_port(), reserved_port());
+            let environment = vec![
+                (
+                    "RUNTIME_ROOT",
+                    runtime.join("current").to_string_lossy().into_owned(),
+                ),
+                ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+                ("REDIS_SOCKET_TYPE", "tcp".into()),
+                ("REDIS_URL", redis.address.clone()),
+                ("DISABLE_STATS", "true".into()),
+                ("LOG_LEVEL", "info".into()),
+                ("TRACING_ENABLED", "true".into()),
+                ("TRACING_EXPORTER_PROTOCOL", protocol.into()),
+                ("TRACING_SERVICE_NAMESPACE", "ns".into()),
+                ("TRACING_SERVICE_INSTANCE_ID", "instance-1".into()),
+                ("TRACING_SAMPLING_RATE", rate.into()),
+                ("OTEL_SEMCONV_STABILITY_OPT_IN", conventions.into()),
+                ("OTEL_SERVICE_NAME", "ignored".into()),
+                (
+                    "OTEL_RESOURCE_ATTRIBUTES",
+                    "deployment= test%20env ,team=rl,team=limits,=empty".into(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    format!("{scheme}://127.0.0.1:{collector_port}"),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    "x-team=rl,x-env=test%20env".into(),
+                ),
+                ("OTEL_EXPORTER_OTLP_COMPRESSION", compression.into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ];
+            let mut environment = environment;
+            if limits {
+                environment.extend([
+                    ("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "10".to_string()),
+                    ("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "4".to_string()),
+                    ("OTEL_ATTRIBUTE_COUNT_LIMIT", "1".to_string()),
+                ]);
+            }
+            if tls {
+                environment.extend([
+                    (
+                        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+                        pki.ca.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+                        pki.client_cert.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+                        pki.client_key.to_string_lossy().into_owned(),
+                    ),
+                ]);
+            }
+            let child = Command::new(&binary)
+                .env_clear()
+                .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("start the service");
+            let address = format!("http://127.0.0.1:{grpc}");
+            let mut channel = None;
+            for _ in 0..300 {
+                if let Ok(c) = Channel::from_shared(address.clone())
+                    .unwrap()
+                    .connect()
+                    .await
+                {
+                    channel = Some(c);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let channel = channel.expect("the service serves");
+            let mut client = RateLimitServiceClient::new(channel.clone());
+            let call = |headers: &[(&'static str, String)]| {
+                let mut call = tonic::Request::new(request("llm", &[&[("user", "t")]]));
+                for (key, value) in headers {
+                    call.metadata_mut().insert(*key, value.parse().unwrap());
+                }
+                call
+            };
+            client
+                .should_rate_limit(call(&[
+                    ("traceparent", traceparent.clone()),
+                    ("tracestate", "vendor=a, other@x=b ".into()),
+                ]))
+                .await
+                .unwrap();
+            client
+                .should_rate_limit(call(&[
+                    ("traceparent", traceparent.clone()),
+                    ("b3", b3.clone()),
+                ]))
+                .await
+                .unwrap();
+            client
+                .should_rate_limit(call(&[
+                    ("x-b3-traceid", hex(&deferred_trace)),
+                    ("x-b3-spanid", hex(&[0x0d; 8])),
+                ]))
+                .await
+                .unwrap();
+            let _ = client
+                .should_rate_limit(tonic::Request::new(request("", &[&[("user", "t")]])))
+                .await;
+            HealthClient::new(channel.clone())
+                .check(HealthCheckRequest {
+                    service: "ratelimit".into(),
+                })
+                .await
+                .unwrap();
+            // A method no service has: no span.
+            let mut unknown = tonic::client::Grpc::new(channel);
+            unknown.ready().await.unwrap();
+            let codec =
+                tonic_prost::ProstCodec::<HealthCheckRequest, HealthCheckRequest>::default();
+            let answer = unknown
+                .unary(
+                    tonic::Request::new(HealthCheckRequest::default()),
+                    http::uri::PathAndQuery::from_static("/grpc.health.v1.Health/Nope"),
+                    codec,
+                )
+                .await;
+            assert_eq!(answer.unwrap_err().code(), tonic::Code::Unimplemented);
+            let json =
+                r#"{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"j"}]}]}"#;
+            let answer = send_raw(
+                &format!("127.0.0.1:{http}"),
+                &format!(
+                    "POST /json HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+                    json.len()
+                ),
+            )
+            .await;
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            let pid = child.id().unwrap().to_string();
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap();
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                    .await
+                    .expect("the service stops")
+                    .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let collected = collected.lock().unwrap();
+            let mut headers: Vec<String> = collected
+                .headers
+                .iter()
+                .filter(|(k, _)| {
+                    k.starts_with("x-") || k == "content-type" || k == "content-encoding"
+                })
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            headers.sort();
+            headers.dedup();
+            let mut paths = collected.paths.clone();
+            paths.dedup();
+            let started: Vec<String> = logrus_lines(&stderr, &[])
+                .into_iter()
+                .filter(|l| l.contains("racerProvider") || l.contains("Tracing"))
+                .collect();
+            assert_eq!(started.len(), 1, "{stderr}");
+            runs.push((received_spans(&collected, &known), headers, paths, started));
+        }
+        // The resource and, at a rate of 0, the six spans of the two sampled callers.
+        assert!(runs[0].0.len() >= 7, "{protocol}: {:#?}", runs[0].0);
+        for (u, o) in runs[0].0.iter().zip(&runs[1].0) {
+            assert_eq!(o, u, "{protocol} {compression}");
+        }
+        assert_eq!(runs[1], runs[0], "{protocol} {compression}");
+    }
 }

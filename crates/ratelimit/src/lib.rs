@@ -20,3 +20,4 @@ pub mod runtime;
 pub mod service;
 pub mod settings;
 pub mod stats;
+pub mod trace;

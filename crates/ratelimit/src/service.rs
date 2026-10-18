@@ -156,6 +156,25 @@ impl<C: RateLimitCache> RateLimitService<C> {
         request: &RateLimitRequest,
     ) -> Result<RateLimitResponse, ServiceError> {
         crate::debug!("ShouldRateLimit: {}", crate::prototext::request(request));
+        // Its context is not passed on: the request's other spans are its siblings.
+        let _span = crate::trace::start(
+            crate::trace::SERVICE,
+            "ShouldRateLimit Execution",
+            crate::trace::Kind::Internal,
+            crate::trace::parent().as_ref(),
+            || {
+                vec![
+                    (
+                        "domain".into(),
+                        crate::trace::Value::Str(request.domain.clone()),
+                    ),
+                    (
+                        "request string".into(),
+                        crate::trace::Value::Str(crate::prototext::request(request)),
+                    ),
+                ]
+            },
+        );
         let response = self.decide(request).await;
         match &response {
             Ok(response) => crate::debug!(

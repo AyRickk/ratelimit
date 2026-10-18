@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/envoy/type/v3/ratelimit_unit.proto",
         "proto/envoy/config/core/v3/base.proto",
         "proto/grpc/health/v1/health.proto",
+        "proto/opentelemetry/proto/collector/trace/v1/trace_service.proto",
     ];
     let fds = protox::compile(protos, ["proto"])?;
     tonic_prost_build::configure()
