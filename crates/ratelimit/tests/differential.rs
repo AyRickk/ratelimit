@@ -3970,6 +3970,36 @@ async fn the_file_provider_loads_the_runtime_directory_like_upstream() {
     }
 }
 
+/// yaml.v2 reads a quoted scalar continued on lines less indented than its key (libyaml does
+/// not check a flow scalar's indentation), folding its lines as usual.
+#[tokio::test]
+async fn quoted_scalars_continue_on_any_indentation_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    let config = "domain: \"dom\nain\"\ndescriptors:\n  - key: \"k\n  e\"\n    value: 'it''s\nv'\n    rate_limit:\n      unit: \"sec\nond\"\n      requests_per_unit: 1\n";
+    // The unit folds to `sec ond`, not a unit: refused as upstream refuses it.
+    assert!(h.load_config(config).await.is_err());
+    let config = "domain: \"dom\nain\"\ndescriptors:\n  - key: \"k\n  e\"\n    value: 'it''s\nv'\n    rate_limit: {unit: second, requests_per_unit: 1}\n  - key: \"tab\\\n\t  bed\"\n    rate_limit: {unit: second, requests_per_unit: 2}\n  - key: plain\n    value: a 'b\n      \"c\n    rate_limit: {unit: second, requests_per_unit: 3}\n";
+    h.load_config(config).await.unwrap();
+    h.at(1_700_000_000).await;
+    for _ in 0..2 {
+        h.call(request(
+            "dom ain",
+            &[
+                &[("k e", "it's v")],
+                &[("tabbed", "")],
+                // A plain scalar holding quotes, continued on a line starting with one.
+                &[("plain", "a 'b \"c")],
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    h.assert_same_redis().await;
+}
+
 /// yaml.v2's reader refuses control characters, and skips a byte order mark.
 #[tokio::test]
 async fn config_characters_are_read_like_upstream() {
@@ -6223,9 +6253,11 @@ async fn server_stats_are_reported_like_upstream() {
 }
 
 /// The server's stats from `lines` once every call of `server_calls` is in them (3
-/// `ShouldRateLimit`, 2 `Check`, 1 `List`, each counted and timed), or after 10 s.
+/// `ShouldRateLimit`, 2 `Check`, 1 `List`, each counted and timed) and the sums stay the same
+/// over 300 ms, or after 10 s.
 async fn wait_for_server_stats(lines: impl Fn() -> Vec<String>) -> BTreeMap<String, u64> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut previous = None;
     loop {
         let sums = server_stat_lines(&lines());
         let calls: u64 = sums
@@ -6233,8 +6265,17 @@ async fn wait_for_server_stats(lines: impl Fn() -> Vec<String>) -> BTreeMap<Stri
             .filter(|(name, _)| name.starts_with("ratelimit_server."))
             .map(|(_, n)| n)
             .sum();
-        if calls >= 12 || std::time::Instant::now() > deadline {
+        if std::time::Instant::now() > deadline {
             return sums;
+        }
+        // Then the same over three flushes (100 ms each): other counters can come later.
+        if calls >= 12 {
+            if previous.as_ref() == Some(&sums) {
+                return sums;
+            }
+            previous = Some(sums);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            continue;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -7799,8 +7840,136 @@ async fn redis_over_tls_is_used_like_upstream() {
     }
 }
 
+/// `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR`: its warning at startup; with the Redis demoted
+/// to a replica, then promoted again, each request answers and logs as upstream's. In SINGLE
+/// mode upstream's commands are pipelined, whose errors its wrapper does not see: nothing more
+/// is logged and no connection is closed.
+#[tokio::test]
+async fn readonly_replies_are_handled_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("readonly");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let command = |redis: &Redis, args: Vec<String>| {
+        let client = redis.client.clone();
+        async move {
+            let (name, args) = args.split_first().unwrap();
+            let name: &'static str = Box::leak(name.clone().into_boxed_str());
+            let _: fred::types::Value = client
+                .custom(
+                    CustomCommand::new_static(name, ClusterHash::Random, false),
+                    args.to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (master, redis) = (Redis::start().await, Redis::start().await);
+        let grpc = reserved_port();
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_URL", redis.address.clone()),
+            ("REDIS_POOL_SIZE", "1".into()),
+            ("REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR", "true".into()),
+            ("DISABLE_STATS", "true".into()),
+            ("LOG_LEVEL", "info".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", reserved_port().to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ];
+        let child = Command::new(&binary)
+            .env_clear()
+            .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the service");
+        let mut client = None;
+        for _ in 0..300 {
+            if let Ok(c) = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}")).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut client = client.expect("the service serves");
+        let mut call = async || {
+            client
+                .should_rate_limit(request("llm", &[&[("user", "a")]]))
+                .await
+                .map(|_| "ok".to_string())
+                .unwrap_or_else(|status| format!("{:?}", status.code()))
+        };
+        let mut outcomes = vec![call().await];
+        // Demoted: writes are refused with READONLY.
+        let (host, port) = master.address.split_once(':').unwrap();
+        command(&redis, vec!["REPLICAOF".into(), host.into(), port.into()]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        outcomes.push(call().await);
+        outcomes.push(call().await);
+        // Promoted again.
+        command(&redis, vec!["REPLICAOF".into(), "NO".into(), "ONE".into()]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        outcomes.push(call().await);
+        let pid = child.id().unwrap().to_string();
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                .await
+                .expect("the service stops")
+                .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let lines: Vec<String> = logrus_lines(&stderr, &[(redis.address.clone(), "REDIS")])
+            .into_iter()
+            .filter(|l| l.contains("READONLY") || l.contains("redis connection"))
+            .collect();
+        runs.push((outcomes, lines));
+    }
+    assert!(
+        runs[0]
+            .1
+            .iter()
+            .any(|l| l.contains("closing connections on READONLY")),
+        "{:?}",
+        runs[0]
+    );
+    // Refused while demoted, served again once promoted.
+    assert_eq!(
+        runs[0].0,
+        ["ok", "Unknown", "Unknown", "ok"],
+        "{:?}",
+        runs[0]
+    );
+    assert_eq!(runs[1], runs[0]);
+}
+
 /// A Redis that answers only after the first dials fail: each failure, each retry, then the
-/// connection restored, as upstream logs them. A binary slowed down enough to dial only once
+/// connection restored, as upstream logs them; meanwhile, no /healthcheck yet. A binary slowed down enough to dial only once
 /// Redis is up has nothing to compare, and a dial made while Redis comes up gets that
 /// instant's error: the pair of runs is tried again, three times at most.
 #[tokio::test]
@@ -7842,7 +8011,7 @@ async fn late_redis_runs(runtime: &std::path::Path, waits: &regex::Regex) -> Vec
         PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
     ] {
         let port = reserved_port();
-        let grpc = reserved_port();
+        let (grpc, http) = (reserved_port(), reserved_port());
         let environment = vec![
             (
                 "RUNTIME_ROOT",
@@ -7858,13 +8027,32 @@ async fn late_redis_runs(runtime: &std::path::Path, waits: &regex::Regex) -> Vec
             ("GRPC_HOST", "127.0.0.1".into()),
             ("GRPC_PORT", grpc.to_string()),
             ("HOST", "127.0.0.1".into()),
-            ("PORT", reserved_port().to_string()),
+            ("PORT", http.to_string()),
             ("DEBUG_HOST", "127.0.0.1".into()),
             ("DEBUG_PORT", reserved_port().to_string()),
         ];
         let late = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             Redis::start_on(port).await.expect("Redis started")
+        });
+        // Before Redis is up, the HTTP port (and its /healthcheck) does not answer yet.
+        let early = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let address = format!("127.0.0.1:{http}");
+            match tokio::net::TcpStream::connect(&address).await {
+                Err(_) => "healthcheck before Redis: refused".to_string(),
+                Ok(_) => {
+                    let answer = send_raw(
+                        &address,
+                        "GET /healthcheck HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    format!(
+                        "healthcheck before Redis: {}",
+                        answer.lines().next().unwrap_or_default()
+                    )
+                }
+            }
         });
         let stderr = logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await;
         let _redis = late.await.unwrap();
@@ -7874,6 +8062,7 @@ async fn late_redis_runs(runtime: &std::path::Path, waits: &regex::Regex) -> Vec
             .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
             .collect();
         lines.dedup();
+        lines.push(early.await.unwrap());
         runs.push(lines);
     }
     runs
