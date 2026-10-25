@@ -4250,7 +4250,12 @@ async fn the_binary_fails_to_start_like_upstream() {
     let redis = Redis::start().await;
     let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let busy_port = busy.local_addr().unwrap().port().to_string();
-    let ca = pki(&runtime.join("pki")).ca.to_string_lossy().into_owned();
+    let test_pki = pki(&runtime.join("pki"));
+    let ca = test_pki.ca.to_string_lossy().into_owned();
+    let client_cert = test_pki.client_cert.to_string_lossy().into_owned();
+    let other_key = runtime.join("pki").join("other-key.pem");
+    std::fs::write(&other_key, &test_pki.server.1).unwrap();
+    let other_key = other_key.to_string_lossy().into_owned();
     let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
         (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
         (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
@@ -4269,6 +4274,8 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CACERT", "/nowhere/ca.pem".into())], "failed to read file: /nowhere/ca.pem: open /nowhere/ca.pem: no such file or directory".into()),
         (vec![("REDIS_PERSECOND_TLS", "true".into()), ("REDIS_TLS_CACERT", runtime.join("current").to_string_lossy().into_owned() + "/ratelimit/config/llm.yaml")], format!("failed to load the provided TLS CA certificate: {}/ratelimit/config/llm.yaml", runtime.join("current").display())),
         (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CLIENT_CERT", "/nowhere/c.pem".into()), ("REDIS_TLS_CLIENT_KEY", "/nowhere/k.pem".into())], "failed lo load TLS key pair (/nowhere/c.pem,/nowhere/k.pem): open /nowhere/c.pem: no such file or directory".into()),
+        // A key not for the certificate: refused before the CA is read.
+        (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CLIENT_CERT", client_cert.clone()), ("REDIS_TLS_CLIENT_KEY", other_key.clone()), ("REDIS_TLS_CACERT", "/nowhere/ca.pem".into())], format!("failed lo load TLS key pair ({client_cert},{other_key}): tls: private key does not match public key")),
         (vec![("REDIS_AUTH", "pw".into()), ("REDIS_AUTH_FILE", "/nowhere".into())], "REDIS_AUTH and REDIS_AUTH_FILE are mutually exclusive".into()),
         // Redis refuses the database: its error ends the message.
         (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
@@ -7577,10 +7584,22 @@ async fn auth_files_are_reread_like_upstream() {
 
 /// A Redis serving TLS on `port` with the server certificate of `pki` (clients' certificates
 /// required with `clients`), and in clear on another port, to know it is up.
-async fn tls_redis(pki: &Pki, dir: &std::path::Path, port: u16, clients: bool) -> Child {
-    let (cert, key) = (dir.join("server.pem"), dir.join("server-key.pem"));
-    std::fs::write(&cert, &pki.server.0).unwrap();
-    std::fs::write(&key, &pki.server.1).unwrap();
+async fn tls_redis(
+    pki: &Pki,
+    dir: &std::path::Path,
+    port: u16,
+    clients: bool,
+    expired: bool,
+) -> Child {
+    let cert = dir.join(format!("server-{port}.pem"));
+    let key = dir.join(format!("server-key-{port}.pem"));
+    let (cert_pem, key_pem) = if expired {
+        &pki.expired_server
+    } else {
+        &pki.server
+    };
+    std::fs::write(&cert, cert_pem).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
     let plain = reserved_port();
     let process = Command::new(redis_server())
         .args([
@@ -7639,46 +7658,81 @@ async fn redis_over_tls_is_used_like_upstream() {
         r"x509: (“[^”]*” certificate is not trusted|certificate signed by unknown authority)",
     )
     .unwrap();
-    // (case, host, CA, skip hostname verification, client certificate, server asks for one, fails)
+    // An expired certificate: the current time is masked, not the certificate's end.
+    let now = regex::Regex::new(r"current time \S+ is after").unwrap();
+    // Each case: the host, a CA given, the hostname not verified, a client certificate given,
+    // one asked by the server, the server's certificate expired, the start failing.
+    struct Case {
+        name: &'static str,
+        host: &'static str,
+        with_ca: bool,
+        skip: bool,
+        with_client: bool,
+        clients: bool,
+        expired: bool,
+        fails: bool,
+    }
+    let base = Case {
+        name: "",
+        host: "127.0.0.1",
+        with_ca: true,
+        skip: false,
+        with_client: false,
+        clients: false,
+        expired: false,
+        fails: false,
+    };
     let cases = [
-        ("CA", "127.0.0.1", true, false, false, false, false),
-        (
-            "system roots only",
-            "127.0.0.1",
-            false,
-            false,
-            false,
-            false,
-            true,
-        ),
-        ("another name", "localhost", true, false, false, false, true),
-        (
-            "another name, skipped",
-            "localhost",
-            true,
-            true,
-            false,
-            false,
-            false,
-        ),
-        (
-            "client certificate",
-            "127.0.0.1",
-            true,
-            false,
-            true,
-            true,
-            false,
-        ),
+        Case { name: "CA", ..base },
+        Case {
+            name: "system roots only",
+            with_ca: false,
+            fails: true,
+            ..base
+        },
+        Case {
+            name: "another name",
+            host: "localhost",
+            fails: true,
+            ..base
+        },
+        Case {
+            name: "another name, skipped",
+            host: "localhost",
+            skip: true,
+            ..base
+        },
+        Case {
+            name: "client certificate",
+            with_client: true,
+            clients: true,
+            ..base
+        },
+        Case {
+            name: "expired",
+            expired: true,
+            fails: true,
+            ..base
+        },
     ];
-    for (case, host, with_ca, skip, with_client, clients, fails) in cases {
+    for Case {
+        name: case,
+        host,
+        with_ca,
+        skip,
+        with_client,
+        clients,
+        expired,
+        fails,
+    } in cases
+    {
         let mut runs = Vec::new();
         for binary in [
             upstream_binary(),
             PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
         ] {
             let port = reserved_port();
-            let _redis = tls_redis(&pki, &runtime.join("pki"), port, clients).await;
+            let _redis = tls_redis(&pki, &runtime.join("pki"), port, clients, expired).await;
             let grpc = reserved_port();
             let mut environment = vec![
                 (
@@ -7719,9 +7773,15 @@ async fn redis_over_tls_is_used_like_upstream() {
                 .into_iter()
                 .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
                 .filter(|l| l.contains("redis") || l.contains("Redis"))
+                // radix fills its pool in the background: the dials still running when the
+                // service stops are cancelled and logged, as many as it was slow (§7).
+                .filter(|l| {
+                    !l.ends_with("context canceled\"") && !l.ends_with("operation was canceled\"")
+                })
                 .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
                 .map(|l| after.replace(&l, "after ELAPSED:").into_owned())
                 .map(|l| untrusted.replace(&l, "x509: UNTRUSTED").into_owned())
+                .map(|l| now.replace(&l, "current time NOW is after").into_owned())
                 .collect();
             lines.dedup();
             runs.push(lines);
@@ -7826,6 +7886,8 @@ struct Collected {
 struct Pki {
     ca: PathBuf,
     server: (String, String),
+    /// A server certificate for 127.0.0.1 that expired on 2020-01-01.
+    expired_server: (String, String),
     client_cert: PathBuf,
     client_key: PathBuf,
 }
@@ -7843,16 +7905,21 @@ fn pki(dir: &std::path::Path) -> Pki {
     named(&mut ca, "test CA");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
-    let issue = |name: &str, purpose| {
+    let issue = |name: &str, purpose, expired: bool| {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
         named(&mut params, name);
         params.extended_key_usages = vec![purpose];
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        }
         let cert = params.signed_by(&key, &ca).unwrap();
         (cert.pem(), key.serialize_pem())
     };
-    let server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth);
-    let (client_cert, client_key) = issue("client", ExtendedKeyUsagePurpose::ClientAuth);
+    let server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth, false);
+    let expired_server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth, true);
+    let (client_cert, client_key) = issue("client", ExtendedKeyUsagePurpose::ClientAuth, false);
     std::fs::create_dir_all(dir).unwrap();
     let write = |name: &str, pem: &str| {
         let path = dir.join(name);
@@ -7862,6 +7929,7 @@ fn pki(dir: &std::path::Path) -> Pki {
     Pki {
         ca: write("ca.pem", &ca.pem()),
         server,
+        expired_server,
         client_cert: write("client.pem", &client_cert),
         client_key: write("client-key.pem", &client_key),
     }

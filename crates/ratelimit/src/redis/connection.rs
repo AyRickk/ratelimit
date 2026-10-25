@@ -339,11 +339,26 @@ impl RedisConnection {
                 let address = crate::net::join_host_port(&server.host, server.port.into());
                 let connect =
                     tokio::net::TcpStream::connect((server.host.to_string(), server.port));
-                let connected = async {
-                    let stream = Box::new(connect.await?) as Stream;
-                    self.handshake(stream).await
+                let started = tokio::time::Instant::now();
+                let connected = self
+                    .within_timeout(async { Ok(Box::new(connect.await?) as Stream) })
+                    .await;
+                // The handshake shares the dial's deadline; past it, Go says the context's.
+                let connected = match connected {
+                    Some(Ok(stream)) => {
+                        let left = self.timeout.saturating_sub(started.elapsed());
+                        let handshake = self.handshake(stream);
+                        match self.timeout.is_zero() {
+                            true => Some(handshake.await),
+                            false => match tokio::time::timeout(left, handshake).await {
+                                Ok(result) => Some(result),
+                                Err(_) => return Err("context deadline exceeded".into()),
+                            },
+                        }
+                    }
+                    other => other,
                 };
-                (address, self.within_timeout(connected).await)
+                (address, connected)
             }
             _ => return Err(format!("dial {network}: unsupported server")),
         };
@@ -635,16 +650,35 @@ fn tls_error_text(error: &std::io::Error) -> String {
         Some(Error::InvalidCertificate(CertificateError::NotValidForName)) => {
             "certificate is not valid for the server's name".to_string()
         }
+        Some(Error::InvalidCertificate(CertificateError::ExpiredContext { time, not_after })) => {
+            format!(
+                "certificate has expired or is not yet valid: current time {} is after {}",
+                rfc3339(time.as_secs()),
+                rfc3339(not_after.as_secs())
+            )
+        }
+        Some(Error::InvalidCertificate(CertificateError::NotValidYetContext {
+            time,
+            not_before,
+        })) => format!(
+            "certificate has expired or is not yet valid: current time {} is before {}",
+            rfc3339(time.as_secs()),
+            rfc3339(not_before.as_secs())
+        ),
         Some(Error::InvalidCertificate(
-            CertificateError::Expired
-            | CertificateError::ExpiredContext { .. }
-            | CertificateError::NotValidYet
-            | CertificateError::NotValidYetContext { .. },
+            CertificateError::Expired | CertificateError::NotValidYet,
         )) => "certificate has expired or is not yet valid".to_string(),
         Some(e) => return format!("tls: {e}"),
         None => return error.to_string(),
     };
     format!("tls: failed to verify certificate: x509: {x509}")
+}
+
+/// `time.RFC3339` in UTC, as `x509` writes a validity error's times.
+fn rfc3339(seconds: u64) -> String {
+    jiff::Timestamp::from_second(seconds as i64)
+        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
 }
 
 /// `x509.HostnameError`: the certificate's IP addresses for an IP, its DNS names otherwise.

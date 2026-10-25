@@ -25,7 +25,7 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
     ) {
         ("", _) | (_, "") => None,
         (cert, key) => Some(
-            key_pair(cert, key)
+            key_pair(cert, key, &provider)
                 .map_err(|e| format!("failed lo load TLS key pair ({cert},{key}): {e}"))?,
         ),
     };
@@ -51,10 +51,11 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
         .map_err(|e| e.to_string())?;
     let builder = match s.redis_tls_skip_hostname_verification {
         true => {
+            // With no root at all, every handshake fails, as Go's verification would.
             let verifier =
                 rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
                     .build()
-                    .map_err(|e| e.to_string())?;
+                    .ok();
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NameNotVerified(verifier)))
@@ -85,6 +86,7 @@ fn read(path: &str) -> Result<Vec<u8>, String> {
 fn key_pair(
     cert: &str,
     key: &str,
+    provider: &rustls::crypto::CryptoProvider,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let cert_pem = read(cert)?;
     let key_pem = read(key)?;
@@ -96,13 +98,28 @@ fn key_pair(
     }
     let key = PrivateKeyDer::from_pem_slice(&key_pem)
         .map_err(|_| "tls: failed to find any PEM data in key input".to_string())?;
+    let signing = provider
+        .key_provider
+        .load_private_key(key.clone_key())
+        .map_err(|e| format!("tls: {e}"))?;
+    rustls::sign::CertifiedKey::new(certs.clone(), signing)
+        .keys_match()
+        .map_err(|_| "tls: private key does not match public key".to_string())?;
     Ok((certs, key))
 }
 
 /// The chain verified against the roots, the name not (Go's `InsecureSkipVerify` with its
 /// own `VerifyPeerCertificate`).
 #[derive(Debug)]
-struct NameNotVerified(Arc<rustls::client::WebPkiServerVerifier>);
+struct NameNotVerified(Option<Arc<rustls::client::WebPkiServerVerifier>>);
+
+impl NameNotVerified {
+    fn inner(&self) -> Result<&rustls::client::WebPkiServerVerifier, rustls::Error> {
+        self.0.as_deref().ok_or(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+}
 
 impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
     fn verify_server_cert(
@@ -114,10 +131,13 @@ impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
         now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         use rustls::{CertificateError, Error};
-        match self
-            .0
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-        {
+        match self.inner()?.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
             Err(Error::InvalidCertificate(
                 CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
             )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
@@ -131,7 +151,7 @@ impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls12_signature(message, cert, dss)
+        self.inner()?.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -140,10 +160,15 @@ impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls13_signature(message, cert, dss)
+        self.inner()?.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.supported_verify_schemes()
+        match &self.0 {
+            Some(verifier) => verifier.supported_verify_schemes(),
+            None => rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
     }
 }

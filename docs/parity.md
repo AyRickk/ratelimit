@@ -325,7 +325,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A `TRACING_SAMPLING_RATE` of `NaN` samples depending on the platform (Go's `uint64(NaN)`) | never | deterministic |
 | A failed TLS handshake with Redis names Go's error | Go's words for an unknown authority (Linux's: on macOS, Go asks the system, whose words differ), a name the certificate is not for (`x509.HostnameError`) and an expired certificate; rustls' for the others | the common failures read as upstream's |
 | A key pair or CA file that does not parse fails with Go's `crypto/tls` error | Go's for missing files and for files with no PEM data; rustls' otherwise | the file and the reason are named either way |
-| TLS to Redis over a Unix socket verifies the socket's path as the server's name | refused as a server name rustls cannot take | nobody encrypts a local socket |
+| TLS to Redis over a Unix socket verifies the socket's path as the server's name (so works only with `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION`) | refused at startup: fred would open the socket in clear | nobody encrypts a local socket; refusing beats sending in clear |
+| Once connected, a pool's reconnection errors read as radix's | fred's and rustls' | best effort (D3); the startup errors read as Go's |
+| radix fills a pool one connection at a time in the background; stopping before it is full cancels the dials still running, which are logged (`creating redis connection error : context canceled`, `… operation was canceled`), as many as the machine is slow (TLS makes it likely) | the pool's connections are made at startup, nothing to cancel | racy upstream, at shutdown only |
 | The expiration jitter of each key is drawn from `math/rand` seeded with the start's second | another random source | the extras are random either way; their range is the same |
 | `OTEL_BSP_MAX_QUEUE_SIZE=0` lets a span through when the processor happens to wait for one; a negative size panics at startup | every span dropped | D1; nobody sets either |
 | The exporter's `User-Agent` is `OTel OTLP Exporter Go/1.45.0` (and grpc-go's) | `ratelimit/<version>` (and tonic's) | it names the software that sends |

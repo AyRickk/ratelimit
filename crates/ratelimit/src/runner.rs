@@ -229,20 +229,28 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     // The per-second pool comes first, as in `NewRateLimiterCacheImplFromSettings`.
     let (per_second_connection, connection) = match settings.backend_type.as_str() {
         "redis" | "" => {
+            // fred would open a Unix socket in clear: TLS over one is refused.
             let with_tls = |mut connection: RedisConnection, tls: bool| {
                 connection.tls = redis_tls.clone().filter(|_| tls);
-                connection
+                match (connection.tls.is_some(), connection.network.as_str()) {
+                    (true, "unix") => Err(format!(
+                        "{}_TLS over a Unix socket is not supported",
+                        connection.prefix
+                    )),
+                    _ => Ok(connection),
+                }
             };
             (
                 settings
                     .redis_persecond
                     .then(|| RedisConnection::per_second_from_settings(&settings))
                     .transpose()?
-                    .map(|c| with_tls(c, settings.redis_persecond_tls)),
+                    .map(|c| with_tls(c, settings.redis_persecond_tls))
+                    .transpose()?,
                 with_tls(
                     RedisConnection::from_settings(&settings)?,
                     settings.redis_tls,
-                ),
+                )?,
             )
         }
         "memcache" => {
