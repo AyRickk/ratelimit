@@ -4,7 +4,7 @@
 //! `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION`, the chain is verified but not the name.
 
 use crate::settings::Settings;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::sync::Arc;
 
 /// The client configuration both pools share, if either uses TLS; an error is what upstream
@@ -14,10 +14,6 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
         return Ok(None);
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
     // A key pair needs both files.
     let identity = match (
         s.redis_tls_client_cert.as_str(),
@@ -25,26 +21,11 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
     ) {
         ("", _) | (_, "") => None,
         (cert, key) => Some(
-            key_pair(cert, key, &provider)
+            crate::tls::key_pair(cert, key, &provider)
                 .map_err(|e| format!("failed lo load TLS key pair ({cert},{key}): {e}"))?,
         ),
     };
-    let ca = s.redis_tls_cacert.as_str();
-    if !ca.is_empty() {
-        let pem = read(ca).map_err(|e| format!("failed to read file: {ca}: {e}"))?;
-        let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem)
-            .filter_map(Result::ok)
-            .collect();
-        let added = certs
-            .into_iter()
-            .filter(|c| roots.add(c.clone()).is_ok())
-            .count();
-        if added == 0 {
-            return Err(format!(
-                "failed to load the provided TLS CA certificate: {ca}"
-            ));
-        }
-    }
+    let roots = crate::tls::roots(&s.redis_tls_cacert)?;
     let roots = Arc::new(roots);
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -60,7 +41,15 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NameNotVerified(verifier)))
         }
-        false => builder.with_root_certificates(roots),
+        false => {
+            let verifier =
+                rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
+                    .build()
+                    .ok();
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(GoNames(verifier)))
+        }
     };
     let config = match identity {
         Some((certs, key)) => builder
@@ -69,43 +58,6 @@ pub fn from_settings(s: &Settings) -> Result<Option<Arc<rustls::ClientConfig>>, 
         None => builder.with_no_client_auth(),
     };
     Ok(Some(Arc::new(config)))
-}
-
-/// `os.ReadFile`'s error as Go writes it.
-fn read(path: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| {
-        let op = match e.kind() {
-            std::io::ErrorKind::IsADirectory => "read",
-            _ => "open",
-        };
-        format!("{op} {path}: {}", crate::go::errno_text(&e))
-    })
-}
-
-/// `tls.LoadX509KeyPair`: the certificate file, then the key file, then the pair.
-fn key_pair(
-    cert: &str,
-    key: &str,
-    provider: &rustls::crypto::CryptoProvider,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
-    let cert_pem = read(cert)?;
-    let key_pem = read(key)?;
-    let certs: Vec<_> = CertificateDer::pem_slice_iter(&cert_pem)
-        .filter_map(Result::ok)
-        .collect();
-    if certs.is_empty() {
-        return Err("tls: failed to find any PEM data in certificate input".into());
-    }
-    let key = PrivateKeyDer::from_pem_slice(&key_pem)
-        .map_err(|_| "tls: failed to find any PEM data in key input".to_string())?;
-    let signing = provider
-        .key_provider
-        .load_private_key(key.clone_key())
-        .map_err(|e| format!("tls: {e}"))?;
-    rustls::sign::CertifiedKey::new(certs.clone(), signing)
-        .keys_match()
-        .map_err(|_| "tls: private key does not match public key".to_string())?;
-    Ok((certs, key))
 }
 
 /// The chain verified against the roots, the name not (Go's `InsecureSkipVerify` with its
@@ -170,5 +122,73 @@ impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
                 .signature_verification_algorithms
                 .supported_schemes(),
         }
+    }
+}
+
+/// The chain verified against the roots, then the name as `Certificate.VerifyHostname`
+/// matches it, a mismatch carrying `HostnameError`'s text.
+#[derive(Debug)]
+struct GoNames(Option<Arc<rustls::client::WebPkiServerVerifier>>);
+
+/// `HostnameError`'s text, carried in a rustls error.
+#[derive(Debug)]
+struct HostnameError(String);
+
+impl std::fmt::Display for HostnameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostnameError {}
+
+impl rustls::client::danger::ServerCertVerifier for GoNames {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::{CertificateError, Error};
+        let verifier = NameNotVerified(self.0.clone());
+        let verified = verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let names = crate::tls::Names::of(end_entity)
+            .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        match names.verify_hostname(&server_name.to_str()) {
+            Ok(()) => Ok(verified),
+            Err(e) => Err(Error::InvalidCertificate(CertificateError::Other(
+                rustls::OtherError(Arc::new(HostnameError(e))),
+            ))),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        NameNotVerified(self.0.clone()).verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        NameNotVerified(self.0.clone()).verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        NameNotVerified(self.0.clone()).supported_verify_schemes()
     }
 }
