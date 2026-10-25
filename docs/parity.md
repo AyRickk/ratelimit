@@ -96,11 +96,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_AWS_IAM_USER_ID` | — | ⬜ | |
 | `REDIS_AWS_IAM_SERVERLESS` | `false` | ⬜ | |
 | `REDIS_AWS_IAM_REGION` | — | ⬜ | |
-| `REDIS_TLS` | `false` | ⬜ | |
-| `REDIS_TLS_CLIENT_CERT` | — | ⬜ | |
-| `REDIS_TLS_CLIENT_KEY` | — | ⬜ | |
-| `REDIS_TLS_CACERT` | — | ⬜ | |
-| `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
+| `REDIS_TLS` | `false` | ✅ | `redis_over_tls_is_used_like_upstream` (its warning, the handshake within the dial, failures retried) |
+| `REDIS_TLS_CLIENT_CERT` | — | ✅ | `redis_over_tls_is_used_like_upstream`; a file that does not load: `the_binary_fails_to_start_like_upstream` |
+| `REDIS_TLS_CLIENT_KEY` | — | ✅ | `redis_over_tls_is_used_like_upstream`; a file that does not load: `the_binary_fails_to_start_like_upstream` |
+| `REDIS_TLS_CACERT` | — | ✅ | added to the system's roots: `redis_over_tls_is_used_like_upstream`; a file that does not load or has no certificate: `the_binary_fails_to_start_like_upstream` |
+| `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ✅ | the chain verified, not the name: `redis_over_tls_is_used_like_upstream` |
 | `REDIS_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream (radix v4's write buffering is cluster-only); `CLUSTER` is not supported yet |
 | `REDIS_PIPELINE_LIMIT` | `0` | ✅ | no effect; upstream's deprecation warning: `redis_startup_is_logged_like_upstream` |
 | `REDIS_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
@@ -116,7 +116,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_AWS_IAM_USER_ID` | — | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_SERVERLESS` | `false` | ⬜ | |
 | `REDIS_PERSECOND_AWS_IAM_REGION` | — | ⬜ | |
-| `REDIS_PERSECOND_TLS` | `false` | ⬜ | |
+| `REDIS_PERSECOND_TLS` | `false` | ✅ | the same configuration, for the per-second pool; its files loaded even with the pool off: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_SENTINEL_AUTH` | — | ⬜ | |
 | `REDIS_PERSECOND_SENTINEL_AUTH` | — | ⬜ | |
 | `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream; `CLUSTER` is not supported yet |
@@ -206,9 +206,10 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: `GET` pipeline then `INCRBY`, siblings at 0, ghost keys | ✅ | `tests/differential.rs` |
 | Local cache of over-limit keys (set before the shadow check, TTL = unit), freecache's size limits and eviction | ✅ | `tests/differential.rs`, `tests/freecache.rs` |
 | `near_limit` threshold in `float32`; near / over split of `hitsAddend` | ✅ | `tests/differential.rs` |
-| `REDIS_PERSECOND` (routing of `second` keys) | ⬜ | |
+| `REDIS_PERSECOND` (routing of `second` keys) | ✅ | `per_second_limits_use_their_own_redis_like_upstream` |
 | Redis single (TCP or Unix socket, `redis://` URL, AUTH, pool, startup retry with backoff) | ✅ | `tests/runner.rs`, `tests/differential.rs` (`the_binary_*`) |
-| Redis sentinel / cluster, TLS, AUTH file, AWS IAM, close on `READONLY` | ⬜ | |
+| Redis TLS, AUTH file | ✅ | `redis_over_tls_is_used_like_upstream`, `auth_files_are_reread_like_upstream` |
+| Redis sentinel / cluster, AWS IAM, close on `READONLY` | ⬜ | |
 | Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
 
 ## 5. Metrics, logs, traces
@@ -322,6 +323,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Export errors are written by Go's standard logger with OTel's texts | the same logger format, this exporter's texts | best effort (D3) |
 | An invalid `OTEL_EXPORTER_OTLP_HEADERS` entry or endpoint is written whole in the error | the entry's position or the header's name, the variable's name | header values and URLs can hold credentials |
 | A `TRACING_SAMPLING_RATE` of `NaN` samples depending on the platform (Go's `uint64(NaN)`) | never | deterministic |
+| A failed TLS handshake with Redis names Go's error | Go's words for an unknown authority (Linux's: on macOS, Go asks the system, whose words differ), a name the certificate is not for (`x509.HostnameError`) and an expired certificate; rustls' for the others | the common failures read as upstream's |
+| A key pair or CA file that does not parse fails with Go's `crypto/tls` error | Go's for missing files and for files with no PEM data; rustls' otherwise | the file and the reason are named either way |
+| TLS to Redis over a Unix socket verifies the socket's path as the server's name | refused as a server name rustls cannot take | nobody encrypts a local socket |
 | The expiration jitter of each key is drawn from `math/rand` seeded with the start's second | another random source | the extras are random either way; their range is the same |
 | `OTEL_BSP_MAX_QUEUE_SIZE=0` lets a span through when the processor happens to wait for one; a negative size panics at startup | every span dropped | D1; nobody sets either |
 | The exporter's `User-Agent` is `OTel OTLP Exporter Go/1.45.0` (and grpc-go's) | `ratelimit/<version>` (and tonic's) | it names the software that sends |

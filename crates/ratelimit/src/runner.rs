@@ -156,6 +156,8 @@ impl PoolStats {
 /// Runs the service until it is told to stop (then stops gracefully): stats, config, Redis,
 /// then serving.
 pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> {
+    // NewSettings: the Redis TLS files are loaded with the settings.
+    let redis_tls = crate::redis::tls::from_settings(&settings)?.map(crate::redis::Tls);
     // NewRunner: the logger, then the stats sink and its flushes.
     configure_logger(&settings)?;
     let sink = stats::select_sink(&settings.sinks(lookup)?).map_err(stats::sink_failure)?;
@@ -226,13 +228,23 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     // createLimiter: Redis, healthy once connected.
     // The per-second pool comes first, as in `NewRateLimiterCacheImplFromSettings`.
     let (per_second_connection, connection) = match settings.backend_type.as_str() {
-        "redis" | "" => (
-            settings
-                .redis_persecond
-                .then(|| RedisConnection::per_second_from_settings(&settings))
-                .transpose()?,
-            RedisConnection::from_settings(&settings)?,
-        ),
+        "redis" | "" => {
+            let with_tls = |mut connection: RedisConnection, tls: bool| {
+                connection.tls = redis_tls.clone().filter(|_| tls);
+                connection
+            };
+            (
+                settings
+                    .redis_persecond
+                    .then(|| RedisConnection::per_second_from_settings(&settings))
+                    .transpose()?
+                    .map(|c| with_tls(c, settings.redis_persecond_tls)),
+                with_tls(
+                    RedisConnection::from_settings(&settings)?,
+                    settings.redis_tls,
+                ),
+            )
+        }
         "memcache" => {
             return Err("BACKEND_TYPE=memcache is not supported yet"
                 .to_string()

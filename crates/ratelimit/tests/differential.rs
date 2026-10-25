@@ -4265,6 +4265,10 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
+        // The TLS files, read with the settings when either pool uses TLS.
+        (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CACERT", "/nowhere/ca.pem".into())], "failed to read file: /nowhere/ca.pem: open /nowhere/ca.pem: no such file or directory".into()),
+        (vec![("REDIS_PERSECOND_TLS", "true".into()), ("REDIS_TLS_CACERT", runtime.join("current").to_string_lossy().into_owned() + "/ratelimit/config/llm.yaml")], format!("failed to load the provided TLS CA certificate: {}/ratelimit/config/llm.yaml", runtime.join("current").display())),
+        (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CLIENT_CERT", "/nowhere/c.pem".into()), ("REDIS_TLS_CLIENT_KEY", "/nowhere/k.pem".into())], "failed lo load TLS key pair (/nowhere/c.pem,/nowhere/k.pem): open /nowhere/c.pem: no such file or directory".into()),
         (vec![("REDIS_AUTH", "pw".into()), ("REDIS_AUTH_FILE", "/nowhere".into())], "REDIS_AUTH and REDIS_AUTH_FILE are mutually exclusive".into()),
         // Redis refuses the database: its error ends the message.
         (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
@@ -6615,7 +6619,16 @@ async fn logged_run(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let mut client = client.expect("the service serves");
+    let Some(mut client) = client else {
+        // Its stderr says why.
+        let mut child = child;
+        let _ = child.start_kill();
+        let output = child.wait_with_output().await.unwrap();
+        panic!(
+            "the service does not serve:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
     client
         .should_rate_limit(request("llm", &[&[("user", "a")]]))
         .await
@@ -7562,6 +7575,162 @@ async fn auth_files_are_reread_like_upstream() {
     }
 }
 
+/// A Redis serving TLS on `port` with the server certificate of `pki` (clients' certificates
+/// required with `clients`), and in clear on another port, to know it is up.
+async fn tls_redis(pki: &Pki, dir: &std::path::Path, port: u16, clients: bool) -> Child {
+    let (cert, key) = (dir.join("server.pem"), dir.join("server-key.pem"));
+    std::fs::write(&cert, &pki.server.0).unwrap();
+    std::fs::write(&key, &pki.server.1).unwrap();
+    let plain = reserved_port();
+    let process = Command::new(redis_server())
+        .args([
+            "--port",
+            &plain.to_string(),
+            "--tls-port",
+            &port.to_string(),
+        ])
+        .args(["--tls-cert-file", &cert.to_string_lossy()])
+        .args(["--tls-key-file", &key.to_string_lossy()])
+        .args(["--tls-ca-cert-file", &pki.ca.to_string_lossy()])
+        .args(["--tls-auth-clients", if clients { "yes" } else { "no" }])
+        .args(["--save", "", "--appendonly", "no"])
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the TLS Redis server");
+    for _ in 0..250 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", plain))
+            .await
+            .is_ok()
+        {
+            return process;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the TLS Redis server did not start");
+}
+
+/// `REDIS_TLS`: the connection over TLS, the server verified with the system's roots and
+/// `REDIS_TLS_CACERT` (by its name, unless `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION`), a client
+/// certificate when the server asks; what fails is retried and logged as upstream does.
+#[tokio::test]
+async fn redis_over_tls_is_used_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("redis-tls");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let pki = pki(&runtime.join("pki"));
+    let ca = pki.ca.to_string_lossy().into_owned();
+    let client = (
+        pki.client_cert.to_string_lossy().into_owned(),
+        pki.client_key.to_string_lossy().into_owned(),
+    );
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let after = regex::Regex::new(r"after [^:]+:").unwrap();
+    // An unknown authority: Go on macOS asks the system, whose words differ from Linux's.
+    let untrusted = regex::Regex::new(
+        r"x509: (“[^”]*” certificate is not trusted|certificate signed by unknown authority)",
+    )
+    .unwrap();
+    // (case, host, CA, skip hostname verification, client certificate, server asks for one, fails)
+    let cases = [
+        ("CA", "127.0.0.1", true, false, false, false, false),
+        (
+            "system roots only",
+            "127.0.0.1",
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+        ("another name", "localhost", true, false, false, false, true),
+        (
+            "another name, skipped",
+            "localhost",
+            true,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "client certificate",
+            "127.0.0.1",
+            true,
+            false,
+            true,
+            true,
+            false,
+        ),
+    ];
+    for (case, host, with_ca, skip, with_client, clients, fails) in cases {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let port = reserved_port();
+            let _redis = tls_redis(&pki, &runtime.join("pki"), port, clients).await;
+            let grpc = reserved_port();
+            let mut environment = vec![
+                (
+                    "RUNTIME_ROOT",
+                    runtime.join("current").to_string_lossy().into_owned(),
+                ),
+                ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+                ("REDIS_SOCKET_TYPE", "tcp".into()),
+                ("REDIS_URL", format!("{host}:{port}")),
+                ("REDIS_TLS", "true".into()),
+                ("REDIS_TLS_SKIP_HOSTNAME_VERIFICATION", skip.to_string()),
+                ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
+                ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
+                ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+                ("DISABLE_STATS", "true".into()),
+                ("LOG_LEVEL", "info".into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", reserved_port().to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ];
+            if with_ca {
+                environment.push(("REDIS_TLS_CACERT", ca.clone()));
+            }
+            if with_client {
+                environment.push(("REDIS_TLS_CLIENT_CERT", client.0.clone()));
+                environment.push(("REDIS_TLS_CLIENT_KEY", client.1.clone()));
+            }
+            let stderr = match fails {
+                true => startup_failure(&binary, &environment).await,
+                false => {
+                    logged_run(&binary, &environment, &format!("http://127.0.0.1:{grpc}")).await
+                }
+            };
+            let mut lines: Vec<String> = logrus_lines(&stderr, &[(port.to_string(), "PORT")])
+                .into_iter()
+                .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+                .filter(|l| l.contains("redis") || l.contains("Redis"))
+                .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+                .map(|l| after.replace(&l, "after ELAPSED:").into_owned())
+                .map(|l| untrusted.replace(&l, "x509: UNTRUSTED").into_owned())
+                .collect();
+            lines.dedup();
+            runs.push(lines);
+        }
+        assert!(runs[0].len() > 2, "{case}: {:?}", runs[0]);
+        assert_eq!(runs[1], runs[0], "{case}");
+    }
+}
+
 /// A Redis that answers only after the first dials fail: each failure, each retry, then the
 /// connection restored, as upstream logs them. A binary slowed down enough to dial only once
 /// Redis is up has nothing to compare, and a dial made while Redis comes up gets that
@@ -7663,12 +7832,21 @@ struct Pki {
 
 fn pki(dir: &std::path::Path) -> Pki {
     use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    // Each its own subject: OpenSSL takes a certificate named as its issuer for a root.
+    let named = |params: &mut CertificateParams, name: &str| {
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+    };
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    named(&mut ca, "test CA");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
     let issue = |name: &str, purpose| {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        named(&mut params, name);
         params.extended_key_usages = vec![purpose];
         let cert = params.signed_by(&key, &ca).unwrap();
         (cert.pem(), key.serialize_pem())
