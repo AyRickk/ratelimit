@@ -6178,6 +6178,7 @@ async fn server_stats_are_reported_like_upstream() {
             let service = Service::start(binary, &stats_environment(redis, sink)).await;
             server_calls(&service).await;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut previous: Option<Vec<String>> = None;
             let lines = loop {
                 let scraped = http_request(&address, "GET", "/metrics", &[]).await;
                 let lines: Vec<String> = scraped
@@ -6190,16 +6191,23 @@ async fn server_stats_are_reported_like_upstream() {
                     })
                     .map(String::from)
                     .collect();
-                // 6 calls counted, and 6 timed; the rate limit's counters, which can come in
-                // a later flush, too.
+                // 6 calls counted, and 6 timed; then the same over three flushes (100 ms
+                // each), so that counters flushed later (the rate limit's, the config's) are in.
                 let total: f64 = lines
                     .iter()
                     .filter(|l| !l.starts_with('#'))
                     .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
                     .sum();
-                let over_limit = lines.iter().any(|l| l.contains("over_limit"));
-                if (total >= 12.0 && over_limit) || std::time::Instant::now() > deadline {
+                if std::time::Instant::now() > deadline {
                     break lines;
+                }
+                if total >= 12.0 {
+                    if previous.as_ref() == Some(&lines) {
+                        break lines;
+                    }
+                    previous = Some(lines);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             };
