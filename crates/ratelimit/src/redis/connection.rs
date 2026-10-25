@@ -36,6 +36,18 @@ pub struct RedisConnection {
     pub prefix: &'static str,
     /// `REDIS_AUTH_FILE`: `user:password` or a password, read at each connection.
     pub auth_file: String,
+    /// `REDIS_TLS` (or `REDIS_PERSECOND_TLS`): the pool's connections over TLS.
+    pub tls: Option<Tls>,
+}
+
+/// A pool's TLS configuration (the same for both pools: equal when it is the same one).
+#[derive(Debug, Clone)]
+pub struct Tls(pub std::sync::Arc<rustls::ClientConfig>);
+
+impl PartialEq for Tls {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// What `newClientImpl` takes for one pool, from its group of settings.
@@ -58,9 +70,6 @@ impl RedisConnection {
     /// not supported yet).
     pub fn from_settings(s: &Settings) -> Result<Self, String> {
         crate::settings::refuse_unsupported(&[
-            (s.redis_tls, "REDIS_TLS"),
-            // Upstream loads the TLS files for either pool, the per-second one enabled or not.
-            (s.redis_persecond_tls, "REDIS_PERSECOND_TLS"),
             (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
             (
                 s.redis_close_connection_on_readonly_error,
@@ -83,13 +92,10 @@ impl RedisConnection {
 
     /// The per-second pool's connection (`REDIS_PERSECOND_*`), for limits in seconds.
     pub fn per_second_from_settings(s: &Settings) -> Result<Self, String> {
-        crate::settings::refuse_unsupported(&[
-            (s.redis_persecond_tls, "REDIS_PERSECOND_TLS"),
-            (
-                s.redis_persecond_aws_iam_auth,
-                "REDIS_PERSECOND_AWS_IAM_AUTH",
-            ),
-        ])?;
+        crate::settings::refuse_unsupported(&[(
+            s.redis_persecond_aws_iam_auth,
+            "REDIS_PERSECOND_AWS_IAM_AUTH",
+        )])?;
         Self::new(PoolSettings {
             prefix: "REDIS_PERSECOND",
             socket_type: &s.redis_persecond_socket_type,
@@ -139,6 +145,7 @@ impl RedisConnection {
             redis_type: p.redis_type.to_string(),
             prefix: p.prefix,
             auth_file: p.auth_file.to_string(),
+            tls: None,
         })
     }
 
@@ -174,9 +181,11 @@ impl RedisConnection {
             .iter()
             .find(|ip| family(ip))
             .ok_or_else(|| dial_error(format!("address {masked}: no suitable address found")))?;
-        Ok(ServerConfig::Centralized {
-            server: Server::new(ip.to_string(), port),
-        })
+        let mut server = Server::new(ip.to_string(), port);
+        if self.tls.is_some() {
+            server.tls_server_name = Some(self.tls_server_name().into());
+        }
+        Ok(ServerConfig::Centralized { server })
     }
 
     /// radix's AUTH arguments: with a user even when the password is empty.
@@ -224,6 +233,13 @@ impl RedisConnection {
             database: self.database.parse().ok().filter(|_| !probe),
             fail_fast: true,
             credential_provider,
+            tls: self
+                .tls
+                .clone()
+                .map(|Tls(config)| fred::types::config::TlsConfig {
+                    connector: fred::types::config::TlsConnector::Rustls(config.into()),
+                    hostnames: fred::types::config::TlsHostMapping::None,
+                }),
             ..Default::default()
         });
         let timeout = self.timeout;
@@ -278,27 +294,80 @@ impl RedisConnection {
         Ok((server, probe))
     }
 
-    /// Go's dial of the server: `dial <network> <address>: connect: <errno>`, or a timeout.
+    /// `tls.Dial`'s server name: the address before its last `:`, without IPv6's brackets.
+    fn tls_server_name(&self) -> String {
+        let host = self
+            .address
+            .rsplit_once(':')
+            .map_or(self.address.as_str(), |(host, _)| host);
+        host.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string()
+    }
+
+    /// The TLS handshake on `stream`, if the pool uses TLS; a failure is the TLS error alone,
+    /// as Go's `tls.Dialer` returns it.
+    async fn handshake(&self, stream: Stream) -> std::io::Result<Stream> {
+        let Some(Tls(config)) = &self.tls else {
+            return Ok(stream);
+        };
+        let name = rustls::pki_types::ServerName::try_from(self.tls_server_name())
+            .map_err(|e| std::io::Error::other(TlsError(format!("tls: {e}"))))?;
+        let connector = tokio_rustls::TlsConnector::from(config.clone());
+        match connector.connect(name, stream).await {
+            Ok(tls) => Ok(Box::new(tls)),
+            Err(e) => Err(std::io::Error::other(TlsError(tls_error_text(&e)))),
+        }
+    }
+
+    /// Go's dial of the server: `dial <network> <address>: connect: <errno>`, or a timeout;
+    /// then the TLS handshake, within the same timeout.
     async fn dial(&self, server: &ServerConfig) -> Result<Stream, String> {
         let network = &self.network;
         let (address, connected) = match server {
             ServerConfig::Unix { path } => {
                 let address = path.display().to_string();
                 let connect = tokio::net::UnixStream::connect(path.clone());
-                let connected = async { connect.await.map(|s| Box::new(s) as Stream) };
+                let connected = async {
+                    let stream = Box::new(connect.await?) as Stream;
+                    self.handshake(stream).await
+                };
                 (address, self.within_timeout(connected).await)
             }
             ServerConfig::Centralized { server } => {
                 let address = crate::net::join_host_port(&server.host, server.port.into());
                 let connect =
                     tokio::net::TcpStream::connect((server.host.to_string(), server.port));
-                let connected = async { connect.await.map(|s| Box::new(s) as Stream) };
-                (address, self.within_timeout(connected).await)
+                let started = tokio::time::Instant::now();
+                let connected = self
+                    .within_timeout(async { Ok(Box::new(connect.await?) as Stream) })
+                    .await;
+                // The handshake shares the dial's deadline; past it, Go says the context's.
+                let connected = match connected {
+                    Some(Ok(stream)) => {
+                        let left = self.timeout.saturating_sub(started.elapsed());
+                        let handshake = self.handshake(stream);
+                        match self.timeout.is_zero() {
+                            true => Some(handshake.await),
+                            false => match tokio::time::timeout(left, handshake).await {
+                                Ok(result) => Some(result),
+                                Err(_) => return Err("context deadline exceeded".into()),
+                            },
+                        }
+                    }
+                    other => other,
+                };
+                (address, connected)
             }
             _ => return Err(format!("dial {network}: unsupported server")),
         };
         match connected {
             Some(Ok(stream)) => Ok(stream),
+            Some(Err(e)) if e.get_ref().is_some_and(|inner| inner.is::<TlsError>()) => Err(e
+                .into_inner()
+                .map(|inner| inner.to_string())
+                .unwrap_or_default()),
             Some(Err(e)) if e.raw_os_error().is_some() => Err(format!(
                 "dial {network} {address}: connect: {}",
                 crate::go::errno_text(&e)
@@ -375,6 +444,9 @@ impl RedisConnection {
             self.pool_size_setting
         ));
         // createDialer.
+        if self.tls.is_some() {
+            crate::log::warn(&format!("enabling TLS to redis {masked}"));
+        }
         if !self.auth.is_empty() {
             match self.auth.split_once(':') {
                 Some((user, _)) => crate::log::warn(&format!(
@@ -542,6 +614,116 @@ impl fred::types::config::CredentialProvider for FileCredentials {
             .credentials()
             .map_err(|e| fred::error::Error::new(fred::error::ErrorKind::Auth, e))?;
         Ok(fred_credentials(&credentials))
+    }
+}
+
+/// A TLS handshake's failure, told apart from the dial's.
+#[derive(Debug)]
+struct TlsError(String);
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TlsError {}
+
+/// A rustls failure in Go's words where they are common (an unknown authority, a name the
+/// certificate is not for, an expired certificate); rustls' otherwise (docs/parity.md §7).
+fn tls_error_text(error: &std::io::Error) -> String {
+    use rustls::{CertificateError, Error};
+    let rustls = error.get_ref().and_then(|e| e.downcast_ref::<Error>());
+    let x509 = match rustls {
+        Some(Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+            "certificate signed by unknown authority".to_string()
+        }
+        Some(Error::InvalidCertificate(CertificateError::NotValidForNameContext {
+            expected,
+            presented,
+        })) => {
+            return format!(
+                "tls: failed to verify certificate: {}",
+                hostname_error(expected, presented)
+            );
+        }
+        Some(Error::InvalidCertificate(CertificateError::NotValidForName)) => {
+            "certificate is not valid for the server's name".to_string()
+        }
+        Some(Error::InvalidCertificate(CertificateError::ExpiredContext { time, not_after })) => {
+            format!(
+                "certificate has expired or is not yet valid: current time {} is after {}",
+                rfc3339(time.as_secs()),
+                rfc3339(not_after.as_secs())
+            )
+        }
+        Some(Error::InvalidCertificate(CertificateError::NotValidYetContext {
+            time,
+            not_before,
+        })) => format!(
+            "certificate has expired or is not yet valid: current time {} is before {}",
+            rfc3339(time.as_secs()),
+            rfc3339(not_before.as_secs())
+        ),
+        Some(Error::InvalidCertificate(
+            CertificateError::Expired | CertificateError::NotValidYet,
+        )) => "certificate has expired or is not yet valid".to_string(),
+        Some(e) => return format!("tls: {e}"),
+        None => return error.to_string(),
+    };
+    format!("tls: failed to verify certificate: x509: {x509}")
+}
+
+/// `time.RFC3339` in UTC, as `x509` writes a validity error's times.
+fn rfc3339(seconds: u64) -> String {
+    jiff::Timestamp::from_second(seconds as i64)
+        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
+/// `x509.HostnameError`: the certificate's IP addresses for an IP, its DNS names otherwise.
+fn hostname_error(expected: &rustls::pki_types::ServerName<'_>, presented: &[String]) -> String {
+    let host = expected.to_str();
+    // rustls writes them `IpAddress(…)` and `DnsName("…")`.
+    let unwrap = |name: &str| {
+        let inner = name
+            .strip_prefix("IpAddress(")
+            .or_else(|| name.strip_prefix("DnsName("))
+            .and_then(|n| n.strip_suffix(')'))
+            .unwrap_or(name);
+        inner.trim_matches('"').to_string()
+    };
+    let (ips, names): (Vec<String>, Vec<String>) = presented
+        .iter()
+        .map(|name| unwrap(name))
+        .partition(|name| name.parse::<std::net::IpAddr>().is_ok());
+    let valid = match host.parse::<std::net::IpAddr>() {
+        Ok(_) if ips.is_empty() => {
+            return format!(
+                "x509: cannot validate certificate for {host} because it doesn't contain any IP SANs"
+            );
+        }
+        Ok(_) if ips.len() >= 100 => {
+            return format!(
+                "x509: certificate is valid for {} IP SANs, but none matched {host}",
+                ips.len()
+            );
+        }
+        Ok(_) => ips,
+        Err(_) if names.len() >= 100 => {
+            return format!(
+                "x509: certificate is valid for {} names, but none matched {host}",
+                names.len()
+            );
+        }
+        Err(_) => names,
+    };
+    match valid.is_empty() {
+        true => format!("x509: certificate is not valid for any names, but wanted to match {host}"),
+        false => format!(
+            "x509: certificate is valid for {}, not {host}",
+            valid.join(", ")
+        ),
     }
 }
 
@@ -766,5 +948,54 @@ mod auth_file_tests {
         assert_eq!(credentials("secret"), ("url-user".into(), "secret".into()));
         assert_eq!(credentials(":secret"), ("url-user".into(), "secret".into()));
         assert_eq!(credentials("me:a:b\n"), ("me".into(), "a:b".into()));
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    /// `x509.HostnameError.Error`'s texts (crypto/x509/verify.go).
+    #[test]
+    fn name_errors_read_like_go() {
+        let error = |host: &str, presented: &[&str]| {
+            let expected = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+            let presented: Vec<String> = presented.iter().map(|s| s.to_string()).collect();
+            hostname_error(&expected, &presented)
+        };
+        assert_eq!(
+            error(
+                "redis.example",
+                &[
+                    "DnsName(\"a.example\")",
+                    "DnsName(\"b.example\")",
+                    "IpAddress(10.0.0.1)"
+                ]
+            ),
+            "x509: certificate is valid for a.example, b.example, not redis.example"
+        );
+        assert_eq!(
+            error("redis.example", &["IpAddress(10.0.0.1)"]),
+            "x509: certificate is not valid for any names, but wanted to match redis.example"
+        );
+        assert_eq!(
+            error(
+                "10.0.0.2",
+                &["IpAddress(10.0.0.1)", "DnsName(\"a.example\")"]
+            ),
+            "x509: certificate is valid for 10.0.0.1, not 10.0.0.2"
+        );
+        assert_eq!(
+            error("10.0.0.2", &["DnsName(\"a.example\")"]),
+            "x509: cannot validate certificate for 10.0.0.2 because it doesn't contain any IP SANs"
+        );
+        let many: Vec<String> = (0..100)
+            .map(|i| format!("DnsName(\"n{i}.example\")"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(
+            error("redis.example", &many),
+            "x509: certificate is valid for 100 names, but none matched redis.example"
+        );
     }
 }

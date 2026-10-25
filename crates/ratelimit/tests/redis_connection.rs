@@ -203,15 +203,4 @@ fn per_second_errors_name_its_variables() {
         RedisConnection::per_second_from_settings(&settings).unwrap_err(),
         "invalid REDIS_PERSECOND_POOL_SIZE -2"
     );
-    // TLS files are loaded for either pool upstream, whether the per-second one is on or not.
-    let tls = Settings::from_lookup(&|key| match key {
-        "REDIS_PERSECOND_TLS" => Some("true".into()),
-        _ => None,
-    })
-    .unwrap();
-    assert!(
-        RedisConnection::from_settings(&tls)
-            .unwrap_err()
-            .contains("REDIS_PERSECOND_TLS")
-    );
 }
