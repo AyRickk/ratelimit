@@ -38,6 +38,8 @@ pub struct RedisConnection {
     pub auth_file: String,
     /// `REDIS_TLS` (or `REDIS_PERSECOND_TLS`): the pool's connections over TLS.
     pub tls: Option<Tls>,
+    /// `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR`, for both pools.
+    pub close_on_readonly: bool,
 }
 
 /// A pool's TLS configuration (the same for both pools: equal when it is the same one).
@@ -63,19 +65,14 @@ struct PoolSettings<'a> {
     pool_on_empty_behavior: &'a str,
     redis_type: &'a str,
     pipeline_limit: i64,
+    close_on_readonly: bool,
 }
 
 impl RedisConnection {
     /// The main pool's connection (`REDIS_*`), or why upstream refuses to start (or what is
     /// not supported yet).
     pub fn from_settings(s: &Settings) -> Result<Self, String> {
-        crate::settings::refuse_unsupported(&[
-            (s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH"),
-            (
-                s.redis_close_connection_on_readonly_error,
-                "REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR",
-            ),
-        ])?;
+        crate::settings::refuse_unsupported(&[(s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH")])?;
         Self::new(PoolSettings {
             prefix: "REDIS",
             socket_type: &s.redis_socket_type,
@@ -87,6 +84,7 @@ impl RedisConnection {
             pool_on_empty_behavior: &s.redis_pool_on_empty_behavior,
             redis_type: &s.redis_type,
             pipeline_limit: s.redis_pipeline_limit,
+            close_on_readonly: s.redis_close_connection_on_readonly_error,
         })
     }
 
@@ -107,6 +105,7 @@ impl RedisConnection {
             pool_on_empty_behavior: &s.redis_persecond_pool_on_empty_behavior,
             redis_type: &s.redis_persecond_type,
             pipeline_limit: s.redis_persecond_pipeline_limit,
+            close_on_readonly: s.redis_close_connection_on_readonly_error,
         })
     }
 
@@ -146,6 +145,7 @@ impl RedisConnection {
             prefix: p.prefix,
             auth_file: p.auth_file.to_string(),
             tls: None,
+            close_on_readonly: p.close_on_readonly,
         })
     }
 
@@ -466,6 +466,11 @@ impl RedisConnection {
         if !self.auth_file.is_empty() {
             crate::log::warn(&format!(
                 "Redis pool {masked}: resolving credentials on every connection attempt"
+            ));
+        }
+        if self.close_on_readonly {
+            crate::log::warn(&format!(
+                "Redis pool {masked}: closing connections on READONLY error replies"
             ));
         }
         match self.pool_on_empty_behavior.to_uppercase().as_str() {
