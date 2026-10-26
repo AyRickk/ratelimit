@@ -9875,11 +9875,12 @@ async fn xds_runs<F, Fut>(
     .await;
     assert_eq!(ours.0, upstream.0, "observations");
     assert_eq!(ours.1, upstream.1, "streams");
-    // Upstream's process may exit before its provider logs that it stops: those lines, when
-    // upstream has them, ours has, but are compared no further.
+    // Upstream's process may exit before its provider, or its debug server, logs that it
+    // stops: those lines, when upstream has them, ours has, but are compared no further.
     let stopping = |l: &String| {
         l.contains("Stopping xDS client watch")
             || l.contains("grpc: the client connection is closing")
+            || l.contains("Failed to start debug server")
     };
     let (mut ours, mut upstream) = (ours, upstream);
     let upstream_stopping: Vec<String> =
