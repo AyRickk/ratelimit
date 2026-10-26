@@ -4096,6 +4096,61 @@ async fn the_file_provider_reloads_like_upstream() {
     h.call(request("other", &[&[("k", "v")]])).await.unwrap();
 }
 
+/// Each config loaded makes upstream read the settings again (`SetConfig`'s
+/// `settings.NewSettings`): a TLS file gone, a reload stops the service with its error.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_reloads_reread_the_tls_files_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let root = temp_dir("reread");
+    write_tree(
+        &root,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("v2/ratelimit/config/other.yaml", OTHER_CONFIG),
+        ],
+    );
+    let test_pki = pki(&root.join("pki"));
+    let (cert, key) = server_files(&root.join("certs"), &test_pki.server);
+    let ca_pem = std::fs::read(&test_pki.ca).unwrap();
+    let message = format!(
+        "failed to read file: {0}: open {0}: no such file or directory",
+        test_pki.ca.display()
+    );
+    let redis = Redis::start().await;
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        std::fs::write(&test_pki.ca, &ca_pem).unwrap();
+        let _ = std::fs::remove_file(root.join("current"));
+        std::os::unix::fs::symlink("v1", root.join("current")).unwrap();
+        let http = reserved_port();
+        let mut environment = binary_environment(&root, &redis);
+        environment.extend([
+            ("GRPC_HOST", "127.0.0.1".to_string()),
+            ("GRPC_PORT", reserved_port().to_string()),
+            ("PORT", http.to_string()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+            ("GRPC_SERVER_USE_TLS", "true".into()),
+            ("GRPC_SERVER_TLS_CERT", cert.clone()),
+            ("GRPC_SERVER_TLS_KEY", key.clone()),
+            (
+                "GRPC_CLIENT_TLS_CACERT",
+                test_pki.ca.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let logged = Logged::start(&binary, &environment, http).await;
+        std::fs::remove_file(&test_pki.ca).unwrap();
+        std::os::unix::fs::symlink("v2", root.join("next")).unwrap();
+        std::fs::rename(root.join("next"), root.join("current")).unwrap();
+        let stderr = logged.exited().await;
+        assert!(stderr.contains(&message), "{}: {stderr}", binary.display());
+    }
+}
+
 /// Upstream's own service binary (`src/service_cmd`), built at the pinned commit.
 fn upstream_binary() -> PathBuf {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -9386,7 +9441,7 @@ impl AggregatedDiscoveryService for XdsServer {
                 .contains(&k.as_str())
             })
             .collect();
-        // In no order, like a Go map's.
+        // Sorted: grpc-go sends them in a Go map's random order.
         let mut metadata: Vec<(String, String)> = metadata;
         metadata.sort();
         let (responder, responses) = tokio::sync::mpsc::unbounded_channel();
@@ -9413,7 +9468,7 @@ impl AggregatedDiscoveryService for XdsServer {
 }
 
 impl XdsServer {
-    /// Serves on `port` (over TLS with `tls`) until dropped... for the test's life.
+    /// Serves on `port` (over TLS with `tls`) for the rest of the test.
     async fn start(port: u16, tls: Option<tonic::transport::ServerTlsConfig>) -> Self {
         let server = Self::default();
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -9496,7 +9551,7 @@ fn xds_config(name: &str, domain: &str, key: &str, requests: u32) -> rls_conf::R
     }
 }
 
-/// The ports and servers of one xDS run of a binary.
+/// The ports of one xDS run of a binary.
 #[derive(Clone)]
 struct XdsRun {
     xds_port: u16,
@@ -9808,7 +9863,8 @@ async fn xds_configs_are_acked_like_upstream() {
             xds.wait_requests(7).await;
             xds.respond(Ok(xds_response("v5", "n5", &[second])));
             xds.wait_requests(8).await;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // The ACK goes out once the service has taken the config, maybe not yet applied.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             observed.extend(xds_calls(&run, &[user.clone(), user]).await);
             (observed, Some(xds), false)
         }

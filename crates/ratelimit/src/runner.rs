@@ -331,6 +331,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         // `NewService`'s update loop, which takes every event.
         crate::debug!("Waiting for config update event");
     }
+    let reread = settings.clone();
     let update =
         move |config: Result<crate::config::RateLimitConfig, crate::config::ConfigError>| {
             let mut first = first.lock().unwrap();
@@ -345,6 +346,12 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
                     false => config_health.ok(health::CONFIG),
                     true => config_health.fail(health::CONFIG),
                 };
+            }
+            // `SetConfig` reads the settings again: a TLS file gone panics.
+            if config.is_ok()
+                && let Err(e) = settings_tls(&reread)
+            {
+                log::panic_exit(&e);
             }
             updated.update_config(config);
             if looped {
@@ -504,8 +511,8 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     served.map_err(Failure::from)
 }
 
-/// The TLS files `NewSettings` loads: Redis's, the gRPC server's, then the xDS client's; an
-/// error is what upstream panics with.
+/// The TLS files `NewSettings` loads: Redis's, the gRPC server's, then the xDS client's (and
+/// Memcached's, not supported yet); an error is what upstream panics with.
 struct SettingsTls {
     redis: Option<crate::redis::Tls>,
     grpc: Option<crate::grpc_tls::ServerTls>,

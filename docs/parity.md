@@ -168,6 +168,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
 | Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
 | Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
+| Each config loaded reads the settings' TLS files again (`SetConfig`'s `NewSettings`): one gone stops the service with its error | ✅ | `config_reloads_reread_the_tls_files_like_upstream` (Linux), `xds_responses_reread_the_tls_files_like_upstream` |
 | YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL as a line break | ✅ | `tests/differential.rs` |
 | Quoted scalars continued on less indented lines, as yaml.v2 reads them | ✅ | `quoted_scalars_continue_on_any_indentation_like_upstream` in `tests/differential.rs`; unit tests in `config/yaml.rs` |
 | Flow collections (`[a,`, `{a: b,`) continued on less indented lines, as yaml.v2 reads them | ⬜ | |
@@ -285,9 +286,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | protobuf-go starts its errors (`proto: mismatched message type`, logged and in NACKs) with `proto:` and a space or a non-breaking space, depending on the build | always a space | Go randomises it on purpose |
 | On SIGTERM, upstream's process may exit before its xDS provider logs `Stopping xDS client watch for rate limit configurations` and the stream's `Canceled` error | always logged while a stream is up | one of upstream's outcomes, deterministic |
 | A stream whose connection is lost reads as grpc-go's transport error for how it was lost (a reset, a `GOAWAY`, a missing trailer) | `rpc error: code = Unavailable desc = error reading from server: EOF` for all | best effort (D3); the stream is opened again either way |
-| A `RateLimitConfig` protobuf-go cannot decode: its error for that input | `string field contains invalid UTF-8` or `proto: cannot parse invalid wire-format data`; messages nested over 100 levels are refused (protobuf-go: 10000) | prost; malformed resources only |
+| A `RateLimitConfig` (or `DiscoveryResponse`) protobuf-go cannot decode: its error for that input; a known field with the wrong wire type kept as an unknown field | `string field contains invalid UTF-8` or `proto: cannot parse invalid wire-format data`; a wrong wire type refused (NACKed, or the stream failed); messages nested over 100 levels refused (protobuf-go: 10000) | prost; malformed resources only |
 | The xDS client's `user-agent` is grpc-go's | tonic's | only the management server sees it |
-| A `unix://HOST/PATH` or `unix-abstract:` xDS URL: grpc-go's resolver refuses the first, dials the second | the path dialled for the first; the second is not supported | not needed by the targeted deployments |
+| A `unix://HOST/PATH` or `unix-abstract:` xDS URL: grpc-go's resolver refuses the first, dials the second | the path (or the host, without a path) dialled for the first; the second is not supported | not needed by the targeted deployments |
 | `LOG_LEVEL=trace` writes each xDS response as Go prints the structure (with memory addresses) | not written | best effort (D3) |
 | What upstream panics on at startup prints Go's panic and its stack trace, exit status 2 | a logrus `level=fatal` line with the panic's message, written whatever `LOG_LEVEL`, exit status 1 | D1: crashes are not reproduced; the stack trace has no equivalent |
 | radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |

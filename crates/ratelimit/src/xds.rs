@@ -12,6 +12,7 @@ use ratelimit_proto::envoy::config::core::v3::Node;
 use ratelimit_proto::envoy::service::discovery::v3::{DiscoveryRequest, DiscoveryResponse};
 use ratelimit_proto::ratelimit::config::ratelimit::v3 as pb;
 use rustls::pki_types::ServerName;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -27,7 +28,7 @@ const DEFAULT_MAX_RECEIVE: i64 = 4 * 1024 * 1024;
 const ERR_INIT: &str = "ads client: grpc connection is not initialized (use InitConnect() method to initialize connection)";
 
 /// What the provider sends the service.
-pub enum Event {
+enum Event {
     Config(Result<RateLimitConfig, ConfigError>),
     /// A panic `sendConfigs` recovered that is no config error: the service panics with it.
     Panic(String),
@@ -117,15 +118,7 @@ fn target(url: &str) -> Target {
                 .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
     });
     if let Some(i) = scheme_end {
-        let rest = &url[i + 1..];
-        // `url.URL`'s path without its leading `/` (or its opaque part), after the host.
-        let (host, path) = match rest.strip_prefix("//") {
-            Some(rest) => match rest.find('/') {
-                Some(j) => (&rest[..j], &rest[j..]),
-                None => (rest, ""),
-            },
-            None => ("", rest),
-        };
+        let (host, path) = host_and_path(&url[i + 1..]);
         match url[..i].to_ascii_lowercase().as_str() {
             "unix" if host.is_empty() => {
                 return Target {
@@ -155,7 +148,19 @@ fn target(url: &str) -> Target {
     passthrough(url)
 }
 
-/// The passthrough resolver's address, as grpc-go's dialer (`parseDialTarget`) reads it.
+/// A URL's host and path (or opaque part), after its scheme's `:`.
+fn host_and_path(rest: &str) -> (&str, &str) {
+    match rest.strip_prefix("//") {
+        Some(rest) => match rest.find('/') {
+            Some(j) => (&rest[..j], &rest[j..]),
+            None => (rest, ""),
+        },
+        None => ("", rest),
+    }
+}
+
+/// The passthrough resolver's address, as grpc-go's dialer (`parseDialTarget`) reads it; Go
+/// dials the local system for an empty host.
 fn passthrough(endpoint: &str) -> Target {
     let authority = match endpoint.starts_with(':') {
         true => format!("localhost{endpoint}"),
@@ -164,17 +169,10 @@ fn passthrough(endpoint: &str) -> Target {
     let address = match (endpoint.find(':'), endpoint.find(":/")) {
         (Some(i), None) if &endpoint[..i] == "unix" => Address::Unix(endpoint[i + 1..].into()),
         (_, Some(i)) if &endpoint[..i] == "unix" => {
-            let rest = &endpoint[i + 1..];
-            let path = match rest.strip_prefix("//") {
-                Some(rest) => match rest.find('/') {
-                    Some(j) => rest[j..].to_string(),
-                    None => rest.to_string(),
-                },
-                None => rest.to_string(),
-            };
-            Address::Unix(path)
+            let (host, path) = host_and_path(&endpoint[i + 1..]);
+            Address::Unix(if path.is_empty() { host } else { path }.into())
         }
-        _ => Address::Tcp(endpoint.to_string()),
+        _ => Address::Tcp(authority.clone()),
     };
     Target { address, authority }
 }
@@ -297,9 +295,8 @@ impl Ads {
 }
 
 /// `getClientNode`: the node ID, and the `KEY=VALUE` pairs of the metadata (others skipped).
-fn node(settings: &Settings) -> Node {
-    let fields = settings
-        .config_grpc_xds_node_metadata
+fn node(id: &str, metadata: &str) -> Node {
+    let fields = metadata
         .split(',')
         .filter_map(|entry| entry.split_once('='))
         .map(|(key, value)| {
@@ -312,7 +309,7 @@ fn node(settings: &Settings) -> Node {
         })
         .collect();
     Node {
-        id: settings.config_grpc_xds_node_id.clone(),
+        id: id.into(),
         metadata: Some(prost_types::Struct { fields }),
         ..Default::default()
     }
@@ -327,56 +324,51 @@ const RESERVED_HEADERS: &[&str] = &[
     "grpc-message",
     "grpc-status",
     "grpc-timeout",
-    "grpc-status-details-bin",
     "te",
 ];
 
-/// `metadata.New` of `CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS` (keys lowercased), checked
-/// as grpc-go checks a call's metadata (`imetadata.Validate`); the error fails the stream.
-fn headers(settings: &Settings) -> Result<Vec<(String, String)>, String> {
-    let headers: Vec<(String, String)> = settings
-        .config_grpc_xds_client_additional_headers
+/// `metadata.New` of `CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS` (keys lowercased), without
+/// grpc-go's reserved headers; `None` if grpc-go refuses them for a call's metadata
+/// (`imetadata.Validate`: an empty key, a key not in `[0-9a-z-_.]` unless a pseudo-header, a
+/// value not printable ASCII unless `-bin`), which fails the stream before it opens.
+fn headers(headers: &BTreeMap<String, String>) -> Option<Vec<(String, String)>> {
+    let headers: Vec<(String, String)> = headers
         .iter()
         .map(|(key, value)| (key.to_lowercase(), value.clone()))
         .collect();
     for (key, value) in &headers {
-        if key.is_empty() {
-            return Err("there is an empty key in the header".into());
-        }
-        if key.starts_with(':') {
-            continue;
-        }
-        if !key
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-        {
-            return Err(format!(
-                "header key {key:?} contains illegal characters not in [0-9a-z-_.]"
-            ));
-        }
-        if !key.ends_with("-bin") && value.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
-            return Err(format!(
-                "header key {key:?} contains value with non-printable ASCII characters"
-            ));
+        let key_valid = key.starts_with(':')
+            || key
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
+        let value_valid =
+            key.ends_with("-bin") || value.bytes().all(|b| (0x20..=0x7e).contains(&b));
+        if key.is_empty() || !key_valid || !value_valid {
+            return None;
         }
     }
-    Ok(headers
-        .into_iter()
-        .filter(|(key, _)| !key.starts_with(':') && !RESERVED_HEADERS.contains(&key.as_str()))
-        .collect())
+    Some(
+        headers
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(':') && !RESERVED_HEADERS.contains(&key.as_str()))
+            .collect(),
+    )
 }
+
+/// The TLS configuration (offering `h2`) and the server name to verify.
+type TlsTarget = (Arc<rustls::ClientConfig>, ServerName<'static>);
 
 /// The client's settings, read once.
 struct Client {
     url: String,
     target: Target,
-    /// With TLS: the configuration (offering `h2`) and the server name to verify.
-    tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
+    tls: Option<TlsTarget>,
     san: String,
     enforce_alpn: bool,
-    max_receive: i64,
-    max_receive_set: bool,
-    headers: Result<Vec<(String, String)>, String>,
+    /// `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES`, if set.
+    max_receive: Option<i64>,
+    /// `None` when grpc-go refuses them.
+    headers: Option<Vec<(String, String)>>,
     node: Node,
     options: LoadOptions,
     backoff: Backoff,
@@ -403,7 +395,7 @@ impl Client {
                     .map_or(target.authority.clone(), |(host, _)| host.to_string()),
             };
             let name = ServerName::try_from(name)
-                .unwrap_or_else(|_| ServerName::try_from("invalid.").unwrap());
+                .unwrap_or_else(|_| ServerName::try_from("invalid.").expect("a valid name"));
             (Arc::new(config), name)
         });
         let max = settings.xds_client_max_msg_size_in_bytes;
@@ -413,10 +405,12 @@ impl Client {
             tls,
             san,
             enforce_alpn,
-            max_receive: if max != 0 { max } else { DEFAULT_MAX_RECEIVE },
-            max_receive_set: max != 0,
-            headers: headers(settings),
-            node: node(settings),
+            max_receive: (max != 0).then_some(max),
+            headers: headers(&settings.config_grpc_xds_client_additional_headers),
+            node: node(
+                &settings.config_grpc_xds_node_id,
+                &settings.config_grpc_xds_node_metadata,
+            ),
             options: settings.load_options(),
             backoff: Backoff {
                 min: settings.xds_client_backoff_initial_interval,
@@ -473,10 +467,9 @@ impl Client {
                 self.san
             ));
         }
-        if self.max_receive_set {
+        if let Some(max) = self.max_receive {
             log::info(&format!(
-                "Setting xDS gRPC max receive message size to {} bytes",
-                self.max_receive
+                "Setting xDS gRPC max receive message size to {max} bytes"
             ));
         }
         // The `:authority`: the SAN with TLS, else the target's.
@@ -528,7 +521,7 @@ impl Client {
         ads: &mut Ads,
         events: &mpsc::Sender<Delivery>,
     ) -> String {
-        let Ok(headers) = &self.headers else {
+        let Some(headers) = &self.headers else {
             return ERR_INIT.into();
         };
         let (requests, outgoing) = mpsc::unbounded_channel();
@@ -559,11 +552,11 @@ impl Client {
             }
         }
         let mut grpc = tonic::client::Grpc::new(channel).max_decoding_message_size(usize::MAX);
-        if let Err(e) = grpc.ready().await {
-            return go_transport_error(&e.to_string());
+        if grpc.ready().await.is_err() {
+            return TRANSPORT_ERROR.into();
         }
         let codec = Codec {
-            max_receive: self.max_receive,
+            max_receive: self.max_receive.unwrap_or(DEFAULT_MAX_RECEIVE),
         };
         let path = http::uri::PathAndQuery::from_static(STREAM_PATH);
         let mut stream = match grpc.streaming(request, path, codec).await {
@@ -658,7 +651,7 @@ fn proto_error(e: &prost::DecodeError) -> String {
 fn go_status(status: &tonic::Status) -> String {
     // A transport failure, not the server's status.
     if std::error::Error::source(status).is_some() {
-        return go_transport_error(status.message());
+        return TRANSPORT_ERROR.into();
     }
     use tonic::Code;
     let code = match status.code() {
@@ -684,9 +677,7 @@ fn go_status(status: &tonic::Status) -> String {
 }
 
 /// What grpc-go reports when the connection under a stream is lost.
-fn go_transport_error(_: &str) -> String {
-    "rpc error: code = Unavailable desc = error reading from server: EOF".into()
-}
+const TRANSPORT_ERROR: &str = "rpc error: code = Unavailable desc = error reading from server: EOF";
 
 /// The stream's codec: grpc-go's receive size limit, and protobuf-go's error texts.
 #[derive(Clone, Copy)]
@@ -757,7 +748,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 /// unless ALPN is not enforced).
 async fn connect(
     target: Arc<Target>,
-    tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
+    tls: Option<TlsTarget>,
     enforce_alpn: bool,
     spoken: Option<oneshot::Sender<bool>>,
 ) -> std::io::Result<hyper_util::rt::TokioIo<FirstRead>> {
@@ -857,12 +848,47 @@ mod tests {
             tcp("127.0.0.1:18000", "127.0.0.1:18000")
         );
         assert_eq!(target("[::1]:18000"), tcp("[::1]:18000", "[::1]:18000"));
-        assert_eq!(target(":18000"), tcp(":18000", "localhost:18000"));
+        assert_eq!(target(":18000"), tcp("localhost:18000", "localhost:18000"));
         assert_eq!(target("dns:///xds:18000"), tcp("xds:18000", "xds:18000"));
         assert_eq!(target("DNS:///xds"), tcp("xds:443", "xds"));
         assert_eq!(target("passthrough:///xds:1"), tcp("xds:1", "xds:1"));
         assert_eq!(target("unix:///run/xds.sock"), unix("/run/xds.sock"));
         assert_eq!(target("unix:xds.sock"), unix("xds.sock"));
+    }
+
+    #[test]
+    fn headers_are_checked_like_grpc_go() {
+        let of = |pairs: &[(&str, &str)]| {
+            headers(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            of(&[("X-A", "1"), ("b.c_d-9", "2")]),
+            Some(vec![pair("x-a", "1"), pair("b.c_d-9", "2")])
+        );
+        // Reserved headers are left out, pseudo-headers too (their values still checked).
+        assert_eq!(
+            of(&[
+                ("te", "x"),
+                ("user-agent", "x"),
+                ("grpc-status-details-bin", "x"),
+                (":p", "x")
+            ]),
+            Some(vec![pair("grpc-status-details-bin", "x")])
+        );
+        assert_eq!(of(&[(":p", "\u{1}")]), None);
+        assert_eq!(of(&[("", "x")]), None);
+        assert_eq!(of(&[("a b", "x")]), None);
+        assert_eq!(of(&[("a", "caf\u{e9}")]), None);
+        assert_eq!(
+            of(&[("a-bin", "caf\u{e9}")]),
+            Some(vec![pair("a-bin", "caf\u{e9}")])
+        );
     }
 
     #[test]
