@@ -167,6 +167,7 @@ pub async fn serve<H, F>(
         let Ok((stream, _)) = accepted else {
             continue;
         };
+        crate::net::nodelay(&stream);
         let handler = handler.clone();
         connections.spawn(async move {
             let service = hyper::service::service_fn(move |request: Request| {

@@ -245,6 +245,8 @@ impl RedisConnection {
         let timeout = self.timeout;
         builder.with_connection_config(|c| {
             c.connection_timeout = timeout;
+            // Go's TCP connections are `TCP_NODELAY`.
+            c.tcp.nodelay = Some(true);
             // radix bounds only the dial, not the commands that set a connection up.
             c.internal_command_timeout = Duration::from_secs(10 * 365 * 24 * 3600);
         });
@@ -341,7 +343,11 @@ impl RedisConnection {
                     tokio::net::TcpStream::connect((server.host.to_string(), server.port));
                 let started = tokio::time::Instant::now();
                 let connected = self
-                    .within_timeout(async { Ok(Box::new(connect.await?) as Stream) })
+                    .within_timeout(async {
+                        let stream = connect.await?;
+                        crate::net::nodelay(&stream);
+                        Ok(Box::new(stream) as Stream)
+                    })
                     .await;
                 // The handshake shares the dial's deadline; past it, Go says the context's.
                 let connected = match connected {

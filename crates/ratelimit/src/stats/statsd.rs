@@ -237,7 +237,11 @@ impl Writer {
         let address = (self.host.as_str(), self.port);
         let connect = async {
             Ok(match self.protocol {
-                StatsdProtocol::Tcp => Connection::Tcp(TcpStream::connect(address).await?),
+                StatsdProtocol::Tcp => {
+                    let stream = TcpStream::connect(address).await?;
+                    crate::net::nodelay(&stream);
+                    Connection::Tcp(stream)
+                }
                 StatsdProtocol::Udp => {
                     let target =
                         tokio::net::lookup_host(address)

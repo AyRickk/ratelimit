@@ -755,7 +755,7 @@ async fn connect(
     let io: Box<dyn Io> = match &target.address {
         Address::Tcp(address) => {
             let stream = tokio::net::TcpStream::connect(address.as_str()).await?;
-            let _ = stream.set_nodelay(true);
+            crate::net::nodelay(&stream);
             Box::new(stream)
         }
         Address::Unix(path) => Box::new(tokio::net::UnixStream::connect(path).await?),
