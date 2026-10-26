@@ -24,3 +24,4 @@ pub mod settings;
 pub mod stats;
 pub mod tls;
 pub mod trace;
+pub mod xds;

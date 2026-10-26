@@ -2,6 +2,7 @@
 //! to a descriptor. A port of envoyproxy/ratelimit `src/config/config_impl.go`.
 
 mod schema;
+mod xds;
 pub(crate) mod yaml;
 
 use rate_limit_response::rate_limit::Unit;
@@ -142,6 +143,16 @@ pub fn load_bytes(
         .collect::<Result<Vec<_>, _>>()?;
     let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
     load_roots(&names, roots, options)
+}
+
+/// The configs an xDS management server sent (`ConfigXdsProtoToYaml`, then the loader), each
+/// named after its `name` in errors.
+pub fn load_xds(
+    configs: &[ratelimit_proto::ratelimit::config::ratelimit::v3::RateLimitConfig],
+    options: &LoadOptions,
+) -> Result<RateLimitConfig, ConfigError> {
+    let names: Vec<&str> = configs.iter().map(|c| c.name.as_str()).collect();
+    load_roots(&names, configs.iter().map(xds::root).collect(), options)
 }
 
 /// The domains of parsed files, in order.

@@ -21,6 +21,11 @@ pub mod envoy {
         }
     }
     pub mod service {
+        pub mod discovery {
+            pub mod v3 {
+                include!(concat!(env!("OUT_DIR"), "/envoy.service.discovery.v3.rs"));
+            }
+        }
         pub mod ratelimit {
             pub mod v3 {
                 include!(concat!(env!("OUT_DIR"), "/envoy.service.ratelimit.v3.rs"));
@@ -30,6 +35,27 @@ pub mod envoy {
     pub mod r#type {
         pub mod v3 {
             include!(concat!(env!("OUT_DIR"), "/envoy.r#type.v3.rs"));
+        }
+    }
+}
+
+/// The `google.rpc.Status` of xDS NACKs.
+pub mod google {
+    pub mod rpc {
+        include!(concat!(env!("OUT_DIR"), "/google.rpc.rs"));
+    }
+}
+
+/// envoyproxy/ratelimit's xDS resource (`RateLimitConfig`).
+pub mod ratelimit {
+    pub mod config {
+        pub mod ratelimit {
+            pub mod v3 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/ratelimit.config.ratelimit.v3.rs"
+                ));
+            }
         }
     }
 }

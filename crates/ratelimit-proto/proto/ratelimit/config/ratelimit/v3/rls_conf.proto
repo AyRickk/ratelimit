@@ -1,0 +1,68 @@
+// From envoyproxy/ratelimit@f4e7669 api/ratelimit/config/ratelimit/v3/rls_conf.proto, options
+// and comments removed; packages, names and field numbers unchanged.
+
+syntax = "proto3";
+
+package ratelimit.config.ratelimit.v3;
+
+import "google/protobuf/struct.proto";
+
+message RateLimitConfig {
+  string name = 1;
+
+  string domain = 2;
+
+  repeated RateLimitDescriptor descriptors = 3;
+}
+
+message RateLimitDescriptor {
+  string key = 1;
+
+  string value = 2;
+
+  RateLimitPolicy rate_limit = 3;
+
+  repeated RateLimitDescriptor descriptors = 4;
+
+  bool shadow_mode = 5;
+
+  bool detailed_metric = 6;
+
+  bool quota_mode = 7;
+
+  google.protobuf.Struct metadata = 8;
+}
+
+message RateLimitPolicy {
+  RateLimitUnit unit = 1;
+
+  uint32 requests_per_unit = 2;
+
+  bool unlimited = 3;
+
+  string name = 4;
+
+  repeated RateLimitReplace replaces = 5;
+}
+
+message RateLimitReplace {
+  string name = 1;
+}
+
+enum RateLimitUnit {
+  UNKNOWN = 0;
+
+  SECOND = 1;
+
+  MINUTE = 2;
+
+  HOUR = 3;
+
+  DAY = 4;
+
+  WEEK = 7;
+
+  MONTH = 5;
+
+  YEAR = 6;
+}

@@ -4315,6 +4315,11 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_CLIENT_TLS_CACERT", "/nowhere/ca.pem".into())], "failed to read file: /nowhere/ca.pem: open /nowhere/ca.pem: no such file or directory".into()),
         (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_SERVER_TLS_CERT", server_cert.clone()), ("GRPC_SERVER_TLS_KEY", apart_key.clone())], "certFile and keyFile must be in the same directory".into()),
         (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_SERVER_TLS_CERT", server_cert.clone()), ("GRPC_SERVER_TLS_KEY", runtime.join("pki/missing.pem").to_string_lossy().into_owned())], format!("failed lo load TLS key pair ({server_cert},{}/pki/missing.pem): open {}/pki/missing.pem: no such file or directory", runtime.display(), runtime.display())),
+        // The xDS client's TLS files, read with the settings whatever the config type, after
+        // the gRPC server's.
+        (vec![("CONFIG_GRPC_XDS_SERVER_USE_TLS", "true".into()), ("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", "/nowhere/xds.pem".into())], "failed to read file: /nowhere/xds.pem: open /nowhere/xds.pem: no such file or directory".into()),
+        (vec![("CONFIG_TYPE", "GRPC_XDS_SOTW".into()), ("CONFIG_GRPC_XDS_SERVER_USE_TLS", "true".into()), ("CONFIG_GRPC_XDS_CLIENT_TLS_CERT", "/nowhere/c.pem".into()), ("CONFIG_GRPC_XDS_CLIENT_TLS_KEY", "/nowhere/k.pem".into())], "failed lo load TLS key pair (/nowhere/c.pem,/nowhere/k.pem): open /nowhere/c.pem: no such file or directory".into()),
+        (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_CLIENT_TLS_CACERT", "/nowhere/grpc.pem".into()), ("CONFIG_GRPC_XDS_SERVER_USE_TLS", "true".into()), ("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", "/nowhere/xds.pem".into())], "failed to read file: /nowhere/grpc.pem: open /nowhere/grpc.pem: no such file or directory".into()),
         // Without a key pair, the cert provider loads none.
         (vec![("GRPC_SERVER_USE_TLS", "true".into())], "CertProvider failed to load any certificate, exiting.".into()),
         // Redis refuses the database: its error ends the message.
@@ -8787,6 +8792,13 @@ struct Logged {
 
 impl Logged {
     async fn start(binary: &std::path::Path, environment: &[(&str, String)], http: u16) -> Self {
+        let logged = Self::spawn(binary, environment);
+        logged.serving(binary, http).await;
+        logged
+    }
+
+    /// The binary started, its stderr collected.
+    fn spawn(binary: &std::path::Path, environment: &[(&str, String)]) -> Self {
         let mut child = Command::new(binary)
             .env_clear()
             .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
@@ -8803,24 +8815,28 @@ impl Logged {
                 sink.lock().unwrap().push(line);
             }
         });
-        // The HTTP port opens once gRPC listens.
+        Self {
+            child,
+            lines,
+            reader,
+        }
+    }
+
+    /// Waits until the HTTP port opens (once gRPC listens).
+    async fn serving(&self, binary: &std::path::Path, http: u16) {
         for _ in 0..300 {
             if tokio::net::TcpStream::connect(("127.0.0.1", http))
                 .await
                 .is_ok()
             {
-                return Self {
-                    child,
-                    lines,
-                    reader,
-                };
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!(
             "{} does not serve: {:?}",
             binary.display(),
-            lines.lock().unwrap()
+            self.lines.lock().unwrap()
         );
     }
 
@@ -8840,6 +8856,17 @@ impl Logged {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("no line with {text:?} in {:?}", self.lines.lock().unwrap());
+    }
+
+    /// Waits until the service exits by itself, unsuccessfully.
+    async fn exited(mut self) -> String {
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), self.child.wait())
+            .await
+            .expect("the service exits")
+            .unwrap();
+        assert!(!status.success());
+        let _ = self.reader.await;
+        self.lines.lock().unwrap().join("\n")
     }
 
     async fn stop(mut self) -> String {
@@ -9292,5 +9319,709 @@ async fn the_grpc_listener_closes_on_sigterm_like_upstream() {
             "upstream on {mode}"
         );
         assert_eq!(runs[1], runs[0], "{mode}");
+    }
+}
+
+use ratelimit_proto::envoy::service::discovery::v3::{
+    DiscoveryRequest, DiscoveryResponse,
+    aggregated_discovery_service_server::{
+        AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
+    },
+};
+use ratelimit_proto::ratelimit::config::ratelimit::v3 as rls_conf;
+
+const RATE_LIMIT_CONFIG_TYPE: &str =
+    "type.googleapis.com/ratelimit.config.ratelimit.v3.RateLimitConfig";
+
+/// A stream an xDS client opened: its metadata (without the transport's own headers) and
+/// the requests it sent.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct XdsStream {
+    metadata: Vec<(String, String)>,
+    requests: Vec<DiscoveryRequest>,
+}
+
+#[derive(Default)]
+struct XdsState {
+    streams: Vec<XdsStream>,
+    /// The latest stream's responses.
+    responder: Option<tokio::sync::mpsc::UnboundedSender<Result<DiscoveryResponse, tonic::Status>>>,
+}
+
+/// A fake xDS management server: it records each ADS stream and answers with what the test
+/// pushes on the latest one.
+#[derive(Clone, Default)]
+struct XdsServer(Arc<std::sync::Mutex<XdsState>>);
+
+#[tonic::async_trait]
+impl AggregatedDiscoveryService for XdsServer {
+    type StreamAggregatedResourcesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, tonic::Status>> + Send>,
+    >;
+
+    async fn stream_aggregated_resources(
+        &self,
+        request: tonic::Request<tonic::Streaming<DiscoveryRequest>>,
+    ) -> Result<tonic::Response<Self::StreamAggregatedResourcesStream>, tonic::Status> {
+        let metadata = request
+            .metadata()
+            .iter()
+            .map(|entry| match entry {
+                tonic::metadata::KeyAndValueRef::Ascii(k, v) => {
+                    (k.to_string(), v.to_str().unwrap_or_default().to_string())
+                }
+                tonic::metadata::KeyAndValueRef::Binary(k, v) => (
+                    k.to_string(),
+                    String::from_utf8_lossy(&v.to_bytes().unwrap_or_default()).into_owned(),
+                ),
+            })
+            .filter(|(k, _)| {
+                ![
+                    "te",
+                    "content-type",
+                    "user-agent",
+                    "grpc-accept-encoding",
+                    "grpc-timeout",
+                ]
+                .contains(&k.as_str())
+            })
+            .collect();
+        // In no order, like a Go map's.
+        let mut metadata: Vec<(String, String)> = metadata;
+        metadata.sort();
+        let (responder, responses) = tokio::sync::mpsc::unbounded_channel();
+        let index = {
+            let mut state = self.0.lock().unwrap();
+            state.streams.push(XdsStream {
+                metadata,
+                requests: Vec::new(),
+            });
+            state.responder = Some(responder);
+            state.streams.len() - 1
+        };
+        let mut requests = request.into_inner();
+        let state = self.0.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(request)) = requests.message().await {
+                state.lock().unwrap().streams[index].requests.push(request);
+            }
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(responses),
+        )))
+    }
+}
+
+impl XdsServer {
+    /// Serves on `port` (over TLS with `tls`) until dropped... for the test's life.
+    async fn start(port: u16, tls: Option<tonic::transport::ServerTlsConfig>) -> Self {
+        let server = Self::default();
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(tls) = tls {
+            builder = builder.tls_config(tls).unwrap();
+        }
+        let router = builder.add_service(AggregatedDiscoveryServiceServer::new(server.clone()));
+        tokio::spawn(router.serve_with_incoming(TcpListenerStream::new(listener)));
+        server
+    }
+
+    fn streams(&self) -> Vec<XdsStream> {
+        self.0.lock().unwrap().streams.clone()
+    }
+
+    /// Waits until the streams hold `count` requests in all.
+    async fn wait_requests(&self, count: usize) -> Vec<XdsStream> {
+        for _ in 0..400 {
+            let streams = self.streams();
+            if streams.iter().map(|s| s.requests.len()).sum::<usize>() >= count {
+                return streams;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("fewer than {count} xDS requests: {:?}", self.streams());
+    }
+
+    /// Sends `response` (or ends with an error) on the latest stream.
+    fn respond(&self, response: Result<DiscoveryResponse, tonic::Status>) {
+        let state = self.0.lock().unwrap();
+        let _ = state.responder.as_ref().expect("a stream").send(response);
+    }
+
+    /// Ends the latest stream with `status`, or with OK when `None`.
+    fn end(&self, status: Option<tonic::Status>) {
+        let mut state = self.0.lock().unwrap();
+        let responder = state.responder.take().expect("a stream");
+        if let Some(status) = status {
+            let _ = responder.send(Err(status));
+        }
+    }
+}
+
+/// A response carrying `configs`, at `version` with `nonce`.
+fn xds_response(
+    version: &str,
+    nonce: &str,
+    configs: &[rls_conf::RateLimitConfig],
+) -> DiscoveryResponse {
+    DiscoveryResponse {
+        version_info: version.into(),
+        resources: configs
+            .iter()
+            .map(|c| prost_types::Any {
+                type_url: RATE_LIMIT_CONFIG_TYPE.into(),
+                value: prost::Message::encode_to_vec(c),
+            })
+            .collect(),
+        type_url: RATE_LIMIT_CONFIG_TYPE.into(),
+        nonce: nonce.into(),
+        ..Default::default()
+    }
+}
+
+/// A config of `domain` limiting `key` to `requests` per minute.
+fn xds_config(name: &str, domain: &str, key: &str, requests: u32) -> rls_conf::RateLimitConfig {
+    rls_conf::RateLimitConfig {
+        name: name.into(),
+        domain: domain.into(),
+        descriptors: vec![rls_conf::RateLimitDescriptor {
+            key: key.into(),
+            rate_limit: Some(rls_conf::RateLimitPolicy {
+                unit: rls_conf::RateLimitUnit::Minute as i32,
+                requests_per_unit: requests,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+    }
+}
+
+/// The ports and servers of one xDS run of a binary.
+#[derive(Clone)]
+struct XdsRun {
+    xds_port: u16,
+    grpc: u16,
+    http: u16,
+}
+
+impl XdsRun {
+    /// Whether the HTTP port is open (gRPC listens).
+    async fn serves(&self) -> bool {
+        tokio::net::TcpStream::connect(("127.0.0.1", self.http))
+            .await
+            .is_ok()
+    }
+
+    async fn serving(&self) {
+        for _ in 0..300 {
+            if self.serves().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the service does not serve");
+    }
+
+    async fn client(&self) -> RateLimitServiceClient<Channel> {
+        RateLimitServiceClient::connect(format!("http://127.0.0.1:{}", self.grpc))
+            .await
+            .unwrap()
+    }
+}
+
+/// What a run of `binary` with `environment` (and an xDS client of a server the scenario
+/// starts) shows: the scenario's observations, the streams the server saw (protobuf-go's
+/// random non-breaking space in its errors made a space), and the log lines (sorted, the
+/// ports and `masked` paths masked). The service stops on SIGTERM unless `exits`.
+async fn xds_run<F, Fut>(
+    binary: &std::path::Path,
+    environment: &[(&'static str, String)],
+    masked: &[&std::path::Path],
+    scenario: F,
+) -> (Vec<String>, Vec<XdsStream>, Vec<String>)
+where
+    F: FnOnce(XdsRun) -> Fut,
+    Fut: std::future::Future<Output = (Vec<String>, Option<XdsServer>, bool)>,
+{
+    let redis = Redis::start().await;
+    let run = XdsRun {
+        xds_port: reserved_port(),
+        grpc: reserved_port(),
+        http: reserved_port(),
+    };
+    let debug = reserved_port();
+    let mut full = vec![
+        ("CONFIG_TYPE", "GRPC_XDS_SOTW".to_string()),
+        (
+            "CONFIG_GRPC_XDS_SERVER_URL",
+            format!("127.0.0.1:{}", run.xds_port),
+        ),
+        ("XDS_CLIENT_BACKOFF_INITIAL_INTERVAL", "100ms".into()),
+        ("REDIS_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_URL", redis.address.clone()),
+        ("USE_STATSD", "false".into()),
+        ("LOG_LEVEL", "debug".into()),
+        ("GRPC_HOST", "127.0.0.1".into()),
+        ("GRPC_PORT", run.grpc.to_string()),
+        ("HOST", "127.0.0.1".into()),
+        ("PORT", run.http.to_string()),
+        ("DEBUG_HOST", "127.0.0.1".into()),
+        ("DEBUG_PORT", debug.to_string()),
+    ];
+    for (key, value) in environment {
+        full.retain(|(k, _)| k != key);
+        full.push((key, value.clone()));
+    }
+    let logged = Logged::spawn(binary, &full);
+    let (observed, xds, exits) = scenario(run.clone()).await;
+    let stderr = match exits {
+        false => logged.stop().await,
+        true => logged.exited().await,
+    };
+    let mut replace = vec![
+        (format!("127.0.0.1:{}", run.xds_port), "XDS"),
+        (redis.address.clone(), "REDIS"),
+        (format!("127.0.0.1:{}", run.grpc), "GRPC"),
+        (format!("127.0.0.1:{}", run.http), "HTTP"),
+        (format!("127.0.0.1:{debug}"), "DEBUG"),
+        ("\\u00a0".to_string(), " "),
+        // prototext's random spaces.
+        ("  ".to_string(), " "),
+    ];
+    for path in masked {
+        replace.push((path.to_string_lossy().into_owned(), "DIR"));
+    }
+    let streams = xds
+        .map(|xds| xds.streams())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut stream| {
+            for request in &mut stream.requests {
+                if let Some(detail) = &mut request.error_detail {
+                    detail.message = detail.message.replace('\u{a0}', " ");
+                }
+            }
+            stream
+        })
+        .collect();
+    // The time until the reset.
+    let resets = regex::Regex::new(r"seconds:\d+").unwrap();
+    let mut lines: Vec<String> = logrus_lines(&stderr, &replace)
+        .into_iter()
+        .map(|l| resets.replace_all(&l, "seconds:N").into_owned())
+        .collect();
+    lines.sort();
+    (observed, streams, lines)
+}
+
+/// Both binaries' [`xds_run`], which must agree.
+async fn xds_runs<F, Fut>(
+    environment: &[(&'static str, String)],
+    masked: &[&std::path::Path],
+    scenario: F,
+) where
+    F: Fn(XdsRun) -> Fut,
+    Fut: std::future::Future<Output = (Vec<String>, Option<XdsServer>, bool)>,
+{
+    let upstream = xds_run(&upstream_binary(), environment, masked, &scenario).await;
+    let ours = xds_run(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        environment,
+        masked,
+        &scenario,
+    )
+    .await;
+    assert_eq!(ours.0, upstream.0, "observations");
+    assert_eq!(ours.1, upstream.1, "streams");
+    // Upstream's process may exit before its provider logs that it stops: those lines, when
+    // upstream has them, ours has, but are compared no further.
+    let stopping = |l: &String| {
+        l.contains("Stopping xDS client watch")
+            || l.contains("grpc: the client connection is closing")
+    };
+    let (mut ours, mut upstream) = (ours, upstream);
+    let upstream_stopping: Vec<String> =
+        upstream.2.iter().filter(|l| stopping(l)).cloned().collect();
+    let ours_stopping: Vec<String> = ours.2.iter().filter(|l| stopping(l)).cloned().collect();
+    for line in &upstream_stopping {
+        assert!(ours_stopping.contains(line), "{line} only upstream's");
+    }
+    ours.2.retain(|l| !stopping(l));
+    upstream.2.retain(|l| !stopping(l));
+    let only = |a: &[String], b: &[String]| {
+        let mut b = b.to_vec();
+        a.iter()
+            .filter(|l| match b.iter().position(|m| m == *l) {
+                Some(i) => {
+                    b.remove(i);
+                    false
+                }
+                None => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (only(&ours.2, &upstream.2), only(&upstream.2, &ours.2)),
+        (vec![], vec![]),
+        "log lines only ours, only upstream's"
+    );
+}
+
+/// The responses to `requests`, without their (time dependent) resets.
+async fn xds_calls(run: &XdsRun, requests: &[RateLimitRequest]) -> Vec<String> {
+    let mut client = run.client().await;
+    let mut observed = Vec::new();
+    for request in requests {
+        let mut response = client
+            .should_rate_limit(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        for status in &mut response.statuses {
+            status.duration_until_reset = None;
+        }
+        observed.push(format!("{response:?}"));
+    }
+    observed
+}
+
+/// A `Value` of `kind`.
+fn pb_value(kind: Option<prost_types::value::Kind>) -> prost_types::Value {
+    prost_types::Value { kind }
+}
+
+/// The xDS SotW provider as upstream's: no service until the server is up and has sent a
+/// config; each response loaded (its metadata too) and ACKed, or NACKed with the loader's or
+/// protobuf's error; a failed stream opened again after the backoff, the NACKed version
+/// then reported as acknowledged; the node, its metadata and the headers sent; the stream
+/// stopped on SIGTERM.
+#[tokio::test]
+async fn xds_configs_are_acked_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    use prost_types::value::Kind;
+    let environment = [
+        ("CONFIG_GRPC_XDS_NODE_ID", "node-1".to_string()),
+        ("CONFIG_GRPC_XDS_NODE_METADATA", "a=b,c,d=e=f".into()),
+        (
+            "CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS",
+            "X-One:1,two:2,token-bin:abc".into(),
+        ),
+        ("RESPONSE_DYNAMIC_METADATA", "true".into()),
+    ];
+    let mut first = xds_config("one", "llm", "user", 2);
+    first.descriptors[0].rate_limit.as_mut().unwrap().unit = rls_conf::RateLimitUnit::Hour as i32;
+    let nested = prost_types::Struct {
+        fields: [
+            (
+                "list".to_string(),
+                pb_value(Some(Kind::ListValue(prost_types::ListValue {
+                    values: vec![pb_value(None), pb_value(Some(Kind::BoolValue(true)))],
+                }))),
+            ),
+            ("unset".to_string(), pb_value(None)),
+        ]
+        .into(),
+    };
+    first.descriptors.push(rls_conf::RateLimitDescriptor {
+        key: "meta".into(),
+        rate_limit: Some(rls_conf::RateLimitPolicy {
+            unit: rls_conf::RateLimitUnit::Hour as i32,
+            requests_per_unit: 10,
+            name: "named".into(),
+            ..Default::default()
+        }),
+        metadata: Some(prost_types::Struct {
+            fields: [
+                (
+                    "s".to_string(),
+                    pb_value(Some(Kind::StringValue("x".into()))),
+                ),
+                ("n".to_string(), pb_value(Some(Kind::NumberValue(1.5)))),
+                (
+                    "nested".to_string(),
+                    pb_value(Some(Kind::StructValue(nested))),
+                ),
+                (
+                    "empty".to_string(),
+                    pb_value(Some(Kind::StructValue(Default::default()))),
+                ),
+            ]
+            .into(),
+        }),
+        ..Default::default()
+    });
+    first.descriptors.push(rls_conf::RateLimitDescriptor {
+        key: "no_metadata".into(),
+        rate_limit: Some(rls_conf::RateLimitPolicy {
+            unit: rls_conf::RateLimitUnit::Hour as i32,
+            requests_per_unit: 10,
+            ..Default::default()
+        }),
+        metadata: Some(Default::default()),
+        ..Default::default()
+    });
+    let mut bad_unit = xds_config("two", "llm", "user", 2);
+    bad_unit.descriptors[0].rate_limit.as_mut().unwrap().unit = 17;
+    let mut second = xds_config("three", "llm", "user", 1);
+    second.descriptors[0].rate_limit.as_mut().unwrap().unit = rls_conf::RateLimitUnit::Hour as i32;
+    let scenario = |run: XdsRun| {
+        let (first, bad_unit, second) = (first.clone(), bad_unit.clone(), second.clone());
+        async move {
+            // The server is down at first: no service.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let mut observed = vec![format!("served early: {}", run.serves().await)];
+            let xds = XdsServer::start(run.xds_port, None).await;
+            xds.wait_requests(1).await;
+            xds.respond(Ok(xds_response("v1", "n1", &[first])));
+            run.serving().await;
+            let user = request("llm", &[&[("user", "a")]]);
+            let meta = request("llm", &[&[("meta", "x")], &[("no_metadata", "y")]]);
+            observed
+                .extend(xds_calls(&run, &[user.clone(), user.clone(), user.clone(), meta]).await);
+            xds.respond(Ok(xds_response("v2", "n2", &[bad_unit])));
+            xds.wait_requests(3).await;
+            xds.respond(Ok(DiscoveryResponse {
+                version_info: "v3".into(),
+                nonce: "n3".into(),
+                resources: vec![prost_types::Any {
+                    type_url: "type.googleapis.com/foo.Bar".into(),
+                    value: vec![],
+                }],
+                ..Default::default()
+            }));
+            xds.wait_requests(4).await;
+            xds.respond(Ok(xds_response(
+                "v4",
+                "n4",
+                &[
+                    xds_config("a", "llm", "user", 1),
+                    xds_config("b", "llm", "user", 1),
+                ],
+            )));
+            xds.wait_requests(5).await;
+            xds.end(Some(tonic::Status::unavailable("going away")));
+            xds.wait_requests(6).await;
+            xds.end(None);
+            xds.wait_requests(7).await;
+            xds.respond(Ok(xds_response("v5", "n5", &[second])));
+            xds.wait_requests(8).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            observed.extend(xds_calls(&run, &[user.clone(), user]).await);
+            (observed, Some(xds), false)
+        }
+    };
+    xds_runs(&environment, &[], scenario).await;
+}
+
+/// A stream fails like upstream's: on a response over `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES`
+/// (opened again, nothing received), and before it opens on headers grpc-go refuses; the
+/// service serves meanwhile with `FORCE_START_WITHOUT_INITIAL_CONFIG`.
+#[tokio::test]
+async fn xds_streams_fail_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let environment = [
+        ("XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES", "200".to_string()),
+        ("FORCE_START_WITHOUT_INITIAL_CONFIG", "true".into()),
+    ];
+    xds_runs(&environment, &[], |run: XdsRun| async move {
+        let xds = XdsServer::start(run.xds_port, None).await;
+        run.serving().await;
+        xds.wait_requests(1).await;
+        let big = xds_config(&"n".repeat(300), "llm", "user", 1);
+        xds.respond(Ok(xds_response("v1", "n1", &[big])));
+        xds.wait_requests(2).await;
+        xds.respond(Ok(xds_response(
+            "v2",
+            "n2",
+            &[xds_config("small", "llm", "user", 1)],
+        )));
+        xds.wait_requests(3).await;
+        (vec![], Some(xds), false)
+    })
+    .await;
+    for headers in ["Bad Key:1", "x:caf\u{e9}"] {
+        let environment = [
+            (
+                "CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS",
+                headers.to_string(),
+            ),
+            ("FORCE_START_WITHOUT_INITIAL_CONFIG", "true".into()),
+            // One failure, then a backoff the stop abandons.
+            ("XDS_CLIENT_BACKOFF_INITIAL_INTERVAL", "1h".into()),
+            ("XDS_CLIENT_BACKOFF_MAX_INTERVAL", "2h".into()),
+        ];
+        xds_runs(&environment, &[], |run: XdsRun| async move {
+            let xds = XdsServer::start(run.xds_port, None).await;
+            run.serving().await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            (vec![], Some(xds), false)
+        })
+        .await;
+    }
+}
+
+/// `CONFIG_GRPC_XDS_SERVER_USE_TLS` as upstream's: the server verified against the system's
+/// roots plus `CONFIG_GRPC_XDS_SERVER_TLS_CACERT`, by `CONFIG_GRPC_XDS_SERVER_TLS_SAN` if set
+/// (else the URL's host), the client's key pair offered; a server failing the handshake is
+/// dialled again silently.
+#[tokio::test]
+async fn xds_over_tls_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let dir = temp_dir("xds-tls");
+    let test_pki = pki(&dir);
+    let (cert, key) = &test_pki.server;
+    let ca_pem = std::fs::read_to_string(&test_pki.ca).unwrap();
+    let ca = test_pki.ca.to_string_lossy().into_owned();
+    let server_tls = |client_ca: bool| {
+        let tls = tonic::transport::ServerTlsConfig::new()
+            .identity(tonic::transport::Identity::from_pem(cert, key));
+        match client_ca {
+            true => tls.client_ca_root(tonic::transport::Certificate::from_pem(&ca_pem)),
+            false => tls,
+        }
+    };
+    let client_pair = [
+        (
+            "CONFIG_GRPC_XDS_CLIENT_TLS_CERT",
+            test_pki.client_cert.to_string_lossy().into_owned(),
+        ),
+        (
+            "CONFIG_GRPC_XDS_CLIENT_TLS_KEY",
+            test_pki.client_key.to_string_lossy().into_owned(),
+        ),
+    ];
+    // (variables, whether the server wants a client certificate, whether it is reached)
+    type Variables = Vec<(&'static str, String)>;
+    let cases: Vec<(Variables, bool, bool)> = vec![
+        (
+            vec![("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", ca.clone())],
+            false,
+            true,
+        ),
+        // Not the server's name.
+        (
+            vec![
+                ("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", ca.clone()),
+                ("CONFIG_GRPC_XDS_SERVER_TLS_SAN", "localhost".into()),
+            ],
+            false,
+            false,
+        ),
+        (
+            vec![
+                ("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", ca.clone()),
+                ("CONFIG_GRPC_XDS_SERVER_TLS_SAN", "127.0.0.1".into()),
+            ],
+            false,
+            true,
+        ),
+        // No root for the server's CA.
+        (vec![], false, false),
+        // No client certificate for a server wanting one, then one.
+        (
+            vec![("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", ca.clone())],
+            true,
+            false,
+        ),
+        (
+            [
+                vec![("CONFIG_GRPC_XDS_SERVER_TLS_CACERT", ca.clone())],
+                client_pair.to_vec(),
+            ]
+            .concat(),
+            true,
+            true,
+        ),
+    ];
+    for (variables, client_ca, reached) in cases {
+        let mut environment = vec![
+            ("CONFIG_GRPC_XDS_SERVER_USE_TLS", "true".to_string()),
+            ("FORCE_START_WITHOUT_INITIAL_CONFIG", "true".into()),
+        ];
+        environment.extend(variables);
+        let tls = server_tls(client_ca);
+        xds_runs(&environment, &[&dir], |run: XdsRun| {
+            let tls = tls.clone();
+            async move {
+                let xds = XdsServer::start(run.xds_port, Some(tls)).await;
+                run.serving().await;
+                match reached {
+                    true => {
+                        xds.wait_requests(1).await;
+                        xds.respond(Ok(xds_response(
+                            "v1",
+                            "n1",
+                            &[xds_config("one", "llm", "user", 1)],
+                        )));
+                        xds.wait_requests(2).await;
+                    }
+                    false => tokio::time::sleep(std::time::Duration::from_millis(2500)).await,
+                }
+                (vec![], Some(xds), false)
+            }
+        })
+        .await;
+    }
+}
+
+/// Each response makes upstream read the settings' TLS files again (`settings.NewSettings`):
+/// one gone, the service exits with its error.
+#[tokio::test]
+async fn xds_responses_reread_the_tls_files_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let dir = temp_dir("xds-reread");
+    let test_pki = pki(&dir);
+    let (cert, key) = server_files(&dir.join("certs"), &test_pki.server);
+    let ca = test_pki.ca.clone();
+    let ca_pem = std::fs::read(&ca).unwrap();
+    let message = format!(
+        "failed to read file: {0}: open {0}: no such file or directory",
+        ca.display()
+    );
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        std::fs::write(&ca, &ca_pem).unwrap();
+        let environment = [
+            ("GRPC_SERVER_USE_TLS", "true".to_string()),
+            ("GRPC_SERVER_TLS_CERT", cert.clone()),
+            ("GRPC_SERVER_TLS_KEY", key.clone()),
+            ("GRPC_CLIENT_TLS_CACERT", ca.to_string_lossy().into_owned()),
+        ];
+        let (ca, ca_pem) = (ca.clone(), ca_pem.clone());
+        let (_, _, lines) = xds_run(&binary, &environment, &[], |run: XdsRun| async move {
+            let xds = XdsServer::start(run.xds_port, None).await;
+            xds.wait_requests(1).await;
+            xds.respond(Ok(xds_response(
+                "v1",
+                "n1",
+                &[xds_config("one", "llm", "user", 1)],
+            )));
+            run.serving().await;
+            std::fs::remove_file(&ca).unwrap();
+            xds.respond(Ok(xds_response(
+                "v2",
+                "n2",
+                &[xds_config("two", "llm", "user", 1)],
+            )));
+            let _ = ca_pem;
+            (vec![], Some(xds), true)
+        })
+        .await;
+        assert!(
+            lines.iter().any(|l| l.contains(&message)),
+            "{}: {lines:#?}",
+            binary.display()
+        );
     }
 }

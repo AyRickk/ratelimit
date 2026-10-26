@@ -4,6 +4,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/envoy/extensions/common/ratelimit/v3/ratelimit.proto",
         "proto/envoy/type/v3/ratelimit_unit.proto",
         "proto/envoy/config/core/v3/base.proto",
+        "proto/envoy/service/discovery/v3/discovery.proto",
+        "proto/ratelimit/config/ratelimit/v3/rls_conf.proto",
         "proto/grpc/health/v1/health.proto",
         "proto/opentelemetry/proto/collector/trace/v1/trace_service.proto",
     ];
