@@ -12,7 +12,7 @@ publish = false
 jiff = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 pin-project-lite = "0.2"
-fred = { version = "10.1", default-features = false, features = ["credential-provider", "enable-rustls-ring", "i-keys", "i-scripts", "i-server", "unix-sockets"] }
+fred = { version = "10.1", default-features = false, features = ["credential-provider", "enable-rustls-ring", "i-keys", "i-scripts", "i-server", "sentinel-auth", "unix-sockets"] }
 prost = "0.14"
 prost-types = "0.14"
 protox = "0.10"

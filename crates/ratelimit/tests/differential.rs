@@ -128,6 +128,8 @@ struct Redis {
     client_address: String,
     address: String,
     monitor: Monitor,
+    /// Its working directory, for what it writes (a replica's snapshots).
+    _dir: TempDir,
 }
 
 /// Every command the server receives, as `MONITOR` reports it.
@@ -175,6 +177,8 @@ impl Redis {
 
     /// [`start_on`](Self::start_on) with `extra` arguments.
     async fn start_with(port: u16, extra: &[&str]) -> Option<Self> {
+        // Replication writes snapshots even without `save`: never in the working directory.
+        let dir = temp_dir(&format!("redis-{port}"));
         let mut process = Command::new(redis_server())
             .args([
                 "--port",
@@ -183,6 +187,8 @@ impl Redis {
                 "",
                 "--appendonly",
                 "no",
+                "--dir",
+                &dir.to_string_lossy(),
             ])
             .args(extra)
             .stdout(Stdio::null())
@@ -233,6 +239,7 @@ impl Redis {
             client_address,
             address,
             monitor,
+            _dir: dir,
         })
     }
 
@@ -10289,16 +10296,17 @@ struct RedisCluster {
 
 impl RedisCluster {
     async fn start() -> Self {
-        Self::start_with(None).await
+        Self::start_with(None, false).await
     }
 
     /// Over TLS too with `pki`: each node also on a TLS port (its certificate, for 127.0.0.1),
     /// its cluster bus over TLS, so that it announces its TLS port to TLS clients.
-    async fn start_with(pki: Option<&Pki>) -> Self {
+    /// With `replicas`, each primary also has a replica (the last three nodes).
+    async fn start_with(pki: Option<&Pki>, replicas: bool) -> Self {
         let dir = temp_dir("cluster");
         let mut nodes = Vec::new();
         let mut tls_ports = Vec::new();
-        while nodes.len() < 3 {
+        while nodes.len() < if replicas { 6 } else { 3 } {
             // Every port reserved, the cluster bus's too (by default 10000 above the node's).
             let port = reserved_port();
             let config = dir.join(format!("nodes-{port}.conf"));
@@ -10345,6 +10353,7 @@ impl RedisCluster {
                 .arg("--cluster")
                 .arg("create")
                 .args(&addresses)
+                .args(["--cluster-replicas", if replicas { "1" } else { "0" }])
                 .arg("--cluster-yes")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -10376,6 +10385,45 @@ impl RedisCluster {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
+        // Every slot range lists its replica (the topology radix and fred read).
+        if replicas {
+            for attempt in 0.. {
+                let slots: Value = nodes[0]
+                    .client
+                    .custom(
+                        CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
+                        vec!["SLOTS"],
+                    )
+                    .await
+                    .unwrap();
+                let listed = match &slots {
+                    Value::Array(sets) => sets
+                        .iter()
+                        .all(|set| matches!(set, Value::Array(set) if set.len() >= 4)),
+                    _ => false,
+                };
+                if listed {
+                    break;
+                }
+                // Up to 30 s: slow under the full suite's load.
+                assert!(
+                    attempt < 1500,
+                    "the replicas are not in the topology: {slots:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // And each replica is in sync.
+            for replica in &nodes[3..] {
+                for attempt in 0.. {
+                    let info = resp_command(&replica.address, &["INFO", "replication"]).await;
+                    if info.contains("master_link_status:up") {
+                        break;
+                    }
+                    assert!(attempt < 1500, "a replica does not sync: {info}");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
         Self {
             nodes,
             tls_ports,
@@ -10396,8 +10444,13 @@ impl RedisCluster {
         format!("{},{}", self.nodes[0].address, self.nodes[1].address)
     }
 
+    /// The primaries (the first three nodes).
+    fn primaries(&self) -> &[Redis] {
+        &self.nodes[..3]
+    }
+
     async fn flush(&self) {
-        for node in &self.nodes {
+        for node in self.primaries() {
             let _: String = node
                 .client
                 .custom(
@@ -10409,10 +10462,10 @@ impl RedisCluster {
         }
     }
 
-    /// Every node's keys, by node.
+    /// Every primary's keys, by node.
     async fn dump(&self) -> Vec<BTreeMap<String, (String, i64)>> {
         let mut dumps = Vec::new();
-        for node in &self.nodes {
+        for node in self.primaries() {
             dumps.push(node.dump().await);
         }
         dumps
@@ -10543,15 +10596,16 @@ async fn cluster_runs(
 }
 
 /// `REDIS_TYPE=CLUSTER` (and `REDIS_PERSECOND_TYPE`) as upstream's: the cluster found from two
-/// of its nodes, each request's keys on their slots' nodes, a pool per node (`cx_*` counting
-/// every node's connections), and upstream's startup lines (the pipeline window, the
+/// of its nodes, each request's keys on their slots' nodes, a pool per node, replicas included
+/// (`cx_*` counting every node's connections), and upstream's startup lines (the pipeline window, the
 /// parallelism, the URLs).
 #[tokio::test]
 async fn a_redis_cluster_serves_like_upstream() {
     if !tools_available() {
         return;
     }
-    let cluster = RedisCluster::start().await;
+    // With replicas, which radix pools too.
+    let cluster = RedisCluster::start_with(None, true).await;
     let variables = [
         ("REDIS_URL", cluster.seeds()),
         ("REDIS_POOL_SIZE", "3".into()),
@@ -10581,7 +10635,7 @@ async fn a_redis_cluster_over_tls_serves_like_upstream() {
     }
     let dir = temp_dir("cluster-pki");
     let test_pki = pki(&dir);
-    let cluster = RedisCluster::start_with(Some(&test_pki)).await;
+    let cluster = RedisCluster::start_with(Some(&test_pki), false).await;
     let variables = [
         ("REDIS_URL", cluster.tls_seeds()),
         ("REDIS_TLS", "true".into()),
@@ -10657,6 +10711,563 @@ async fn a_cluster_node_down_at_startup_is_logged_like_upstream() {
         upstream
             .iter()
             .any(|l| l.contains("error creating client for \"DOWN\"")),
+        "{upstream:?}"
+    );
+    assert_eq!(ours, upstream);
+}
+
+/// A primary, its replica and a sentinel watching them (`mymaster`, quorum 1).
+struct RedisSentinel {
+    nodes: Vec<Redis>,
+    _sentinel: Child,
+    sentinel_address: String,
+    /// The sentinel's `requirepass`, if any.
+    password: Option<String>,
+    _dir: TempDir,
+}
+
+impl RedisSentinel {
+    async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// With `password`, the sentinel requires it.
+    async fn start_with(password: Option<&str>) -> Self {
+        let dir = temp_dir("sentinel");
+        let mut primary = None;
+        for _ in 0..5 {
+            primary = Redis::start_with(reserved_port(), &[]).await;
+            if primary.is_some() {
+                break;
+            }
+        }
+        let primary = primary.expect("the primary starts");
+        let (host, port) = primary.address.split_once(':').unwrap();
+        let mut replica = None;
+        for _ in 0..5 {
+            replica = Redis::start_with(reserved_port(), &["--replicaof", host, port]).await;
+            if replica.is_some() {
+                break;
+            }
+        }
+        let replica = replica.expect("the replica starts");
+        let port = reserved_port();
+        let config = dir.join("sentinel.conf");
+        let (host, primary_port) = primary.address.split_once(':').unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "port {port}\nsentinel monitor mymaster {host} {primary_port} 1\nsentinel down-after-milliseconds mymaster 1000\nsentinel failover-timeout mymaster 3000\n{}",
+                password.map_or(String::new(), |p| format!("requirepass {p}\n")),
+            ),
+        )
+        .unwrap();
+        let sentinel = Command::new(redis_server())
+            .arg(&config)
+            .arg("--sentinel")
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the sentinel");
+        let sentinel = Self {
+            nodes: vec![primary, replica],
+            _sentinel: sentinel,
+            sentinel_address: format!("127.0.0.1:{port}"),
+            password: password.map(String::from),
+            _dir: dir,
+        };
+        // The replica is in sync.
+        for attempt in 0.. {
+            let info = resp_command(&sentinel.nodes[1].address, &["INFO", "replication"]).await;
+            if info.contains("master_link_status:up") {
+                break;
+            }
+            assert!(attempt < 300, "the replica does not sync: {info}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // The sentinel knows the replica.
+        for attempt in 0.. {
+            let replicas = sentinel.ask(&["SENTINEL", "REPLICAS", "mymaster"]).await;
+            if replicas.contains(
+                &sentinel.nodes[1]
+                    .address
+                    .split(':')
+                    .nth(1)
+                    .unwrap()
+                    .to_string(),
+            ) {
+                break;
+            }
+            assert!(
+                attempt < 300,
+                "the sentinel does not see the replica: {replicas}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        sentinel
+    }
+
+    /// A command to the sentinel (authenticated, if it wants a password): its reply.
+    async fn ask(&self, args: &[&str]) -> String {
+        match &self.password {
+            None => resp_command(&self.sentinel_address, args).await,
+            Some(password) => resp_commands(&self.sentinel_address, &[&["AUTH", password], args])
+                .await
+                .pop()
+                .unwrap(),
+        }
+    }
+
+    /// The primary's address, as the sentinel names it.
+    async fn primary(&self) -> String {
+        let reply = self
+            .ask(&["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"])
+            .await;
+        let parts: Vec<&str> = reply
+            .lines()
+            .filter(|l| !l.starts_with(['*', '$']))
+            .collect();
+        format!("{}:{}", parts[0], parts[1])
+    }
+
+    /// A failover, done once the sentinel names the other node and it takes writes. Tried
+    /// again while the sentinel refuses it, or gives it up (`-failover-abort-no-good-slave`:
+    /// the last failover's old primary is not yet a replica, which takes it about 10 s).
+    async fn failover(&self) {
+        let before = self.primary().await;
+        for attempt in 0..30 {
+            let reply = self.ask(&["SENTINEL", "FAILOVER", "mymaster"]).await;
+            if reply.starts_with("+OK") {
+                for _ in 0..50 {
+                    let primary = self.primary().await;
+                    if primary != before
+                        && resp_command(&primary, &["ROLE"]).await.contains("master")
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            assert!(attempt < 29, "no failover: {reply}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// A command to the server (a sentinel, or a node) at `address`, over a connection of its own:
+/// its raw RESP reply, read whole.
+async fn resp_command(address: &str, args: &[&str]) -> String {
+    resp_commands(address, &[args]).await.pop().unwrap()
+}
+
+/// [`resp_command`] for several commands on one connection: each reply.
+async fn resp_commands(address: &str, commands: &[&[&str]]) -> Vec<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut command = String::new();
+    for args in commands {
+        command.push_str(&format!("*{}\r\n", args.len()));
+        for arg in *args {
+            command.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+        }
+    }
+    // It may still be starting.
+    let mut stream = None;
+    for _ in 0..250 {
+        let connect = tokio::net::TcpStream::connect(address);
+        if let Ok(Ok(connected)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), connect).await
+        {
+            stream = Some(connected);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let mut stream = stream.expect("the server listens");
+    stream.write_all(command.as_bytes()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut reply = Vec::new();
+    // The replies, each whole.
+    let lengths = |bytes: &[u8]| {
+        let mut lengths = Vec::new();
+        let mut at = 0;
+        while lengths.len() < commands.len() {
+            let length = resp_length(&bytes[at..])?;
+            lengths.push(length);
+            at += length;
+        }
+        Some(lengths)
+    };
+    let lengths = loop {
+        if let Some(lengths) = lengths(&reply) {
+            break lengths;
+        }
+        let mut chunk = [0; 65536];
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
+            .await
+            .expect("whole replies")
+            .unwrap();
+        assert!(read > 0, "the connection closed mid-reply");
+        reply.extend_from_slice(&chunk[..read]);
+    };
+    let mut at = 0;
+    lengths
+        .into_iter()
+        .map(|length| {
+            let text = String::from_utf8_lossy(&reply[at..at + length]).into_owned();
+            at += length;
+            text
+        })
+        .collect()
+}
+
+/// The length of the RESP value at the start of `bytes`, once it is all there.
+fn resp_length(bytes: &[u8]) -> Option<usize> {
+    let end = bytes.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&bytes[1..end]).ok()?;
+    let after = end + 2;
+    match bytes.first()? {
+        b'$' => match line.parse::<i64>().ok()? {
+            -1 => Some(after),
+            n => (bytes.len() >= after + n as usize + 2).then_some(after + n as usize + 2),
+        },
+        b'*' => {
+            let mut at = after;
+            for _ in 0..line.parse::<i64>().ok()?.max(0) {
+                at += resp_length(&bytes[at..])?;
+            }
+            Some(at)
+        }
+        _ => Some(after),
+    }
+}
+
+/// `REDIS_TYPE=SENTINEL` as upstream's: the primary the sentinel names, a pool on it and on
+/// its replica (both in `cx_active`), and after a failover, the new primary within radix's
+/// 5 s, the counters going on.
+#[tokio::test]
+async fn a_redis_sentinel_serves_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    // On the heap: on the test thread's stack, its state overflows it.
+    Box::pin(sentinel_serves_like_upstream()).await;
+}
+
+async fn sentinel_serves_like_upstream() {
+    let runtime = temp_dir("sentinel-runtime");
+    write_tree(
+        &runtime,
+        &[
+            (
+                "v1/ratelimit/config/llm.yaml",
+                b"domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: hour, requests_per_unit: 4}\n  - key: burst\n    rate_limit: {unit: second, requests_per_unit: 1000}\n",
+            ),
+            ("current", b"->v1"),
+        ],
+    );
+    let topology = RedisSentinel::start().await;
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        // Over a connection of its own: a failover drops the harness's.
+        resp_command(&topology.primary().await, &["FLUSHALL"]).await;
+        let statsd = StatsdServer::start().await;
+        let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+        let environment = [
+            runtime_environment(&runtime, true),
+            vec![
+                ("REDIS_SOCKET_TYPE", "tcp".to_string()),
+                ("REDIS_TYPE", "sentinel".into()),
+                (
+                    "REDIS_URL",
+                    format!("mymaster,{}", topology.sentinel_address),
+                ),
+                ("REDIS_POOL_SIZE", "2".into()),
+                // The per-second pool too, on the same sentinel.
+                ("REDIS_PERSECOND", "true".into()),
+                ("REDIS_PERSECOND_SOCKET_TYPE", "tcp".into()),
+                ("REDIS_PERSECOND_TYPE", "SENTINEL".into()),
+                (
+                    "REDIS_PERSECOND_URL",
+                    format!("mymaster,{}", topology.sentinel_address),
+                ),
+                ("REDIS_PERSECOND_POOL_SIZE", "1".into()),
+                ("EXPIRATION_JITTER_MAX_SECONDS", "0".into()),
+                ("STATSD_HOST", "127.0.0.1".into()),
+                ("STATSD_PORT", statsd.address.port().to_string()),
+                ("STATS_FLUSH_INTERVAL", "100ms".into()),
+                ("LOG_LEVEL", "warn".into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", debug.to_string()),
+            ],
+        ]
+        .concat();
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut client = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
+            .await
+            .unwrap();
+        let mut answers = Vec::new();
+        let mut ask = async |answers: &mut Vec<String>| {
+            let call =
+                client.should_rate_limit(request("llm", &[&[("user", "a")], &[("burst", "b")]]));
+            let mut response =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), call).await {
+                    Ok(answer) => answer.map(|r| r.into_inner()),
+                    Err(_) => Err(tonic::Status::deadline_exceeded("no answer in 5 s")),
+                };
+            if let Ok(response) = &mut response {
+                for status in &mut response.statuses {
+                    status.duration_until_reset = None;
+                }
+            }
+            answers.push(format!("{response:?}"));
+        };
+        for _ in 0..2 {
+            ask(&mut answers).await;
+        }
+        topology.failover().await;
+        // radix asks the sentinels every 5 s.
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        for _ in 0..3 {
+            ask(&mut answers).await;
+        }
+        // Over a connection of its own: a failover drops the harness's.
+        let primary = topology.primary().await;
+        let mut keys = Vec::new();
+        // The hour's counters only: the second's are named after their second.
+        for key in resp_bulk_strings(&resp_command(&primary, &["KEYS", "llm_user_*"]).await) {
+            let value = resp_bulk_strings(&resp_command(&primary, &["GET", &key]).await);
+            keys.push(format!("{key}={}", value.join("")));
+        }
+        keys.sort();
+        let active = stat_values(&statsd.lines.lock().unwrap(), |name| {
+            name.ends_with("_pool.cx_active")
+        });
+        let stderr = logged.stop().await;
+        let lines = logrus_lines(
+            &stderr,
+            &[
+                (topology.sentinel_address.clone(), "SENTINEL"),
+                (format!("127.0.0.1:{grpc}"), "GRPC"),
+                (format!("127.0.0.1:{http}"), "HTTP"),
+                (format!("127.0.0.1:{debug}"), "DEBUG"),
+            ],
+        );
+        runs.push((answers, keys, active, lines));
+    }
+    assert!(runs[0].0[4].contains("OverLimit"), "{:?}", runs[0].0);
+    assert_eq!(runs[1].0, runs[0].0, "answers");
+    assert_eq!(runs[1].1, runs[0].1, "keys");
+    assert_eq!(runs[1].2, runs[0].2, "connections");
+    assert_eq!(runs[1].3, runs[0].3, "log lines");
+}
+
+/// `SENTINEL` startup failures, retried and logged as upstream: an unknown primary, an
+/// unreachable sentinel, the sentinel auth refused (its dialer's line at each attempt); a URL
+/// without sentinels is refused at once.
+#[tokio::test]
+async fn sentinel_startup_is_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("sentinel-logs");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let topology = RedisSentinel::start().await;
+    let sentinel = &topology.sentinel_address;
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let given_up = regex::Regex::new(r"(Expected master name|timed out waiting).*").unwrap();
+    let after = regex::Regex::new(r"after [^:]+:").unwrap();
+    let cases: Vec<(String, &str)> = vec![
+        (format!("nosuch,{sentinel}"), ""),
+        ("mymaster,127.0.0.1:1".into(), ""),
+        (format!("mymaster,{sentinel}"), "u:pw"),
+        (format!("mymaster,{sentinel}"), "pw"),
+        ("mymaster".into(), ""),
+    ];
+    for (url, sentinel_auth) in cases {
+        let environment = vec![
+            (
+                "RUNTIME_ROOT",
+                runtime.join("current").to_string_lossy().into_owned(),
+            ),
+            ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+            ("REDIS_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_TYPE", "SENTINEL".into()),
+            ("REDIS_URL", url.clone()),
+            ("REDIS_SENTINEL_AUTH", sentinel_auth.into()),
+            ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
+            ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
+            ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+            ("DISABLE_STATS", "true".into()),
+            ("LOG_LEVEL", "warn".into()),
+        ];
+        let lines = |stderr: &str| {
+            let mut lines: Vec<String> = logrus_lines(stderr, &[(sentinel.clone(), "SENTINEL")])
+                .into_iter()
+                .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+                .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+                .collect();
+            lines.dedup();
+            lines
+        };
+        let upstream = startup_failure(&upstream_binary(), &environment).await;
+        let ours = startup_failure(
+            std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+            &environment,
+        )
+        .await;
+        assert_eq!(lines(&ours), lines(&upstream), "{url} {sentinel_auth}");
+        // The reason it gives up: upstream's panic, our fatal line.
+        let reason = |stderr: &str| {
+            given_up
+                .find(stderr)
+                .map(|m| {
+                    let text = m.as_str().trim_end_matches('"').to_string();
+                    after.replace(&text, "after ELAPSED:").into_owned()
+                })
+                .unwrap_or_default()
+        };
+        assert!(!reason(&upstream).is_empty(), "{upstream}");
+        assert_eq!(reason(&ours), reason(&upstream), "{url} {sentinel_auth}");
+    }
+}
+
+/// The bulk strings of a raw RESP reply, in order.
+fn resp_bulk_strings(reply: &str) -> Vec<String> {
+    let mut lines = reply.split("\r\n");
+    let mut strings = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.starts_with('$') && line != "$-1" {
+            strings.extend(lines.next().map(String::from));
+        }
+    }
+    strings
+}
+
+/// A sentinel with a password: `REDIS_SENTINEL_AUTH` reaches it while `REDIS_AUTH_FILE` stays
+/// the nodes' (upstream's credential provider wraps only their dialer); and the first sentinel
+/// URL's credentials come before another sentinel's own, as radix reads them.
+#[tokio::test]
+async fn a_password_protected_sentinel_is_used_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("sentinel-auth");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    // The nodes' default user takes any password.
+    let auth_file = runtime.join("redis-auth");
+    std::fs::write(&auth_file, "default:anything\n").unwrap();
+    let topology = RedisSentinel::start_with(Some("sentpw")).await;
+    let sentinel = topology.sentinel_address.clone();
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let environment = [
+            runtime_environment(&runtime, true),
+            vec![
+                ("REDIS_SOCKET_TYPE", "tcp".to_string()),
+                ("REDIS_TYPE", "sentinel".into()),
+                ("REDIS_URL", format!("mymaster,{sentinel}")),
+                ("REDIS_SENTINEL_AUTH", "sentpw".into()),
+                ("REDIS_AUTH_FILE", auth_file.to_string_lossy().into_owned()),
+                ("DISABLE_STATS", "true".into()),
+                ("LOG_LEVEL", "warn".into()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ],
+        ]
+        .concat();
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut client = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
+            .await
+            .unwrap();
+        let call = client.should_rate_limit(request("llm", &[&[("user", "a")]]));
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .map(|r| r.map(|r| r.into_inner().overall_code));
+        let stderr = logged.stop().await;
+        let lines = logrus_lines(
+            &stderr,
+            &[
+                (sentinel.clone(), "SENTINEL"),
+                (auth_file.to_string_lossy().into_owned(), "AUTH_FILE"),
+                (format!("127.0.0.1:{grpc}"), "GRPC"),
+                (format!("127.0.0.1:{http}"), "HTTP"),
+            ],
+        );
+        let lines: Vec<String> = lines.into_iter().filter(|l| !l.contains("debug")).collect();
+        runs.push((format!("{answer:?}"), lines));
+    }
+    assert!(runs[0].0.contains("Ok(Ok(1))"), "{:?}", runs[0]);
+    assert_eq!(runs[1], runs[0]);
+
+    // The first URL's (wrong) password is the one sent, the other sentinel's own unused. Both
+    // URLs name the same sentinel: radix tries them in Go's map order and reports the last
+    // one's error, so each must fail the same way.
+    let environment = vec![
+        (
+            "RUNTIME_ROOT",
+            runtime.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("REDIS_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_TYPE", "sentinel".into()),
+        (
+            "REDIS_URL",
+            format!(
+                "mymaster,redis://:wrong@{sentinel},redis://:sentpw@{}",
+                sentinel.replace("127.0.0.1", "localhost")
+            ),
+        ),
+        ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+        ("DISABLE_STATS", "true".into()),
+        ("LOG_LEVEL", "warn".into()),
+    ];
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let lines = |stderr: &str| {
+        let mut lines: Vec<String> = logrus_lines(stderr, &[(sentinel.clone(), "SENTINEL")])
+            .into_iter()
+            .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+            .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+            .collect();
+        lines.dedup();
+        lines
+    };
+    let upstream = lines(&startup_failure(&upstream_binary(), &environment).await);
+    let ours = lines(
+        &startup_failure(
+            std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+            &environment,
+        )
+        .await,
+    );
+    assert!(
+        upstream.iter().any(|l| l.contains("WRONGPASS")),
         "{upstream:?}"
     );
     assert_eq!(ours, upstream);

@@ -44,8 +44,14 @@ pub struct RedisConnection {
     /// upstream reads in `CLUSTER` mode.
     pub pipeline_window: i64,
     pub cluster_pipeline_parallelism: i64,
-    /// `REDIS_URL` as given: in `CLUSTER` mode, the nodes to start from, comma-separated.
+    /// `REDIS_URL` as given: in `CLUSTER` mode, the nodes to start from, comma-separated; in
+    /// `SENTINEL` mode, the primary's name, then the sentinels.
     pub url: String,
+    /// `REDIS_SENTINEL_AUTH` (or `REDIS_PERSECOND_SENTINEL_AUTH`): the sentinels' credentials.
+    pub sentinel_auth: String,
+    /// For a pool through sentinels: the sentinels and their credentials, which the auth
+    /// file (upstream's pool dialer only) must not replace.
+    sentinel_dial: Option<(Vec<Server>, (String, String))>,
 }
 
 impl std::fmt::Debug for RedisConnection {
@@ -92,6 +98,7 @@ struct PoolSettings<'a> {
     close_on_readonly: bool,
     pipeline_window: i64,
     cluster_pipeline_parallelism: i64,
+    sentinel_auth: &'a str,
 }
 
 impl RedisConnection {
@@ -113,6 +120,7 @@ impl RedisConnection {
             close_on_readonly: s.redis_close_connection_on_readonly_error,
             pipeline_window: s.redis_pipeline_window,
             cluster_pipeline_parallelism: s.redis_cluster_pipeline_parallelism,
+            sentinel_auth: &s.redis_sentinel_auth,
         })
     }
 
@@ -136,6 +144,7 @@ impl RedisConnection {
             close_on_readonly: s.redis_close_connection_on_readonly_error,
             pipeline_window: s.redis_persecond_pipeline_window,
             cluster_pipeline_parallelism: s.redis_persecond_cluster_pipeline_parallelism,
+            sentinel_auth: &s.redis_persecond_sentinel_auth,
         })
     }
 
@@ -167,7 +176,35 @@ impl RedisConnection {
             pipeline_window: p.pipeline_window,
             cluster_pipeline_parallelism: p.cluster_pipeline_parallelism,
             url: p.url.to_string(),
+            sentinel_auth: p.sentinel_auth.to_string(),
+            sentinel_dial: None,
         })
+    }
+
+    /// The sentinel at `url`, dialled over TCP with `SentinelDialer`: what is set of the
+    /// sentinel auth, then of the first sentinel URL (`parseRedisURL(urls[0])`), then of its own
+    /// URL (`Dial`), for the credentials and the database; no auth file.
+    fn sentinel(&self, url: &str, first: &str) -> Self {
+        let (_, mut username, mut password, mut database) = dialled(&self.sentinel_auth, first);
+        let (address, own_username, own_password, own_database) = dialled("", url);
+        for (field, own) in [
+            (&mut username, own_username),
+            (&mut password, own_password),
+            (&mut database, own_database),
+        ] {
+            if field.is_empty() {
+                *field = own;
+            }
+        }
+        Self {
+            network: "tcp".into(),
+            address,
+            username,
+            password,
+            database,
+            auth_file: String::new(),
+            ..self.clone()
+        }
     }
 
     /// The node at `url` of a cluster, dialled over TCP as radix's cluster dials its nodes.
@@ -244,6 +281,7 @@ impl RedisConnection {
             path: self.auth_file.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            sentinels: self.sentinel_dial.clone(),
         }
     }
 
@@ -290,7 +328,7 @@ impl RedisConnection {
     /// One attempt of upstream's loop: radix's dial (connect, AUTH, then the URL's database as
     /// given, which Redis may refuse), then `PONG` to `PING`, then the pool. A failed dial is
     /// traced like radix's; `failed` is upstream's `hadConnError`.
-    async fn attempt(&self, failed: &mut bool) -> Result<Pool, String> {
+    async fn attempt(&self, failed: &mut bool) -> Result<Connected, String> {
         let probe = match self.probe(Dial::Single).await {
             Ok(probe) => probe,
             Err(message) => {
@@ -299,14 +337,17 @@ impl RedisConnection {
             }
         };
         traced_success(failed);
-        self.set_up(probe).await
+        Ok(Connected {
+            pool: self.set_up(probe).await?,
+            replicas: Vec::new(),
+        })
     }
 
     /// One attempt of upstream's loop in `CLUSTER` mode (`ClusterConfig.New`): a pool on the
     /// first node that dials (each failure traced), the topology from it (`CLUSTER SLOTS`), a
     /// pool on each of its other nodes (`sync`, by their addresses, so with `REDIS_AUTH` but
     /// not the seed URL's credentials), then `PONG` to `PING` from the cluster.
-    async fn attempt_cluster(&self, failed: &mut bool) -> Result<Pool, String> {
+    async fn attempt_cluster(&self, failed: &mut bool) -> Result<Connected, String> {
         let mut last_error = String::new();
         let mut probed = None;
         for seed in self.url.split(',') {
@@ -332,6 +373,7 @@ impl RedisConnection {
         let _ = probe.quit().await;
         let slots = slots.map_err(|e| format!("response returned from Conn: {}", e.details()))?;
         let mut primaries = Vec::new();
+        let mut secondaries = Vec::new();
         for (address, primary) in topology(&slots) {
             // The seed's pool is under its URL: a node spelled alike is not dialled again.
             if address != seed {
@@ -349,38 +391,242 @@ impl RedisConnection {
                     }
                 }
             }
-            if let (true, Ok((host, port))) = (primary, crate::go::split_host_port(&address))
-                && let Ok(port) = port.parse()
-            {
-                primaries.push(Server::new(host, port));
+            match (primary, crate::go::split_host_port(&address)) {
+                (true, Ok((host, port))) => {
+                    if let Ok(port) = port.parse() {
+                        primaries.push(Server::new(host, port));
+                    }
+                }
+                (false, _) => secondaries.push(address),
+                _ => {}
             }
         }
         // fred's clients over the primaries, dialled as the nodes are.
         let pool = self
             .node("")
-            .builder(
-                ServerConfig::Clustered {
-                    hosts: primaries,
-                    policy: Default::default(),
-                },
-                false,
-            )
+            .open_pool(ServerConfig::Clustered {
+                hosts: primaries,
+                policy: Default::default(),
+            })
+            .await?;
+        self.with_replicas(pool, &secondaries).await
+    }
+
+    /// A pool of the pool size's clients on `server`, reconnecting as radix's, once it answers
+    /// `PONG` to `PING`; a failure closes it (upstream's `client.Close()`).
+    async fn open_pool(&self, server: ServerConfig) -> Result<Pool, String> {
+        let pool = self
+            .builder(server, false)
             .set_policy(radix_reconnects())
             .build_pool(self.pool_size)
             .map_err(|e| e.to_string())?;
-        pool.init().await.map_err(|e| e.details().to_string())?;
-        let pong: String = pool
-            .next()
-            .ping(None)
-            .await
-            .map_err(|e| e.details().to_string())?;
-        if pong != "PONG" {
-            return Err(format!(
-                "unexpected PING response: {}",
-                crate::go::quote(&pong)
-            ));
+        let opened = async {
+            pool.init().await.map_err(|e| e.details().to_string())?;
+            let pong: String = pool
+                .next()
+                .ping(None)
+                .await
+                .map_err(|e| e.details().to_string())?;
+            match pong.as_str() {
+                "PONG" => Ok(()),
+                _ => Err(format!(
+                    "unexpected PING response: {}",
+                    crate::go::quote(&pong)
+                )),
+            }
+        }
+        .await;
+        if let Err(e) = opened {
+            let _ = pool.quit().await;
+            return Err(e);
         }
         Ok(pool)
+    }
+
+    /// `pool` with the pools radix also keeps on `replicas`; a failure closes them all.
+    async fn with_replicas(&self, pool: Pool, replicas: &[String]) -> Result<Connected, String> {
+        match self.replica_pools(replicas).await {
+            Ok(replicas) => Ok(Connected { pool, replicas }),
+            Err(e) => {
+                let _ = pool.quit().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The pools radix keeps on `replicas` (which the service never uses): their connections
+    /// count in the pool's stats. A failure closes those opened.
+    async fn replica_pools(&self, replicas: &[String]) -> Result<Vec<Pool>, String> {
+        let mut pools = Vec::new();
+        for address in replicas {
+            let node = self.node(address);
+            let opened = match node.server().await {
+                Ok(server) => node.open_pool(server).await,
+                Err(e) => Err(e),
+            };
+            match opened {
+                Ok(pool) => pools.push(pool),
+                Err(e) => {
+                    for pool in pools {
+                        let _ = pool.quit().await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(pools)
+    }
+
+    /// The sentinels of `REDIS_URL` (after the primary's name), as `SentinelDialer` dials them.
+    fn sentinels(&self) -> Vec<Self> {
+        let urls: Vec<&str> = self.url.split(',').skip(1).collect();
+        urls.iter().map(|url| self.sentinel(url, urls[0])).collect()
+    }
+
+    /// The first sentinel that dials (`dialSentinel`), or the last dial's error.
+    async fn dial_sentinel(&self) -> Result<Client, String> {
+        let mut last_error = String::new();
+        for sentinel in self.sentinels() {
+            match sentinel.probe(Dial::Sentinel).await {
+                Ok((_, client)) => return Ok(client),
+                Err(message) => last_error = message,
+            }
+        }
+        Err(last_error)
+    }
+
+    /// `SENTINEL MASTER` and `SENTINEL SLAVES` on `sentinel`: the primary's address, then the
+    /// replicas' (those flagged `slave` alone).
+    async fn sentinel_nodes(&self, sentinel: &Client) -> Result<(String, Vec<String>), String> {
+        let name = self.url.split(',').next().unwrap_or_default();
+        let ask = |what: &'static str| {
+            sentinel.custom::<fred::types::Value, _>(fred::cmd!("SENTINEL"), vec![what, name])
+        };
+        let refused =
+            |e: fred::error::Error| format!("response returned from Conn: {}", e.details());
+        let primary = ask("MASTER").await.map_err(refused)?;
+        let replicas = ask("SLAVES").await.map_err(refused)?;
+        let fields = |value: &fred::types::Value| -> std::collections::HashMap<String, String> {
+            let fred::types::Value::Array(items) = value else {
+                return Default::default();
+            };
+            items
+                .chunks(2)
+                .filter_map(|pair| Some((pair.first()?.as_string()?, pair.get(1)?.as_string()?)))
+                .collect()
+        };
+        let address = |m: &std::collections::HashMap<String, String>, command: &str| match (
+            m.get("ip"),
+            m.get("port"),
+        ) {
+            (Some(ip), Some(port)) if !ip.is_empty() && !port.is_empty() => {
+                Ok(crate::net::join_host_port(ip, port.parse().unwrap_or(0)))
+            }
+            _ => Err(format!("malformed {}: {m:?}", crate::go::quote(command))),
+        };
+        let primary = address(&fields(&primary), "SENTINEL MASTER")?;
+        let mut secondaries = Vec::new();
+        if let fred::types::Value::Array(replicas) = &replicas {
+            for replica in replicas {
+                let replica = fields(replica);
+                if replica.get("flags").map(String::as_str) == Some("slave") {
+                    secondaries.push(address(&replica, "SENTINEL SLAVES")?);
+                }
+            }
+        }
+        Ok((primary, secondaries))
+    }
+
+    /// One attempt of upstream's loop in `SENTINEL` mode (`SentinelConfig.New`): the first
+    /// sentinel that dials (untraced), the sentinels it knows (`SENTINEL SENTINELS`), the
+    /// primary and its replicas, a pool on each (by address, with `REDIS_AUTH`), then `PONG`
+    /// to `PING` from the primary.
+    async fn attempt_sentinel(&self, failed: &mut bool) -> Result<Connected, String> {
+        let name = self.url.split(',').next().unwrap_or_default();
+        let sentinel = self.dial_sentinel().await?;
+        let known: Result<fred::types::Value, _> = sentinel
+            .custom(fred::cmd!("SENTINEL"), vec!["SENTINELS", name])
+            .await;
+        let nodes = match known {
+            Ok(_) => self.sentinel_nodes(&sentinel).await,
+            Err(e) => Err(format!("response returned from Conn: {}", e.details())),
+        };
+        let _ = sentinel.quit().await;
+        let (primary, secondaries) = nodes?;
+        for address in std::iter::once(&primary).chain(&secondaries) {
+            match self.node(address).probe(Dial::Single).await {
+                Ok((_, client)) => {
+                    let _ = client.quit().await;
+                    traced_success(failed);
+                }
+                Err(message) => {
+                    traced_failure(failed, &message);
+                    return Err(format!(
+                        "error creating client for {}: {message}",
+                        crate::go::quote(address)
+                    ));
+                }
+            }
+        }
+        let sentinels = self.sentinels();
+        let hosts = sentinels
+            .iter()
+            .filter_map(|s| {
+                let (host, port) = crate::go::split_host_port(&s.address).ok()?;
+                Some(Server::new(host, port.parse().ok()?))
+            })
+            .collect::<Vec<_>>();
+        let first = sentinels.first();
+        let sentinel_credentials = first
+            .map(|s| (s.username.clone(), s.password.clone()))
+            .unwrap_or_default();
+        let (username, password) = fred_credentials(&sentinel_credentials);
+        // The pool's settings: by the nodes' addresses (with `REDIS_AUTH`).
+        let mut pooled = self.node("");
+        pooled.sentinel_dial = Some((hosts.clone(), sentinel_credentials));
+        let pool = pooled
+            .open_pool(ServerConfig::Sentinel {
+                hosts,
+                service_name: name.to_string(),
+                username,
+                password,
+            })
+            .await?;
+        self.with_replicas(pool, &secondaries).await
+    }
+
+    /// radix's sentinel `spin`: every 5 s, the primary the sentinels name; when it changed (a
+    /// failover), the pool reconnects to it. (radix also subscribes to `switch-master`, which
+    /// no sentinel publishes: they publish `+switch-master`.)
+    fn follow_primary(&self, pool: Pool) {
+        let connection = self.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(5),
+            );
+            loop {
+                ticks.tick().await;
+                let Ok(sentinel) = connection.dial_sentinel().await else {
+                    continue;
+                };
+                let nodes = connection.sentinel_nodes(&sentinel).await;
+                let _ = sentinel.quit().await;
+                let Ok((primary, _)) = nodes else {
+                    continue;
+                };
+                // Every client on the primary (those reconnecting aside): one left on the
+                // demoted node would get READONLY errors.
+                let on_primary = pool.clients().iter().all(|client| {
+                    client.active_connections().iter().all(|server| {
+                        crate::net::join_host_port(&server.host, server.port.into()) == primary
+                    })
+                });
+                if !on_primary {
+                    let _ = pool.force_reconnection().await;
+                }
+            }
+        });
     }
 
     /// radix's `Dialer.Dial`: the connection, then AUTH and SELECT as it sends them, which
@@ -552,7 +798,7 @@ impl RedisConnection {
         &self,
         startup: &StartupBackoff,
         cancelled: impl std::future::Future<Output = ()>,
-    ) -> Result<Pool, String> {
+    ) -> Result<Connected, String> {
         // `newCredentialProviderFromSettings`, before `newClientImpl` starts.
         if !self.auth_file.is_empty() && !self.auth.is_empty() {
             return Err(format!(
@@ -630,11 +876,15 @@ impl RedisConnection {
                 self.pool_size_setting
             )),
         }
+        let sentinel = self.redis_type.eq_ignore_ascii_case("sentinel");
+        if sentinel && self.url.split(',').count() < 2 {
+            return Err("Expected master name and a list of urls for the sentinels, in the format: <redis master name>,<sentinel1>,...,<sentineln>".into());
+        }
         let start = std::time::Instant::now();
         let mut attempt = 0;
         let mut failed = false;
         tokio::pin!(cancelled);
-        let pool = loop {
+        let connected = loop {
             match self.redis_type.to_lowercase().as_str() {
                 // Upstream logs REDIS_URL as given, credentials included (docs/parity.md §7).
                 "single" => crate::log::warn(&format!("Creating single with urls {masked}")),
@@ -647,20 +897,32 @@ impl RedisConnection {
                         .collect::<Vec<_>>()
                         .join(" ")
                 )),
+                // Its dialer, made at each attempt (`createDialer`), logs again.
                 "sentinel" => {
-                    return Err(format!(
-                        "{}_TYPE={} is not supported yet",
-                        self.prefix, self.redis_type
-                    ));
+                    let target = format!("sentinel({masked})");
+                    if self.tls.is_some() {
+                        crate::log::warn(&format!("enabling TLS to redis {target}"));
+                    }
+                    if !self.sentinel_auth.is_empty() {
+                        match self.sentinel_auth.split_once(':') {
+                            Some((user, _)) => crate::log::warn(&format!(
+                                "enabling authentication to redis {target} with user {user}"
+                            )),
+                            None => crate::log::warn(&format!(
+                                "enabling authentication to redis {target} without user"
+                            )),
+                        }
+                    }
                 }
                 _ => return Err(format!("Unrecognized redis type {}", self.redis_type)),
             }
-            let attempted = match cluster {
-                true => self.attempt_cluster(&mut failed).await,
-                false => self.attempt(&mut failed).await,
+            let attempted = match (cluster, sentinel) {
+                (true, _) => self.attempt_cluster(&mut failed).await,
+                (_, true) => self.attempt_sentinel(&mut failed).await,
+                _ => self.attempt(&mut failed).await,
             };
             let error = match attempted {
-                Ok(pool) => break pool,
+                Ok(connected) => break connected,
                 Err(message) => message,
             };
             let elapsed = start.elapsed();
@@ -688,25 +950,39 @@ impl RedisConnection {
             }
             attempt += 1;
         };
-        let pinger = pool.clone();
+        if sentinel {
+            self.follow_primary(connected.pool.clone());
+        }
         let interval = Duration::from_secs(5) / self.pool_size as u32;
-        tokio::spawn(async move {
-            let mut ticks =
-                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-            loop {
-                ticks.tick().await;
-                let _: Result<String, _> = pinger.next().ping(None).await;
-            }
-        });
-        Ok(pool)
+        for pinger in std::iter::once(&connected.pool).chain(&connected.replicas) {
+            let pinger = pinger.clone();
+            tokio::spawn(async move {
+                let mut ticks =
+                    tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                loop {
+                    ticks.tick().await;
+                    let _: Result<String, _> = pinger.next().ping(None).await;
+                }
+            });
+        }
+        Ok(connected)
     }
 }
 
-/// What radix dials: the server, or a cluster's node (which also gets `READONLY`).
+/// The pools a connection opened: the one the service uses, and those radix also keeps on
+/// the replicas (a cluster's, or the sentinels' primary's).
+pub struct Connected {
+    pub pool: Pool,
+    pub replicas: Vec<Pool>,
+}
+
+/// What radix dials: the server, a cluster's node (which also gets `READONLY`), or a
+/// sentinel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dial {
     Single,
     ClusterNode,
+    Sentinel,
 }
 
 /// `poolTrace` of a failed connection: logged, and remembered (`hadConnError`).
@@ -830,6 +1106,8 @@ struct FileCredentials {
     path: String,
     username: String,
     password: String,
+    /// Through sentinels: theirs, and their own credentials.
+    sentinels: Option<(Vec<Server>, (String, String))>,
 }
 
 impl std::fmt::Debug for FileCredentials {
@@ -861,8 +1139,16 @@ impl FileCredentials {
 impl fred::types::config::CredentialProvider for FileCredentials {
     async fn fetch(
         &self,
-        _server: Option<&Server>,
+        server: Option<&Server>,
     ) -> Result<(Option<String>, Option<String>), fred::error::Error> {
+        // fred asks for the sentinels' too: theirs are not the file's.
+        if let (Some((sentinels, credentials)), Some(server)) = (&self.sentinels, server)
+            && sentinels
+                .iter()
+                .any(|s| s.host == server.host && s.port == server.port)
+        {
+            return Ok(fred_credentials(credentials));
+        }
         let credentials = self
             .credentials()
             .map_err(|e| fred::error::Error::new(fred::error::ErrorKind::Auth, e))?;
@@ -1257,6 +1543,7 @@ mod auth_file_tests {
                 path: path.to_string_lossy().into_owned(),
                 username: "url-user".into(),
                 password: "url-pass".into(),
+                sentinels: None,
             }
             .credentials()
             .unwrap()
