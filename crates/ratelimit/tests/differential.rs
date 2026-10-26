@@ -170,6 +170,11 @@ impl Redis {
 
     /// The server started on `port`, once it answers and is the one started here.
     async fn start_on(port: u16) -> Option<Self> {
+        Self::start_with(port, &[]).await
+    }
+
+    /// [`start_on`](Self::start_on) with `extra` arguments.
+    async fn start_with(port: u16, extra: &[&str]) -> Option<Self> {
         let mut process = Command::new(redis_server())
             .args([
                 "--port",
@@ -179,6 +184,7 @@ impl Redis {
                 "--appendonly",
                 "no",
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -4512,6 +4518,18 @@ async fn the_binary_fails_to_start_like_upstream() {
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "create".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=CREATE is not supported in radix v4.".into()),
         (vec![("REDIS_POOL_ON_EMPTY_BEHAVIOR", "Error".into())], "REDIS_POOL_ON_EMPTY_BEHAVIOR=ERROR is not supported in radix v4. Pool will block instead of failing fast. Remove this setting or set to WAIT, and use context timeouts for fail-fast behavior.".into()),
         (vec![("REDIS_TYPE", "Foo".into())], "Unrecognized redis type Foo".into()),
+        // CLUSTER: the parallelism checked first; then no node that dials, or one that is no
+        // cluster's (READONLY refused).
+        (vec![("REDIS_TYPE", "cluster".into()), ("REDIS_CLUSTER_PIPELINE_PARALLELISM", "-1".into())], "redis cluster pipeline parallelism must be >= 0".into()),
+        (vec![("REDIS_TYPE", "cluster".into()), ("REDIS_URL", "127.0.0.1:1".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "could not connect to any redis instances, last error was: dial tcp 127.0.0.1:1: connect: connection refused".into()),
+        // Redis refuses READONLY outside a cluster; Valkey takes it, then refuses the topology
+        // (the error then follows the elapsed time, `after 1.0s:`).
+        (vec![("REDIS_TYPE", "CLUSTER".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], match redis_server().contains("valkey") {
+            false => "could not connect to any redis instances, last error was: response returned from Conn: ERR This instance has cluster support disabled".into(),
+            true => "s: response returned from Conn: ERR This instance has cluster support disabled".into(),
+        }),
+        // Without READONLY (its dialer replaced), the topology is refused instead.
+        (vec![("REDIS_TYPE", "cluster".into()), ("REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR", "true".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "s: response returned from Conn: ERR This instance has cluster support disabled".into()),
         // The TLS files, read with the settings when either pool uses TLS.
         (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CACERT", "/nowhere/ca.pem".into())], "failed to read file: /nowhere/ca.pem: open /nowhere/ca.pem: no such file or directory".into()),
         (vec![("REDIS_PERSECOND_TLS", "true".into()), ("REDIS_TLS_CACERT", runtime.join("current").to_string_lossy().into_owned() + "/ratelimit/config/llm.yaml")], format!("failed to load the provided TLS CA certificate: {}/ratelimit/config/llm.yaml", runtime.join("current").display())),
@@ -7600,7 +7618,7 @@ fn without_text_spaces(text: &str) -> String {
 }
 
 /// Upstream's Redis startup lines: the pool, the authentication, each failed connection
-/// (unreachable, or refused by Redis: AUTH, the database), each retry (its wait and elapsed
+/// (unreachable, or refused by Redis: AUTH, the database, a cluster's READONLY), each retry (its wait and elapsed
 /// time masked: they are random), then the fatal line once it gives up.
 #[tokio::test]
 async fn redis_startup_is_logged_like_upstream() {
@@ -7620,11 +7638,14 @@ async fn redis_startup_is_logged_like_upstream() {
     let refused_database = format!("redis://{}/abc", redis.address);
     let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
     let after = regex::Regex::new(r"after [^:]+:").unwrap();
-    for (url, auth, behavior) in [
-        (&unreachable, "user:secret", "wait"),
-        (&unreachable, "secret", "other"),
-        (&redis.address, "secret", "wait"),
-        (&refused_database, "", "wait"),
+    // CLUSTER: each node tried in turn, the last error retried.
+    let no_cluster = format!("{unreachable},{}", redis.address);
+    for (url, auth, behavior, redis_type) in [
+        (&unreachable, "user:secret", "wait", "single"),
+        (&unreachable, "secret", "other", "single"),
+        (&redis.address, "secret", "wait", "single"),
+        (&refused_database, "", "wait", "single"),
+        (&no_cluster, "", "wait", "cluster"),
     ] {
         let environment = vec![
             (
@@ -7638,6 +7659,7 @@ async fn redis_startup_is_logged_like_upstream() {
             ("REDIS_POOL_SIZE", "3".into()),
             ("REDIS_PIPELINE_LIMIT", "8".into()),
             ("REDIS_POOL_ON_EMPTY_BEHAVIOR", behavior.into()),
+            ("REDIS_TYPE", redis_type.into()),
             ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
             ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
             ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
@@ -7645,10 +7667,16 @@ async fn redis_startup_is_logged_like_upstream() {
             ("LOG_LEVEL", "warn".into()),
         ];
         let lines = |stderr: &str| {
-            // The logrus lines: upstream's panic (our fatal line, §7) is compared elsewhere.
+            // The logrus lines: upstream's panic (our fatal line, §7) is compared elsewhere, as
+            // are the dials radix cancels when it gives up on a cluster's node (§7).
+            let cancelled = |l: &String| {
+                redis_type == "cluster"
+                    && (l.contains("operation was canceled") || l.contains("context canceled"))
+            };
             let mut lines: Vec<String> = logrus_lines(stderr, &[])
                 .into_iter()
                 .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+                .filter(|l| !cancelled(l))
                 .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
                 .map(|l| after.replace(&l, "after ELAPSED:").into_owned())
                 .collect();
@@ -8347,6 +8375,8 @@ struct Pki {
     server: (String, String),
     /// A server certificate for 127.0.0.1 that expired on 2020-01-01.
     expired_server: (String, String),
+    /// For 127.0.0.1, as a server and as a client: a Redis cluster node's (its bus).
+    node: (String, String),
     client_cert: PathBuf,
     client_key: PathBuf,
 }
@@ -8364,11 +8394,11 @@ fn pki(dir: &std::path::Path) -> Pki {
     named(&mut ca, "test CA");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
-    let issue = |name: &str, purpose, expired: bool| {
+    let issue = |name: &str, purposes: Vec<ExtendedKeyUsagePurpose>, expired: bool| {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
         named(&mut params, name);
-        params.extended_key_usages = vec![purpose];
+        params.extended_key_usages = purposes;
         if expired {
             params.not_before = rcgen::date_time_ymd(2019, 1, 1);
             params.not_after = rcgen::date_time_ymd(2020, 1, 1);
@@ -8376,9 +8406,11 @@ fn pki(dir: &std::path::Path) -> Pki {
         let cert = params.signed_by(&key, &ca).unwrap();
         (cert.pem(), key.serialize_pem())
     };
-    let server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth, false);
-    let expired_server = issue("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth, true);
-    let (client_cert, client_key) = issue("client", ExtendedKeyUsagePurpose::ClientAuth, false);
+    use ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+    let server = issue("127.0.0.1", vec![ServerAuth], false);
+    let expired_server = issue("127.0.0.1", vec![ServerAuth], true);
+    let node = issue("127.0.0.1", vec![ServerAuth, ClientAuth], false);
+    let (client_cert, client_key) = issue("client", vec![ClientAuth], false);
     std::fs::create_dir_all(dir).unwrap();
     let write = |name: &str, pem: &str| {
         let path = dir.join(name);
@@ -8389,6 +8421,7 @@ fn pki(dir: &std::path::Path) -> Pki {
         ca: write("ca.pem", &ca.pem()),
         server,
         expired_server,
+        node,
         client_cert: write("client.pem", &client_cert),
         client_key: write("client-key.pem", &client_key),
     }
@@ -10234,4 +10267,396 @@ async fn xds_responses_reread_the_tls_files_like_upstream() {
             binary.display()
         );
     }
+}
+
+/// `redis-cli` (or `valkey-cli`) for the server: its name with `-cli` for `-server`.
+fn redis_cli() -> String {
+    let server = redis_server();
+    match server.strip_suffix("-server") {
+        Some(prefix) => format!("{prefix}-cli"),
+        None => "redis-cli".into(),
+    }
+}
+
+/// A Redis cluster of three primaries, each with a third of the slots.
+struct RedisCluster {
+    nodes: Vec<Redis>,
+    /// With TLS, each node's TLS port (the harness uses the plain ones).
+    tls_ports: Vec<u16>,
+    _dir: TempDir,
+}
+
+impl RedisCluster {
+    async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// Over TLS too with `pki`: each node also on a TLS port (its certificate, for 127.0.0.1),
+    /// its cluster bus over TLS, so that it announces its TLS port to TLS clients.
+    async fn start_with(pki: Option<&Pki>) -> Self {
+        let dir = temp_dir("cluster");
+        let mut nodes = Vec::new();
+        let mut tls_ports = Vec::new();
+        while nodes.len() < 3 {
+            // Every port reserved, the cluster bus's too (by default 10000 above the node's).
+            let port = reserved_port();
+            let config = dir.join(format!("nodes-{port}.conf"));
+            let config = config.to_string_lossy().into_owned();
+            let mut args = vec![
+                "--cluster-enabled".to_string(),
+                "yes".into(),
+                "--cluster-config-file".into(),
+                config,
+                "--cluster-port".into(),
+                reserved_port().to_string(),
+            ];
+            let tls_port = reserved_port();
+            if let Some(pki) = pki {
+                let (cert, key) = server_files(&dir.join(format!("tls-{port}")), &pki.node);
+                args.extend(
+                    [
+                        "--tls-port",
+                        &tls_port.to_string(),
+                        "--tls-cert-file",
+                        &cert,
+                        "--tls-key-file",
+                        &key,
+                        "--tls-ca-cert-file",
+                        &pki.ca.to_string_lossy(),
+                        "--tls-cluster",
+                        "yes",
+                        "--tls-auth-clients",
+                        "no",
+                    ]
+                    .map(String::from),
+                );
+            }
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Some(node) = Redis::start_with(port, &args).await {
+                nodes.push(node);
+                tls_ports.push(tls_port);
+            }
+        }
+        let addresses: Vec<String> = nodes.iter().map(|n| n.address.clone()).collect();
+        let created = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Command::new(redis_cli())
+                .arg("--cluster")
+                .arg("create")
+                .args(&addresses)
+                .arg("--cluster-yes")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .expect("the cluster is created")
+        .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        // Every node sees the cluster as up.
+        for node in &nodes {
+            for attempt in 0.. {
+                let info: String = node
+                    .client
+                    .custom(
+                        CustomCommand::new_static("CLUSTER", ClusterHash::Random, false),
+                        vec!["INFO"],
+                    )
+                    .await
+                    .unwrap();
+                if info.contains("cluster_state:ok") {
+                    break;
+                }
+                assert!(attempt < 500, "the cluster is not up: {info}");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        Self {
+            nodes,
+            tls_ports,
+            _dir: dir,
+        }
+    }
+
+    /// [`seeds`](Self::seeds) on the TLS ports.
+    fn tls_seeds(&self) -> String {
+        format!(
+            "127.0.0.1:{},127.0.0.1:{}",
+            self.tls_ports[0], self.tls_ports[1]
+        )
+    }
+
+    /// `REDIS_URL` for two of the nodes: the cluster finds the third.
+    fn seeds(&self) -> String {
+        format!("{},{}", self.nodes[0].address, self.nodes[1].address)
+    }
+
+    async fn flush(&self) {
+        for node in &self.nodes {
+            let _: String = node
+                .client
+                .custom(
+                    CustomCommand::new_static("FLUSHALL", ClusterHash::Random, false),
+                    Vec::<String>::new(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Every node's keys, by node.
+    async fn dump(&self) -> Vec<BTreeMap<String, (String, i64)>> {
+        let mut dumps = Vec::new();
+        for node in &self.nodes {
+            dumps.push(node.dump().await);
+        }
+        dumps
+    }
+}
+
+/// What a run of `binary` on `cluster` shows: three requests' answers (for keys spread over the
+/// nodes), the hour's counters on each node, the pools' stats and the log lines (`masked` and
+/// the ports masked).
+async fn cluster_run(
+    binary: &std::path::Path,
+    cluster: &RedisCluster,
+    variables: &[(&'static str, String)],
+    masked: &[(String, &str)],
+) -> (
+    Vec<String>,
+    Vec<Vec<String>>,
+    BTreeMap<String, u64>,
+    Vec<String>,
+) {
+    const CONFIG: &[u8] = b"domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: hour, requests_per_unit: 2}\n  - key: burst\n    rate_limit: {unit: second, requests_per_unit: 1000}\n";
+    let runtime = temp_dir("cluster-runtime");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let users = [
+        "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi",
+    ];
+    cluster.flush().await;
+    let statsd = StatsdServer::start().await;
+    let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+    let mut environment = [
+        runtime_environment(&runtime, true),
+        vec![
+            ("REDIS_SOCKET_TYPE", "tcp".to_string()),
+            ("REDIS_TYPE", "cluster".into()),
+            ("EXPIRATION_JITTER_MAX_SECONDS", "0".into()),
+            ("STATSD_HOST", "127.0.0.1".into()),
+            ("STATSD_PORT", statsd.address.port().to_string()),
+            ("STATS_FLUSH_INTERVAL", "100ms".into()),
+            ("LOG_LEVEL", "warn".into()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", debug.to_string()),
+        ],
+    ]
+    .concat();
+    environment.extend(variables.iter().cloned());
+    let logged = Logged::start(binary, &environment, http).await;
+    let mut client = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
+        .await
+        .unwrap();
+    let descriptors: Vec<[(&str, &str); 1]> = users
+        .iter()
+        .flat_map(|u| [[("user", *u)], [("burst", *u)]])
+        .collect();
+    let descriptors: Vec<&[(&str, &str)]> = descriptors.iter().map(|d| d.as_slice()).collect();
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        let mut response = client
+            .should_rate_limit(request("llm", &descriptors))
+            .await
+            .unwrap()
+            .into_inner();
+        for status in &mut response.statuses {
+            status.duration_until_reset = None;
+        }
+        answers.push(format!("{response:?}"));
+    }
+    // The hour's counters only: the second's expire.
+    let keys = cluster
+        .dump()
+        .await
+        .into_iter()
+        .map(|node| {
+            node.into_iter()
+                .filter(|(k, _)| k.starts_with("llm_user_"))
+                .map(|(k, (v, _))| format!("{k}={v}"))
+                .collect()
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let pools = stat_values(&statsd.lines.lock().unwrap(), |name| {
+        name.contains("_pool.")
+    });
+    let stderr = logged.stop().await;
+    let mut masked = masked.to_vec();
+    masked.extend([
+        (format!("127.0.0.1:{grpc}"), "GRPC"),
+        (format!("127.0.0.1:{http}"), "HTTP"),
+        (format!("127.0.0.1:{debug}"), "DEBUG"),
+    ]);
+    (answers, keys, pools, logrus_lines(&stderr, &masked))
+}
+
+/// [`cluster_run`] of both binaries, which must agree; the limit applies and the keys spread
+/// over the nodes.
+async fn cluster_runs(
+    cluster: &RedisCluster,
+    variables: &[(&'static str, String)],
+    masked: &[(String, &str)],
+) {
+    let upstream = cluster_run(&upstream_binary(), cluster, variables, masked).await;
+    let ours = cluster_run(
+        std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+        cluster,
+        variables,
+        masked,
+    )
+    .await;
+    assert!(upstream.0[2].contains("OverLimit"), "{:?}", upstream.0);
+    assert!(
+        upstream.1.iter().filter(|node| !node.is_empty()).count() > 1,
+        "the keys spread over the nodes: {:?}",
+        upstream.1
+    );
+    assert_eq!(ours.0, upstream.0, "answers");
+    assert_eq!(ours.1, upstream.1, "keys by node");
+    assert_eq!(ours.2, upstream.2, "pool stats");
+    assert_eq!(ours.3, upstream.3, "log lines");
+}
+
+/// `REDIS_TYPE=CLUSTER` (and `REDIS_PERSECOND_TYPE`) as upstream's: the cluster found from two
+/// of its nodes, each request's keys on their slots' nodes, a pool per node (`cx_*` counting
+/// every node's connections), and upstream's startup lines (the pipeline window, the
+/// parallelism, the URLs).
+#[tokio::test]
+async fn a_redis_cluster_serves_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let cluster = RedisCluster::start().await;
+    let variables = [
+        ("REDIS_URL", cluster.seeds()),
+        ("REDIS_POOL_SIZE", "3".into()),
+        ("REDIS_PIPELINE_WINDOW", "1ms".into()),
+        ("REDIS_CLUSTER_PIPELINE_PARALLELISM", "0".into()),
+        ("REDIS_PERSECOND", "true".into()),
+        ("REDIS_PERSECOND_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_PERSECOND_TYPE", "CLUSTER".into()),
+        ("REDIS_PERSECOND_URL", cluster.nodes[2].address.clone()),
+        ("REDIS_PERSECOND_POOL_SIZE", "2".into()),
+        ("REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM", "5".into()),
+    ];
+    let masked = [
+        (cluster.seeds(), "SEEDS"),
+        (cluster.seeds().replace(',', " "), "SEED SEED"),
+        (cluster.nodes[2].address.clone(), "NODE"),
+    ];
+    cluster_runs(&cluster, &variables, &masked).await;
+}
+
+/// A cluster over TLS (`REDIS_TLS`): every node, found from the seeds, dialled over TLS and
+/// verified by its address, as upstream's.
+#[tokio::test]
+async fn a_redis_cluster_over_tls_serves_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let dir = temp_dir("cluster-pki");
+    let test_pki = pki(&dir);
+    let cluster = RedisCluster::start_with(Some(&test_pki)).await;
+    let variables = [
+        ("REDIS_URL", cluster.tls_seeds()),
+        ("REDIS_TLS", "true".into()),
+        (
+            "REDIS_TLS_CACERT",
+            test_pki.ca.to_string_lossy().into_owned(),
+        ),
+        ("REDIS_POOL_SIZE", "2".into()),
+    ];
+    let masked = [
+        (cluster.tls_seeds(), "SEEDS"),
+        (cluster.tls_seeds().replace(',', " "), "SEED SEED"),
+    ];
+    cluster_runs(&cluster, &variables, &masked).await;
+}
+
+/// A cluster node down at startup (in the topology, but refusing connections): its dial's
+/// error, then the retry naming it, as upstream logs them.
+#[tokio::test]
+async fn a_cluster_node_down_at_startup_is_logged_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("cluster-down");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let mut cluster = RedisCluster::start().await;
+    let down = cluster.nodes.remove(2);
+    let down_address = down.address.clone();
+    drop(down);
+    let environment = vec![
+        (
+            "RUNTIME_ROOT",
+            runtime.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("REDIS_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_TYPE", "cluster".into()),
+        ("REDIS_URL", cluster.seeds()),
+        ("REDIS_POOL_SIZE", "2".into()),
+        ("REDIS_STARTUP_INITIAL_INTERVAL", "50ms".into()),
+        ("REDIS_STARTUP_MAX_INTERVAL", "100ms".into()),
+        ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into()),
+        ("DISABLE_STATS", "true".into()),
+        ("LOG_LEVEL", "warn".into()),
+    ];
+    let waits = regex::Regex::new(r"in [^ ]+ \(elapsed: [^)]+\)").unwrap();
+    let lines = |stderr: &str| {
+        let mut lines: Vec<String> = logrus_lines(stderr, &[(down_address.clone(), "DOWN")])
+            .into_iter()
+            // The panic (our fatal line, §7) and the dials radix cancels (§7) aside.
+            .filter(|l| l.starts_with("time=") && !l.contains("level=fatal"))
+            .filter(|l| !l.contains("operation was canceled") && !l.contains("context canceled"))
+            .map(|l| waits.replace(&l, "in WAIT (elapsed: ELAPSED)").into_owned())
+            .collect();
+        lines.dedup();
+        lines
+    };
+    let upstream = lines(&startup_failure(&upstream_binary(), &environment).await);
+    let ours = lines(
+        &startup_failure(
+            std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
+            &environment,
+        )
+        .await,
+    );
+    assert!(
+        upstream
+            .iter()
+            .any(|l| l.contains("error creating client for \"DOWN\"")),
+        "{upstream:?}"
+    );
+    assert_eq!(ours, upstream);
 }

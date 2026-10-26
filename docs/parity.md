@@ -86,7 +86,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `LIMIT_REQUEST_RESET_HEADER` | `RateLimit-Reset` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` | `false` | ✅ | `health_is_reported_like_upstream` in `tests/differential.rs` |
 | `REDIS_SOCKET_TYPE` | `unix` | ✅ | `tcp`: `tests/differential.rs`; `unix`: `tests/runner.rs` |
-| `REDIS_TYPE` | `SINGLE` | 🚧 | `SINGLE`, and an invalid value: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream`; `CLUSTER`, `SENTINEL` not supported yet |
+| `REDIS_TYPE` | `SINGLE` | 🚧 | `SINGLE`, and an invalid value: `tests/runner.rs`, `the_binary_fails_to_start_like_upstream`; `CLUSTER` (any case): `a_redis_cluster_serves_like_upstream`, `a_redis_cluster_over_tls_serves_like_upstream`, its startup lines and failures: `redis_startup_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`; `SENTINEL` not supported yet |
 | `REDIS_URL` | `/var/run/nutcracker/ratelimit.sock` | ✅ | `tests/differential.rs`; `redis://` URLs (user, password, database): `tests/runner.rs` |
 | `REDIS_POOL_SIZE` | `10` | ✅ | `tests/runner.rs` (0 is radix's 4) |
 | `REDIS_AUTH` | — | ✅ | `user:password` or a password: `tests/runner.rs` |
@@ -101,12 +101,12 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_TLS_CLIENT_KEY` | — | ✅ | `redis_over_tls_is_used_like_upstream`; a file that does not load: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_TLS_CACERT` | — | ✅ | added to the system's roots: `redis_over_tls_is_used_like_upstream`; a file that does not load or has no certificate: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ✅ | the chain verified, not the name: `redis_over_tls_is_used_like_upstream` |
-| `REDIS_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream (radix v4's write buffering is cluster-only); `CLUSTER` is not supported yet |
+| `REDIS_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream (radix v4's write buffering is cluster-only); in `CLUSTER` mode, upstream's debug line; its buffering not reproduced (§7) |
 | `REDIS_PIPELINE_LIMIT` | `0` | ✅ | no effect; upstream's deprecation warning: `redis_startup_is_logged_like_upstream` |
-| `REDIS_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
+| `REDIS_CLUSTER_PIPELINE_PARALLELISM` | `1` | ✅ | in `CLUSTER` mode, bounded by `REDIS_POOL_SIZE` and logged as upstream (`a_redis_cluster_serves_like_upstream`, `redis/connection.rs` unit test); negative refused at startup (`the_binary_fails_to_start_like_upstream`); the pipelines' grouping is fred's (§7) |
 | `REDIS_PERSECOND` | `false` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream` |
 | `REDIS_PERSECOND_SOCKET_TYPE` | `unix` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
-| `REDIS_PERSECOND_TYPE` | `SINGLE` | 🚧 | `SINGLE`: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs`; `CLUSTER`, `SENTINEL` not supported yet |
+| `REDIS_PERSECOND_TYPE` | `SINGLE` | 🚧 | `SINGLE`: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs`; `CLUSTER`: `a_redis_cluster_serves_like_upstream`; `SENTINEL` not supported yet |
 | `REDIS_PERSECOND_URL` | `/var/run/nutcracker/ratelimitpersecond.sock` | ✅ | `per_second_limits_use_their_own_redis_like_upstream`, `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_POOL_SIZE` | `10` | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AUTH` | — | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
@@ -119,9 +119,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_TLS` | `false` | ✅ | the same configuration, for the per-second pool; its files loaded even with the pool off: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_SENTINEL_AUTH` | — | ⬜ | |
 | `REDIS_PERSECOND_SENTINEL_AUTH` | — | ⬜ | |
-| `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ✅ | no effect outside `CLUSTER` mode, as upstream; `CLUSTER` is not supported yet |
+| `REDIS_PERSECOND_PIPELINE_WINDOW` | `0` | ✅ | as `REDIS_PIPELINE_WINDOW`, for the per-second pool |
 | `REDIS_PERSECOND_PIPELINE_LIMIT` | `0` | ✅ | no effect; the warning, as the main pool's: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
-| `REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM` | `1` | ⬜ | |
+| `REDIS_PERSECOND_CLUSTER_PIPELINE_PARALLELISM` | `1` | ✅ | as `REDIS_CLUSTER_PIPELINE_PARALLELISM`, bounded by `REDIS_PERSECOND_POOL_SIZE`: `a_redis_cluster_serves_like_upstream` |
 | `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | `false` | ✅ | `redis_connections_drive_health_like_upstream` in `tests/differential.rs` |
 | `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR` | `false` | ✅ | `SINGLE`: its warning only, as upstream, whose wrapper does not see the errors of the pipelined commands: `readonly_replies_are_handled_like_upstream`; `CLUSTER` with cluster mode |
 | `REDIS_TIMEOUT` | `10s` | ✅ | the connection timeout, as radix's dialer: `tests/runner.rs` |
@@ -215,7 +215,8 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND` (routing of `second` keys) | ✅ | `per_second_limits_use_their_own_redis_like_upstream` |
 | Redis single (TCP or Unix socket, `redis://` URL, AUTH, pool, startup retry with backoff) | ✅ | `tests/runner.rs`, `tests/differential.rs` (`the_binary_*`) |
 | Redis TLS, AUTH file | ✅ | `redis_over_tls_is_used_like_upstream`, `auth_files_are_reread_like_upstream` |
-| Redis sentinel / cluster, AWS IAM | ⬜ | |
+| Redis cluster: the topology from the first seed that dials (`READONLY` sent on its connections unless upstream's dialer is replaced), each of its nodes dialled by address (with `REDIS_AUTH`, without the seed URL's credentials), keys on their slots' nodes, a pool per primary (`cx_*` count every primary's), over TLS too; a node down at startup refused as upstream | ✅ | `a_redis_cluster_serves_like_upstream`, `a_redis_cluster_over_tls_serves_like_upstream`, `a_cluster_node_down_at_startup_is_logged_like_upstream`; `redis/connection.rs` unit tests |
+| Redis sentinel, AWS IAM | ⬜ | |
 | Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
 
 ## 5. Metrics, logs, traces
@@ -294,11 +295,14 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A `unix://HOST/PATH` or `unix-abstract:` xDS URL: grpc-go's resolver refuses the first, dials the second | the path (or the host, without a path) dialled for the first; the second is not supported | not needed by the targeted deployments |
 | `LOG_LEVEL=trace` writes each xDS response as Go prints the structure (with memory addresses) | not written | best effort (D3) |
 | What upstream panics on at startup prints Go's panic and its stack trace, exit status 2 | a logrus `level=fatal` line with the panic's message, written whatever `LOG_LEVEL`, exit status 1 | D1: crashes are not reproduced; the stack trace has no equivalent |
+| In `CLUSTER` mode, a pipeline's commands are grouped by key and the groups sent concurrently (`REDIS_CLUSTER_PIPELINE_PARALLELISM`), with `REDIS_PIPELINE_WINDOW`'s write buffering | fred's pipeline, each command sent to its slot's node | the same commands, keys and answers; only the scheduling differs |
+| In `CLUSTER` mode, radix sends `READONLY` on every connection of its node pools, refreshes the topology every 5 s, and traces the dials it cancels when giving up on a node (`operation was canceled`, as many as timing allows) | `READONLY` on the startup probe of each node only; fred refreshes the topology on `MOVED` and `ASK`; no cancelled dials traced |
+| In `CLUSTER` mode, radix keeps a pool for every node, replicas included, and for a seed spelled unlike its node (`localhost:7000`, a `redis://` URL) until the topology replaces it: all count in `cx_*`, and keep Redis healthy with `REDIS_HEALTH_CHECK_ACTIVE_CONNECTION` | pools on the primaries only: `cx_*` count theirs | the service only talks to primaries; replicas' connections would sit idle | `READONLY` only matters for reads from replicas, which the service never makes |
 | radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |
 | Redis connection errors read as Go's `net` errors | the startup dial's errors as Go's and radix's (`dial tcp 127.0.0.1:1: connect: connection refused`, `i/o timeout`, `response returned from Conn: <Redis' refusal of AUTH or SELECT>`); later ones (a failed reconnection, a command) as fred's; a name that does not resolve reads as the system resolver's error. Each startup attempt dials, authenticates and selects the database on a connection of its own, as radix's dial, before fred connects | different libraries; the messages around them are upstream's |
 | On SIGTERM, grpc-go closes each connection whose client does not answer its drain's ping 5 s later, once that connection's calls are done; a connection still in its TLS handshake or before its HTTP/2 preface holds the stop up to 120 s | the server stops 5 s later once no call is in flight on any connection | the process stops at the same time; `silent_grpc_clients_hold_the_stop_like_upstream` |
 | `GRPC_MAX_CONNECTION_AGE` gets ±10% of jitter (grpc-go) | applied as it is (tonic) | spreads reconnections only |
-| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info), and `Creating single with urls %v` prints `REDIS_URL` as given | masked too | keeps secrets out of logs |
+| A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info), and `Creating single with urls %v` and `Creating cluster with urls %v` print `REDIS_URL` as given | masked too | keeps secrets out of logs |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
