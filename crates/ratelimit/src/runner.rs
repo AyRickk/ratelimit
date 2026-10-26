@@ -156,8 +156,9 @@ impl PoolStats {
 /// Runs the service until it is told to stop (then stops gracefully): stats, config, Redis,
 /// then serving.
 pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> {
-    // NewSettings: the Redis TLS files are loaded with the settings.
+    // NewSettings: the Redis TLS files, then the gRPC server's, are loaded with the settings.
     let redis_tls = crate::redis::tls::from_settings(&settings)?.map(crate::redis::Tls);
+    let grpc_tls = crate::grpc_tls::from_settings(&settings)?;
     // NewRunner: the logger, then the stats sink and its flushes.
     configure_logger(&settings)?;
     let sink = stats::select_sink(&settings.sinks(lookup)?).map_err(stats::sink_failure)?;
@@ -171,7 +172,6 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
 
     // Run: the signals, then tracing.
     let signals = signals()?;
-    crate::settings::refuse_unsupported(&[(settings.grpc_server_use_tls, "GRPC_SERVER_USE_TLS")])?;
     if settings.tracing_enabled {
         crate::trace::init(&crate::trace::Settings {
             protocol: settings.tracing_exporter_protocol.clone(),
@@ -184,7 +184,14 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         log::info("Tracing disabled");
     }
 
-    // NewServer: the config provider, the health checker (SIGTERM makes it fail).
+    // NewServer: the gRPC server's cert provider, the config provider, the health checker
+    // (SIGTERM makes it fail).
+    // grpc-go's `envconfig`: enforced unless `false`.
+    let enforce_alpn =
+        !lookup("GRPC_ENFORCE_ALPN_ENABLED").is_some_and(|v| v.eq_ignore_ascii_case("false"));
+    let grpc_tls = grpc_tls
+        .map(|tls| tls.acceptor(&stats, enforce_alpn))
+        .transpose()?;
     let loader = match settings.config_type.as_str() {
         "FILE" => runtime::loader(&settings, &stats)?,
         "GRPC_XDS_SOTW" => {
@@ -363,14 +370,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         .layer(crate::trace::grpc::Layer::new(uds))
         .add_service(health_service.server())
         .add_service(grpc::server(service.clone(), server_stats));
-    // handleGracefulShutdown: on a signal, the server stops.
-    let stop = {
+    // handleGracefulShutdown: on a signal, the line, then the server stops (its listeners
+    // closed, its connections drained).
+    let (stopped_tx, server_stopping) = tokio::sync::watch::channel(false);
+    {
         let stopping = signals.stop.clone();
-        async move {
+        tokio::spawn(async move {
             shutting_down(stopping).await;
             log::info("Context cancelled, stopping server");
-        }
-    };
+            let _ = stopped_tx.send(true);
+        });
+    }
+    let stop = shutting_down(server_stopping.clone());
     // Start: the debug port first; a failure to listen there is logged, not fatal.
     let (grpc_done, grpc_stopped) = tokio::sync::watch::channel(false);
     let debug_address = crate::net::join_host_port(&settings.debug_host, settings.debug_port);
@@ -397,6 +408,18 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             None
         }
     };
+    // The server on its listener's connections, over TLS or not.
+    macro_rules! serve {
+        ($server:expr, $incoming:expr, $stop:expr) => {{
+            let (server, incoming, stop) = ($server, $incoming, $stop);
+            Box::pin(async move {
+                server
+                    .serve_with_incoming_shutdown(incoming, stop)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }};
+    }
     let grpc_served: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
     > = if !settings.grpc_uds.is_empty() {
@@ -406,13 +429,20 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             let e = crate::net::listen_error("unix", &address, &e);
             Failure::Fatal(format!("Failed to listen for gRPC on '{address}': {e}"))
         })?;
-        let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
-        Box::pin(async move {
-            server
-                .serve_with_incoming_shutdown(incoming, stop)
-                .await
-                .map_err(|e| e.to_string())
-        })
+        // Go's Unix listener removes its socket file as it closes.
+        let stopping = shutting_down(server_stopping.clone());
+        let socket = address.clone();
+        let incoming = crate::net::closed_on(
+            tokio_stream::wrappers::UnixListenerStream::new(listener),
+            async move {
+                stopping.await;
+                let _ = std::fs::remove_file(socket);
+            },
+        );
+        match &grpc_tls {
+            Some(tls) => serve!(server, tls.incoming(incoming), stop),
+            None => serve!(server, incoming, stop),
+        }
     } else {
         let address = crate::net::join_host_port(&settings.grpc_host, settings.grpc_port);
         log::warn(&format!("Listening for gRPC on '{address}'"));
@@ -420,13 +450,14 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             let e = crate::net::listen_error("tcp", &address, &e);
             Failure::Fatal(format!("Failed to listen for gRPC on '{address}': {e}"))
         })?;
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        Box::pin(async move {
-            server
-                .serve_with_incoming_shutdown(incoming, stop)
-                .await
-                .map_err(|e| e.to_string())
-        })
+        let incoming = crate::net::closed_on(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            shutting_down(server_stopping.clone()),
+        );
+        match &grpc_tls {
+            Some(tls) => serve!(server, tls.incoming(incoming), stop),
+            None => serve!(server, incoming, stop),
+        }
     };
     let http_address = crate::net::join_host_port(&settings.host, settings.port);
     log::warn(&format!("Listening for HTTP on '{http_address}'"));

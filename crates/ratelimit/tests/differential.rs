@@ -4286,6 +4286,9 @@ async fn the_binary_fails_to_start_like_upstream() {
     let other_key = runtime.join("pki").join("other-key.pem");
     std::fs::write(&other_key, &test_pki.server.1).unwrap();
     let other_key = other_key.to_string_lossy().into_owned();
+    // A server key pair whose files are in two directories.
+    let (server_cert, _) = server_files(&runtime.join("pki"), &test_pki.server);
+    let (_, apart_key) = server_files(&runtime.join("apart"), &test_pki.server);
     let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
         (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
         (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
@@ -4307,6 +4310,13 @@ async fn the_binary_fails_to_start_like_upstream() {
         // A key not for the certificate: refused before the CA is read.
         (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CLIENT_CERT", client_cert.clone()), ("REDIS_TLS_CLIENT_KEY", other_key.clone()), ("REDIS_TLS_CACERT", "/nowhere/ca.pem".into())], format!("failed lo load TLS key pair ({client_cert},{other_key}): tls: private key does not match public key")),
         (vec![("REDIS_AUTH", "pw".into()), ("REDIS_AUTH_FILE", "/nowhere".into())], "REDIS_AUTH and REDIS_AUTH_FILE are mutually exclusive".into()),
+        // The gRPC server's TLS files, read with the settings, then by the cert provider.
+        (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_SERVER_TLS_CERT", "/nowhere/c.pem".into()), ("GRPC_SERVER_TLS_KEY", "/nowhere/k.pem".into())], "failed lo load TLS key pair (/nowhere/c.pem,/nowhere/k.pem): open /nowhere/c.pem: no such file or directory".into()),
+        (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_CLIENT_TLS_CACERT", "/nowhere/ca.pem".into())], "failed to read file: /nowhere/ca.pem: open /nowhere/ca.pem: no such file or directory".into()),
+        (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_SERVER_TLS_CERT", server_cert.clone()), ("GRPC_SERVER_TLS_KEY", apart_key.clone())], "certFile and keyFile must be in the same directory".into()),
+        (vec![("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_SERVER_TLS_CERT", server_cert.clone()), ("GRPC_SERVER_TLS_KEY", runtime.join("pki/missing.pem").to_string_lossy().into_owned())], format!("failed lo load TLS key pair ({server_cert},{}/pki/missing.pem): open {}/pki/missing.pem: no such file or directory", runtime.display(), runtime.display())),
+        // Without a key pair, the cert provider loads none.
+        (vec![("GRPC_SERVER_USE_TLS", "true".into())], "CertProvider failed to load any certificate, exiting.".into()),
         // Redis refuses the database: its error ends the message.
         (vec![("REDIS_URL", format!("redis://{}/abc", redis.address)), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "value is not an integer or out of range".into()),
         (vec![("REDIS_URL", "::1:6379".into()), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".into())], "timed out waiting for Redis connection to ::1:6379 after ".into()),
@@ -4356,14 +4366,25 @@ async fn the_binary_fails_to_start_like_upstream() {
     drop(busy);
 }
 
-/// A gRPC client over the Unix socket at `path`.
-async fn unix_client(path: &std::path::Path) -> RateLimitServiceClient<Channel> {
+/// A gRPC client over the Unix socket at `path`, over TLS with `tls` if given.
+async fn unix_client(
+    path: &std::path::Path,
+    tls: Option<rustls::ClientConfig>,
+) -> RateLimitServiceClient<Channel> {
+    let tls = tls.map(|config| tokio_rustls::TlsConnector::from(Arc::new(config)));
     for _ in 0..300 {
-        let path = path.to_path_buf();
+        let (path, tls) = (path.to_path_buf(), tls.clone());
         let connector = tower::service_fn(move |_: tonic::transport::Uri| {
-            let path = path.clone();
+            let (path, tls) = (path.clone(), tls.clone());
             async move {
                 let stream = tokio::net::UnixStream::connect(path).await?;
+                let stream: Box<dyn TokioStream> = match tls {
+                    Some(tls) => {
+                        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+                        Box::new(tls.connect(name, stream).await?)
+                    }
+                    None => Box::new(stream),
+                };
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }
         });
@@ -4376,7 +4397,12 @@ async fn unix_client(path: &std::path::Path) -> RateLimitServiceClient<Channel> 
     panic!("no gRPC server on {}", path.display());
 }
 
-/// With `GRPC_UDS`, both binaries serve gRPC on that Unix socket instead.
+/// A connection a client reads and writes.
+trait TokioStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TokioStream for T {}
+
+/// With `GRPC_UDS`, both binaries serve gRPC on that Unix socket instead; with
+/// `GRPC_SERVER_USE_TLS` too, over TLS.
 #[tokio::test]
 async fn the_binary_serves_on_a_unix_socket_like_upstream() {
     if !tools_available() {
@@ -4390,43 +4416,56 @@ async fn the_binary_serves_on_a_unix_socket_like_upstream() {
             ("current", b"->v1"),
         ],
     );
-    let (upstream_redis, our_redis) = (Redis::start().await, Redis::start().await);
-    let mut clients = Vec::new();
-    let mut services = Vec::new();
-    for (binary, redis, socket) in [
-        (
-            upstream_binary(),
-            &upstream_redis,
-            runtime.join("upstream.sock"),
-        ),
-        (
-            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
-            &our_redis,
-            runtime.join("ours.sock"),
-        ),
-    ] {
-        let mut environment = binary_environment(&runtime, redis);
-        environment.push(("GRPC_UDS", socket.to_string_lossy().into_owned()));
-        services.push(Service::start(&binary, &environment).await);
-        clients.push(unix_client(&socket).await);
+    let pki = pki(&runtime.join("pki"));
+    let (cert, key) = server_files(&runtime.join("certs"), &pki.server);
+    let ca = std::fs::read_to_string(&pki.ca).unwrap();
+    for tls in [false, true] {
+        let (upstream_redis, our_redis) = (Redis::start().await, Redis::start().await);
+        let mut clients = Vec::new();
+        let mut services = Vec::new();
+        for (binary, redis, socket) in [
+            (
+                upstream_binary(),
+                &upstream_redis,
+                runtime.join(format!("upstream-{tls}.sock")),
+            ),
+            (
+                PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+                &our_redis,
+                runtime.join(format!("ours-{tls}.sock")),
+            ),
+        ] {
+            let mut environment = binary_environment(&runtime, redis);
+            environment.push(("GRPC_UDS", socket.to_string_lossy().into_owned()));
+            if tls {
+                environment.extend([
+                    ("GRPC_SERVER_USE_TLS", "true".to_string()),
+                    ("GRPC_SERVER_TLS_CERT", cert.clone()),
+                    ("GRPC_SERVER_TLS_KEY", key.clone()),
+                ]);
+            }
+            services.push(Service::start(&binary, &environment).await);
+            let config = tls.then(|| tls_client_config(&ca, None, true));
+            clients.push(unix_client(&socket, config).await);
+        }
+        let request = request("llm", &[&[("user", "a")]]);
+        let expected = clients[0]
+            .should_rate_limit(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        let actual = clients[1]
+            .should_rate_limit(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(actual.overall_code, expected.overall_code);
+        assert_eq!(actual.statuses.len(), expected.statuses.len());
+        assert_eq!(
+            actual.statuses[0].limit_remaining,
+            expected.statuses[0].limit_remaining
+        );
     }
-    let request = request("llm", &[&[("user", "a")]]);
-    let expected = clients[0]
-        .should_rate_limit(request.clone())
-        .await
-        .unwrap()
-        .into_inner();
-    let actual = clients[1]
-        .should_rate_limit(request)
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(actual.overall_code, expected.overall_code);
-    assert_eq!(actual.statuses.len(), expected.statuses.len());
-    assert_eq!(
-        actual.statuses[0].limit_remaining,
-        expected.statuses[0].limit_remaining
-    );
 }
 
 /// On SIGTERM both binaries stop serving gracefully and exit successfully.
@@ -6685,10 +6724,19 @@ async fn logged_run(
             String::from_utf8_lossy(&output.stderr)
         );
     };
-    client
+    if let Err(e) = client
         .should_rate_limit(request("llm", &[&[("user", "a")]]))
         .await
-        .unwrap();
+    {
+        // Its stderr says why.
+        let mut child = child;
+        let _ = child.start_kill();
+        let output = child.wait_with_output().await.unwrap();
+        panic!(
+            "{e:?}; the service wrote:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     drop(client);
     let pid = child.id().unwrap().to_string();
     assert!(
@@ -8636,5 +8684,613 @@ async fn traces_are_exported_like_upstream() {
             assert_eq!(o, u, "{protocol} {compression}");
         }
         assert_eq!(runs[1], runs[0], "{protocol} {compression}");
+    }
+}
+
+/// A TLS client trusting `ca` (PEM), with `identity` (certificate and key PEM) if any, and
+/// ALPN `h2` if `h2`.
+fn tls_client_config(
+    ca: &str,
+    identity: Option<&(String, String)>,
+    h2: bool,
+) -> rustls::ClientConfig {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots);
+    let mut config = match identity {
+        Some((cert, key)) => builder
+            .with_client_auth_cert(
+                CertificateDer::pem_slice_iter(cert.as_bytes())
+                    .map(Result::unwrap)
+                    .collect(),
+                PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        None => builder.with_no_client_auth(),
+    };
+    if h2 {
+        config.alpn_protocols = vec![b"h2".to_vec()];
+    }
+    config
+}
+
+/// What a TLS client finds on the gRPC port: `served` when the server answers HTTP/2's
+/// preface, `closed` when it closes the connection, `refused` when the handshake or the first
+/// read fails; `plain` for a client without TLS.
+async fn tls_probe(port: u16, config: Option<rustls::ClientConfig>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let read = match config {
+        None => {
+            let mut tcp = tcp;
+            let _ = tcp.write_all(PREFACE).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read(&mut buf)).await
+        }
+        Some(config) => {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+            let Ok(mut tls) = connector.connect(name, tcp).await else {
+                return "refused".into();
+            };
+            let _ = tls.write_all(PREFACE).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut buf)).await
+        }
+    };
+    match read {
+        Ok(Ok(0)) => "closed".into(),
+        Ok(Ok(_)) => "served".into(),
+        Ok(Err(_)) => "refused".into(),
+        Err(_) => "silent".into(),
+    }
+}
+
+/// A gRPC client over TLS on `port`.
+async fn tls_grpc_client(
+    port: u16,
+    config: rustls::ClientConfig,
+) -> RateLimitServiceClient<Channel> {
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let connect = tower::service_fn(move |_: tonic::transport::Uri| {
+        let connector = connector.clone();
+        async move {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+            let tls = connector.connect(name, tcp).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
+        }
+    });
+    let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1")
+        .connect_with_connector(connect)
+        .await
+        .unwrap();
+    RateLimitServiceClient::new(channel)
+}
+
+/// A service binary whose stderr is collected as it writes it; stopped with SIGTERM.
+struct Logged {
+    child: Child,
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Logged {
+    async fn start(binary: &std::path::Path, environment: &[(&str, String)], http: u16) -> Self {
+        let mut child = Command::new(binary)
+            .env_clear()
+            .envs(environment.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the service");
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+        let sink = lines.clone();
+        let reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = stderr.next_line().await {
+                sink.lock().unwrap().push(line);
+            }
+        });
+        // The HTTP port opens once gRPC listens.
+        for _ in 0..300 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", http))
+                .await
+                .is_ok()
+            {
+                return Self {
+                    child,
+                    lines,
+                    reader,
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "{} does not serve: {:?}",
+            binary.display(),
+            lines.lock().unwrap()
+        );
+    }
+
+    /// Waits until `count` lines hold `text`.
+    async fn wait_for(&self, text: &str, count: usize) {
+        for _ in 0..200 {
+            let found = self
+                .lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(text))
+                .count();
+            if found >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no line with {text:?} in {:?}", self.lines.lock().unwrap());
+    }
+
+    async fn stop(mut self) -> String {
+        let pid = self.child.id().unwrap().to_string();
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.child.wait())
+            .await
+            .expect("the service stops")
+            .unwrap();
+        let _ = self.reader.await;
+        self.lines.lock().unwrap().join("\n")
+    }
+}
+
+/// The server's key pair as files in `dir`.
+fn server_files(dir: &std::path::Path, (cert, key): &(String, String)) -> (String, String) {
+    std::fs::create_dir_all(dir).unwrap();
+    let (cert_path, key_path) = (dir.join("server.pem"), dir.join("server-key.pem"));
+    std::fs::write(&cert_path, cert).unwrap();
+    std::fs::write(&key_path, key).unwrap();
+    (
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+    )
+}
+
+/// `GRPC_SERVER_USE_TLS`: gRPC over TLS with the cert provider's key pair, only for clients
+/// negotiating `h2`; with `GRPC_CLIENT_TLS_CACERT`, only for clients with a certificate the
+/// CA issued, valid for `GRPC_CLIENT_TLS_SAN` if set (a mismatch is logged); the `certs.*`
+/// stats and the log lines as upstream's.
+#[tokio::test]
+async fn grpc_over_tls_is_served_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("grpc-tls");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let other = pki(&runtime.join("other-pki"));
+    let pki = pki(&runtime.join("pki"));
+    let (cert, key) = server_files(&runtime.join("certs"), &pki.server);
+    // Not counted in `certs.num_values`: the loader ignores dotfiles.
+    std::fs::write(runtime.join("certs/.hidden"), "x").unwrap();
+    let ca_pem = std::fs::read_to_string(&pki.ca).unwrap();
+    let client = (
+        std::fs::read_to_string(&pki.client_cert).unwrap(),
+        std::fs::read_to_string(&pki.client_key).unwrap(),
+    );
+    let stranger = (
+        std::fs::read_to_string(&other.client_cert).unwrap(),
+        std::fs::read_to_string(&other.client_key).unwrap(),
+    );
+    let ca = pki.ca.to_string_lossy().into_owned();
+    let redis = Redis::start().await;
+    // The client CA, the client SAN, and whether ALPN is enforced (grpc-go's default).
+    let clients: [(&str, Option<&str>, &str); 7] = [
+        ("", None, ""),
+        ("", None, "False"),
+        (&ca, None, ""),
+        (&ca, Some("client"), ""),
+        (&ca, Some("other.example"), ""),
+        (&ca, Some("10.0.0.1"), ""),
+        // No host name: Go matches nothing to it.
+        (&ca, Some("spiffe://x"), ""),
+    ];
+    for (client_ca, san, enforce_alpn) in clients {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+            let statsd = StatsdServer::start().await;
+            let mut environment = binary_environment(&runtime, &redis);
+            environment.retain(|(k, _)| *k != "LOG_LEVEL" && *k != "DISABLE_STATS");
+            environment.extend([
+                ("LOG_LEVEL", "info".to_string()),
+                ("GRPC_HOST", "127.0.0.1".into()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", debug.to_string()),
+                ("STATS_FLUSH_INTERVAL", "100ms".into()),
+                ("STATSD_HOST", "127.0.0.1".into()),
+                ("STATSD_PORT", statsd.address.port().to_string()),
+                ("GRPC_SERVER_USE_TLS", "true".into()),
+                ("GRPC_SERVER_TLS_CERT", cert.clone()),
+                ("GRPC_SERVER_TLS_KEY", key.clone()),
+                ("GRPC_CLIENT_TLS_CACERT", client_ca.to_string()),
+            ]);
+            if let Some(san) = san {
+                environment.push(("GRPC_CLIENT_TLS_SAN", san.to_string()));
+            }
+            if !enforce_alpn.is_empty() {
+                environment.push(("GRPC_ENFORCE_ALPN_ENABLED", enforce_alpn.to_string()));
+            }
+            let service = Logged::start(&binary, &environment, http).await;
+            let mut outcomes = vec![
+                tls_probe(grpc, None).await,
+                tls_probe(grpc, Some(tls_client_config(&ca_pem, None, true))).await,
+                tls_probe(grpc, Some(tls_client_config(&ca_pem, Some(&client), true))).await,
+                tls_probe(grpc, Some(tls_client_config(&ca_pem, Some(&client), false))).await,
+                tls_probe(
+                    grpc,
+                    Some(tls_client_config(&ca_pem, Some(&stranger), true)),
+                )
+                .await,
+            ];
+            if outcomes[2] == "served" {
+                let mut grpc_client =
+                    tls_grpc_client(grpc, tls_client_config(&ca_pem, Some(&client), true)).await;
+                let response = grpc_client
+                    .should_rate_limit(request("llm", &[&[("user", "a")]]))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                outcomes.push(format!("{:?}", response.overall_code));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let stats = loop {
+                let stats = stat_values(&statsd.lines.lock().unwrap(), |name| {
+                    name.starts_with("certs.")
+                });
+                // `certs.load_failures` stays at 0, so unflushed.
+                let flushed = stats.contains_key("certs.load_attempts|c")
+                    && stats.contains_key("certs.num_values|g");
+                if flushed || std::time::Instant::now() > deadline {
+                    break stats;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
+            let stderr = service.stop().await;
+            let replace = [
+                (runtime.to_string_lossy().into_owned(), "RUNTIME"),
+                (format!(":{grpc}'"), ":GRPC'"),
+                (format!(":{http}'"), ":HTTP'"),
+                (format!(":{debug}"), ":DEBUG"),
+            ];
+            let lines: Vec<String> = logrus_lines(&stderr, &replace)
+                .into_iter()
+                .filter(|l| !l.contains("gostats"))
+                .collect();
+            runs.push((outcomes, stats, lines));
+        }
+        let (ours, upstream) = (&runs[1], &runs[0]);
+        assert_eq!(
+            ours.0, upstream.0,
+            "outcomes with {client_ca:?} {san:?} {enforce_alpn:?}"
+        );
+        assert_eq!(
+            ours.1, upstream.1,
+            "certs stats with {client_ca:?} {san:?} {enforce_alpn:?}"
+        );
+        assert_eq!(
+            ours.2, upstream.2,
+            "logs with {client_ca:?} {san:?} {enforce_alpn:?}"
+        );
+    }
+}
+
+/// The cert provider reloads the key pair on each change in its directory, and keeps the one
+/// it serves when the new one does not load (a key for another certificate, a file without
+/// PEM data), as upstream's.
+#[tokio::test]
+async fn grpc_certificates_are_reloaded_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("grpc-tls-reload");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let first = pki(&runtime.join("first"));
+    let second = pki(&runtime.join("second"));
+    let trusting = |pki: &Pki| {
+        let ca = std::fs::read_to_string(&pki.ca).unwrap();
+        move || Some(tls_client_config(&ca, None, true))
+    };
+    let (trusts_first, trusts_second) = (trusting(&first), trusting(&second));
+    let redis = Redis::start().await;
+    let mut runs = Vec::new();
+    for (i, binary) in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let certs = runtime.join(format!("certs-{i}"));
+        let (cert, key) = server_files(&certs, &first.server);
+        // Each file moves in at once, from beside the watched directory.
+        let staging = runtime.join(format!("staging-{i}"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let replace = |name: &str, contents: &str| {
+            std::fs::write(staging.join(name), contents).unwrap();
+            std::fs::rename(staging.join(name), certs.join(name)).unwrap();
+        };
+        let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+        let mut environment = binary_environment(&runtime, &redis);
+        environment.retain(|(k, _)| *k != "LOG_LEVEL");
+        environment.extend([
+            ("LOG_LEVEL", "info".to_string()),
+            ("GRPC_HOST", "127.0.0.1".into()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", debug.to_string()),
+            ("GRPC_SERVER_USE_TLS", "true".into()),
+            ("GRPC_SERVER_TLS_CERT", cert.clone()),
+            ("GRPC_SERVER_TLS_KEY", key.clone()),
+        ]);
+        let service = Logged::start(binary, &environment, http).await;
+        let probes = || async {
+            vec![
+                tls_probe(grpc, trusts_first()).await,
+                tls_probe(grpc, trusts_second()).await,
+            ]
+        };
+        let mut outcomes = vec![probes().await];
+        // The second key, for a certificate not yet there: the first pair is kept.
+        replace("server-key.pem", &second.server.1);
+        service
+            .wait_for("CertProvider failed to load TLS key pair", 1)
+            .await;
+        outcomes.push(probes().await);
+        replace("server.pem", &second.server.0);
+        service.wait_for("CertProvider reloaded cert", 2).await;
+        outcomes.push(probes().await);
+        replace("server.pem", "no PEM here");
+        service
+            .wait_for("CertProvider failed to load TLS key pair", 2)
+            .await;
+        outcomes.push(probes().await);
+        let stderr = service.stop().await;
+        let replace = [
+            (runtime.to_string_lossy().into_owned(), "RUNTIME"),
+            (format!("certs-{i}"), "certs"),
+            (format!(":{grpc}'"), ":GRPC'"),
+            (format!(":{http}'"), ":HTTP'"),
+            (format!(":{debug}"), ":DEBUG"),
+        ];
+        runs.push((outcomes, logrus_lines(&stderr, &replace)));
+    }
+    assert_eq!(
+        runs[0].0,
+        [
+            ["served", "refused"],
+            ["served", "refused"],
+            ["refused", "served"],
+            ["refused", "served"],
+        ]
+    );
+    assert_eq!(runs[1], runs[0]);
+}
+
+/// With `GRPC_CLIENT_TLS_CACERT`, upstream also accepts client certificates the system's roots
+/// issued (here `SSL_CERT_FILE`, which Go reads on Linux); ours only those of that CA
+/// (docs/parity.md §7).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn grpc_clients_are_verified_by_their_ca_alone() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("grpc-tls-roots");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let system = pki(&runtime.join("system"));
+    let pki = pki(&runtime.join("pki"));
+    let (cert, key) = server_files(&runtime.join("certs"), &pki.server);
+    let ca_pem = std::fs::read_to_string(&pki.ca).unwrap();
+    let identity = |pki: &Pki| {
+        (
+            std::fs::read_to_string(&pki.client_cert).unwrap(),
+            std::fs::read_to_string(&pki.client_key).unwrap(),
+        )
+    };
+    let (client, public) = (identity(&pki), identity(&system));
+    let redis = Redis::start().await;
+    let mut outcomes = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let mut environment = binary_environment(&runtime, &redis);
+        environment.extend([
+            ("GRPC_HOST", "127.0.0.1".to_string()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("HOST", "127.0.0.1".into()),
+            ("PORT", http.to_string()),
+            ("DEBUG_HOST", "127.0.0.1".into()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+            ("SSL_CERT_FILE", system.ca.to_string_lossy().into_owned()),
+            ("GRPC_SERVER_USE_TLS", "true".into()),
+            ("GRPC_SERVER_TLS_CERT", cert.clone()),
+            ("GRPC_SERVER_TLS_KEY", key.clone()),
+            (
+                "GRPC_CLIENT_TLS_CACERT",
+                pki.ca.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let service = Logged::start(&binary, &environment, http).await;
+        outcomes.push(vec![
+            tls_probe(grpc, Some(tls_client_config(&ca_pem, Some(&client), true))).await,
+            tls_probe(grpc, Some(tls_client_config(&ca_pem, Some(&public), true))).await,
+        ]);
+        service.stop().await;
+    }
+    assert_eq!(outcomes[0], ["served", "served"]);
+    assert_eq!(outcomes[1], ["served", "refused"]);
+}
+
+/// Sends one command to `redis` and reads its reply's first line.
+async fn redis_command(redis: &Redis, args: &[&str]) -> String {
+    use tokio::io::AsyncWriteExt;
+    let mut command = format!("*{}\r\n", args.len());
+    for arg in args {
+        command.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+    }
+    let mut stream = tokio::net::TcpStream::connect(&redis.address)
+        .await
+        .unwrap();
+    stream.write_all(command.as_bytes()).await.unwrap();
+    let mut reply = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut reply)
+        .await
+        .unwrap();
+    reply
+}
+
+/// On SIGTERM, while a request is still being answered, the gRPC listener is already closed
+/// (on TCP, over TLS, and on a Unix socket, whose file is removed), as `GracefulStop` closes
+/// it before draining.
+#[tokio::test]
+async fn the_grpc_listener_closes_on_sigterm_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("grpc-stop");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let pki = pki(&runtime.join("pki"));
+    let (cert, key) = server_files(&runtime.join("certs"), &pki.server);
+    let ca = std::fs::read_to_string(&pki.ca).unwrap();
+    let redis = Redis::start().await;
+    for mode in ["tcp", "unix", "tls"] {
+        let mut runs = Vec::new();
+        for (i, binary) in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (grpc, http) = (reserved_port(), reserved_port());
+            let socket = runtime.join(format!("{mode}-{i}.sock"));
+            let mut environment = binary_environment(&runtime, &redis);
+            environment.extend([
+                ("GRPC_HOST", "127.0.0.1".to_string()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("HOST", "127.0.0.1".into()),
+                ("PORT", http.to_string()),
+                ("DEBUG_HOST", "127.0.0.1".into()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ]);
+            match mode {
+                "unix" => environment.push(("GRPC_UDS", socket.to_string_lossy().into_owned())),
+                "tls" => environment.extend([
+                    ("GRPC_SERVER_USE_TLS", "true".to_string()),
+                    ("GRPC_SERVER_TLS_CERT", cert.clone()),
+                    ("GRPC_SERVER_TLS_KEY", key.clone()),
+                ]),
+                _ => {}
+            }
+            let service = Logged::start(binary, &environment, http).await;
+            let mut client = match mode {
+                "unix" => unix_client(&socket, None).await,
+                "tls" => tls_grpc_client(grpc, tls_client_config(&ca, None, true)).await,
+                _ => RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
+                    .await
+                    .unwrap(),
+            };
+            // A request held in Redis while the service stops.
+            assert_eq!(
+                redis_command(&redis, &["CLIENT", "PAUSE", "3000"]).await,
+                "+OK\r\n"
+            );
+            let answered = tokio::spawn(async move {
+                client
+                    .should_rate_limit(request("llm", &[&[("user", "a")]]))
+                    .await
+                    .is_ok()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let mut child = service.child;
+            let pid = child.id().unwrap().to_string();
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let connects = match mode {
+                "unix" => tokio::net::UnixStream::connect(&socket).await.is_ok(),
+                _ => tokio::net::TcpStream::connect(("127.0.0.1", grpc))
+                    .await
+                    .is_ok(),
+            };
+            let draining = child.try_wait().unwrap().is_none();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+                .await
+                .expect("the service stops")
+                .unwrap();
+            runs.push((
+                connects,
+                draining,
+                answered.await.unwrap(),
+                status.success(),
+                socket.exists(),
+            ));
+        }
+        assert_eq!(
+            runs[0],
+            (false, true, true, true, false),
+            "upstream on {mode}"
+        );
+        assert_eq!(runs[1], runs[0], "{mode}");
     }
 }

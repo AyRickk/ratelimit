@@ -130,6 +130,19 @@ pub fn dir(path: &str) -> String {
     clean(&path[..i])
 }
 
+/// `filepath.Base` on Unix: the last element, without trailing `/`; `.` for an empty path,
+/// `/` for one of slashes only.
+pub fn base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".into();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
 /// `time.Duration.String`: `1h2m3.5s`, `1.5s`, `250ms`, `1.5µs`, `0s`.
 pub fn format_duration(nanos: i64) -> String {
     /// `fmtFrac`: the fraction of `v` (in units of 10^-prec), without trailing zeros.

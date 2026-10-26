@@ -1466,6 +1466,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower",
+ "x509-parser",
  "xxhash-rust",
  "yaml-rust2",
 ]

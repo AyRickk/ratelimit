@@ -643,14 +643,9 @@ fn tls_error_text(error: &std::io::Error) -> String {
         Some(Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
             "certificate signed by unknown authority".to_string()
         }
-        Some(Error::InvalidCertificate(CertificateError::NotValidForNameContext {
-            expected,
-            presented,
-        })) => {
-            return format!(
-                "tls: failed to verify certificate: {}",
-                hostname_error(expected, presented)
-            );
+        // `HostnameError`, from the certificate's names.
+        Some(Error::InvalidCertificate(CertificateError::Other(other))) => {
+            return format!("tls: failed to verify certificate: {}", other.0);
         }
         Some(Error::InvalidCertificate(CertificateError::NotValidForName)) => {
             "certificate is not valid for the server's name".to_string()
@@ -684,52 +679,6 @@ fn rfc3339(seconds: u64) -> String {
     jiff::Timestamp::from_second(seconds as i64)
         .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default()
-}
-
-/// `x509.HostnameError`: the certificate's IP addresses for an IP, its DNS names otherwise.
-fn hostname_error(expected: &rustls::pki_types::ServerName<'_>, presented: &[String]) -> String {
-    let host = expected.to_str();
-    // rustls writes them `IpAddress(…)` and `DnsName("…")`.
-    let unwrap = |name: &str| {
-        let inner = name
-            .strip_prefix("IpAddress(")
-            .or_else(|| name.strip_prefix("DnsName("))
-            .and_then(|n| n.strip_suffix(')'))
-            .unwrap_or(name);
-        inner.trim_matches('"').to_string()
-    };
-    let (ips, names): (Vec<String>, Vec<String>) = presented
-        .iter()
-        .map(|name| unwrap(name))
-        .partition(|name| name.parse::<std::net::IpAddr>().is_ok());
-    let valid = match host.parse::<std::net::IpAddr>() {
-        Ok(_) if ips.is_empty() => {
-            return format!(
-                "x509: cannot validate certificate for {host} because it doesn't contain any IP SANs"
-            );
-        }
-        Ok(_) if ips.len() >= 100 => {
-            return format!(
-                "x509: certificate is valid for {} IP SANs, but none matched {host}",
-                ips.len()
-            );
-        }
-        Ok(_) => ips,
-        Err(_) if names.len() >= 100 => {
-            return format!(
-                "x509: certificate is valid for {} names, but none matched {host}",
-                names.len()
-            );
-        }
-        Err(_) => names,
-    };
-    match valid.is_empty() {
-        true => format!("x509: certificate is not valid for any names, but wanted to match {host}"),
-        false => format!(
-            "x509: certificate is valid for {}, not {host}",
-            valid.join(", ")
-        ),
-    }
 }
 
 /// A dialled connection to Redis: TCP or Unix.
@@ -953,54 +902,5 @@ mod auth_file_tests {
         assert_eq!(credentials("secret"), ("url-user".into(), "secret".into()));
         assert_eq!(credentials(":secret"), ("url-user".into(), "secret".into()));
         assert_eq!(credentials("me:a:b\n"), ("me".into(), "a:b".into()));
-    }
-}
-
-#[cfg(test)]
-mod tls_tests {
-    use super::*;
-
-    /// `x509.HostnameError.Error`'s texts (crypto/x509/verify.go).
-    #[test]
-    fn name_errors_read_like_go() {
-        let error = |host: &str, presented: &[&str]| {
-            let expected = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
-            let presented: Vec<String> = presented.iter().map(|s| s.to_string()).collect();
-            hostname_error(&expected, &presented)
-        };
-        assert_eq!(
-            error(
-                "redis.example",
-                &[
-                    "DnsName(\"a.example\")",
-                    "DnsName(\"b.example\")",
-                    "IpAddress(10.0.0.1)"
-                ]
-            ),
-            "x509: certificate is valid for a.example, b.example, not redis.example"
-        );
-        assert_eq!(
-            error("redis.example", &["IpAddress(10.0.0.1)"]),
-            "x509: certificate is not valid for any names, but wanted to match redis.example"
-        );
-        assert_eq!(
-            error(
-                "10.0.0.2",
-                &["IpAddress(10.0.0.1)", "DnsName(\"a.example\")"]
-            ),
-            "x509: certificate is valid for 10.0.0.1, not 10.0.0.2"
-        );
-        assert_eq!(
-            error("10.0.0.2", &["DnsName(\"a.example\")"]),
-            "x509: cannot validate certificate for 10.0.0.2 because it doesn't contain any IP SANs"
-        );
-        let many: Vec<String> = (0..100)
-            .map(|i| format!("DnsName(\"n{i}.example\")"))
-            .collect();
-        let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(
-            error("redis.example", &many),
-            "x509: certificate is valid for 100 names, but none matched redis.example"
-        );
     }
 }

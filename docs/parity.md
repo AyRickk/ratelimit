@@ -21,11 +21,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `GRPC_PORT` | `8081` | ✅ | `tests/differential.rs` (`the_binary_*`); a busy port fails like upstream |
 | `GRPC_MAX_CONNECTION_AGE` | `24h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
 | `GRPC_MAX_CONNECTION_AGE_GRACE` | `1h` | ✅ | applied to the gRPC server (tonic's keepalive settings) |
-| `GRPC_SERVER_USE_TLS` | `false` | ⬜ | |
-| `GRPC_SERVER_TLS_CERT` | — | ⬜ | |
-| `GRPC_SERVER_TLS_KEY` | — | ⬜ | |
-| `GRPC_CLIENT_TLS_CACERT` | — | ⬜ | |
-| `GRPC_CLIENT_TLS_SAN` | — | ⬜ | |
+| `GRPC_SERVER_USE_TLS` | `false` | ✅ | gRPC over TLS, only for clients negotiating `h2`, plaintext clients closed without an alert, on TCP or `GRPC_UDS`: `grpc_over_tls_is_served_like_upstream`, `the_binary_serves_on_a_unix_socket_like_upstream` |
+| `GRPC_SERVER_TLS_CERT` | — | ✅ | the cert provider's key pair, with `GRPC_SERVER_TLS_KEY` (same directory), loaded with the settings and then by the provider, reloaded on changes: `grpc_over_tls_is_served_like_upstream`, `grpc_certificates_are_reloaded_like_upstream`; failures: `the_binary_fails_to_start_like_upstream` |
+| `GRPC_SERVER_TLS_KEY` | — | ✅ | as `GRPC_SERVER_TLS_CERT` |
+| `GRPC_CLIENT_TLS_CACERT` | — | ✅ | a client certificate required, issued by this CA (not the system's roots, §7): `grpc_over_tls_is_served_like_upstream`; an unreadable file: `the_binary_fails_to_start_like_upstream` |
+| `GRPC_CLIENT_TLS_SAN` | — | ✅ | with a CA, the client's certificate valid for this name (DNS name or IP), a mismatch logged: `grpc_over_tls_is_served_like_upstream` |
 | `LOG_LEVEL` | `WARN` | ✅ | `tests/differential.rs` (`the_binary_fails_to_start_like_upstream`, `logs_are_written_like_upstream`), `log.rs` unit tests |
 | `LOG_FORMAT` | `text` | ✅ | `logs_are_written_like_upstream` in `tests/differential.rs` |
 | `CONFIG_TYPE` | `FILE` | 🚧 | `FILE`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `GRPC_XDS_SOTW` not supported yet |
@@ -150,6 +150,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `TRACING_SERVICE_INSTANCE_ID` | — | ✅ | `traces_are_exported_like_upstream`; a random version 4 UUID by default: `trace/mod.rs` unit test |
 | `TRACING_EXPORTER_PROTOCOL` | `http` | ✅ | `traces_are_exported_like_upstream`; an unknown one is fatal: `the_binary_fails_to_start_like_upstream` |
 | `TRACING_SAMPLING_RATE` | `1` | ✅ | `traces_are_exported_like_upstream` (1, 0); the ratio's bound: `trace/mod.rs` unit test |
+| `GRPC_ENFORCE_ALPN_ENABLED` | (read by grpc-go) | ✅ | `false` (any case) serves TLS clients that negotiate no protocol: `grpc_over_tls_is_served_like_upstream` |
 | `GRPC_SERVER_TLS_CA_CERT` | (injected by Envoy Gateway, read by no upstream code) | — ignored, as upstream | |
 | `OTEL_EXPORTER_OTLP_*` | (read by the OpenTelemetry SDK) | ✅ | `ENDPOINT`, `HEADERS`, `COMPRESSION`, `CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`: `traces_are_exported_like_upstream`; their `TRACES_` forms, `INSECURE`, `TIMEOUT`, URL and header parsing: `trace/export.rs` unit tests |
 
@@ -191,13 +192,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `replaces`: two passes, not transitive | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | Per-rule and global shadow mode (`global_shadow_mode`) | ✅ | `tests/service.rs`, `tests/differential.rs` |
 | `/json` (any method): protojson, 200 / 429 / 400 / 500 | ✅ | `tests/differential.rs` (`json_requests_are_decoded_like_upstream` against `protojson.Unmarshal`, `json_is_served_like_upstream`) |
-| SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error) | ✅ | `the_binary_stops_on_sigterm_like_upstream` in `tests/differential.rs` |
+| SIGINT, SIGTERM, SIGHUP ⇒ gRPC stopped gracefully, exit status 0 (during the Redis startup wait: an error); the gRPC listener closed before the requests drain (a Unix socket's file removed) | ✅ | `the_binary_stops_on_sigterm_like_upstream`, `the_grpc_listener_closes_on_sigterm_like_upstream` in `tests/differential.rs` |
 | `/healthcheck`: 500 with no body when unhealthy, unhealthy once shutting down; gorilla/mux routing (clean-path 301, 404); what Go's server answers itself (bad escapes, `Host` checks, `OPTIONS *`) | ✅ | `tests/differential.rs` (`the_healthcheck_answers_like_upstream`, `the_http_server_reads_requests_like_upstream`, `sigterm_turns_health_off_like_upstream`) |
 | `grpc.health.v1`, service `ratelimit` | ✅ | `tests/differential.rs` (`health_is_reported_like_upstream`, `sigterm_turns_health_off_like_upstream`), `tests/health.rs` |
 | Debug port: `/`, `/rlconfig` (`Dump()` format), `/stats`, `/debug/pprof/*`; Go's `ServeMux` (307 redirects, escaped paths), sniffed content types; a port it cannot listen on is not fatal | ✅ | `tests/differential.rs` (`the_debug_port_answers_like_upstream`, `bodies_are_sniffed_and_strings_quoted_like_go`, `a_busy_debug_port_is_ignored_like_upstream`) |
 | `GRPC_UDS` | ✅ | `tests/differential.rs` |
 | Max connection age | ✅ | the gRPC server's keepalive settings |
-| Client mTLS + SAN, server certificate hot reload | ⬜ | |
+| Client mTLS + SAN, server certificate hot reload | ✅ | `grpc_over_tls_is_served_like_upstream` (and the `certs.*` stats), `grpc_certificates_are_reloaded_like_upstream` |
 
 ## 4. Algorithm and storage
 
@@ -250,6 +251,9 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 
 | Upstream behaviour | Our behaviour | Reason |
 |---|---|---|
+| `GRPC_CLIENT_TLS_CACERT` is added to the system's roots, so a client certificate any system-trusted CA issued (a public CA, in the image) is accepted unless `GRPC_CLIENT_TLS_SAN` is set | only certificates `GRPC_CLIENT_TLS_CACERT` issued | security: the system's roots vouch for servers, not for clients; `grpc_clients_are_verified_by_their_ca_alone` (Linux, where Go reads `SSL_CERT_FILE`) |
+| The gRPC server's TLS handshake: Go's cipher suites, curves and alerts (e.g. for a refused client certificate, or a client offering only `http/1.1`) | rustls' | best effort (D3): which clients are served and refused is the same, but for the next row |
+| Go accepts RSA keys from 1024 bits and ECDSA P-521 keys (the gRPC server's, its clients', Redis') | from 2048 bits, P-256 and P-384 (the ring provider) | keys below 2048 bits are deprecated; P-521 is rare |
 | Client `limit` with `unit: UNKNOWN` ⇒ the process panics | gRPC error `INVALID_ARGUMENT` | D1: crashes are not reproduced |
 | Invalid environment variable re-read on reload ⇒ panic | config error | D1 |
 | An invalid environment variable (or `DOG_STATSD_MOGRIFIER_*`, or gostats' own checks) ⇒ panic at startup | an error with the same text | D1 |

@@ -77,3 +77,54 @@ pub fn listen_error(network: &str, address: &str, error: &std::io::Error) -> Str
         None => error.to_string(),
     }
 }
+
+/// The connections of `listener` until `stop` completes; the listener is then closed at once,
+/// as gRPC's `GracefulStop` closes its listeners before draining the connections.
+pub fn closed_on<S>(
+    listener: S,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> ClosedOn<S>
+where
+    S: Send + 'static,
+{
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Listening {
+        listener: Some(listener),
+        waker: None,
+    }));
+    let closing = shared.clone();
+    tokio::spawn(async move {
+        stop.await;
+        let mut listening = closing.lock().unwrap();
+        listening.listener = None;
+        if let Some(waker) = listening.waker.take() {
+            waker.wake();
+        }
+    });
+    ClosedOn { shared }
+}
+
+struct Listening<S> {
+    listener: Option<S>,
+    waker: Option<std::task::Waker>,
+}
+
+/// See [`closed_on`].
+pub struct ClosedOn<S> {
+    shared: std::sync::Arc<std::sync::Mutex<Listening<S>>>,
+}
+
+impl<S: tokio_stream::Stream + Unpin> tokio_stream::Stream for ClosedOn<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut listening = self.shared.lock().unwrap();
+        listening.waker = Some(cx.waker().clone());
+        match listening.listener.as_mut() {
+            Some(listener) => std::pin::Pin::new(listener).poll_next(cx),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
