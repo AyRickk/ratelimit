@@ -15,8 +15,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 ARG TARGETARCH
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# The registry's cache is locked, both platforms' builds running at once. No cache of the
+# target directory: cargo would trust its stale files over the sources copied in.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-musl ;; \
       arm64) target=aarch64-unknown-linux-musl ;; \
