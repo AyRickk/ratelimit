@@ -82,17 +82,24 @@ impl PoolStats {
         }
     }
 
-    /// `poolTrace` for `pool`: each client's connection is followed from its own events (all
-    /// open at first); a failed reconnection, which names no server, changes nothing. With
-    /// `health` (`REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`), Redis is healthy again on each new
-    /// connection, and unhealthy once none is open.
+    /// `poolTrace` for `pool`: each client's connections (one, or one per node of a cluster, as
+    /// radix keeps a pool per node) are followed from its own events (all open at first); a
+    /// failed reconnection, which names no server, changes nothing. With `health`
+    /// (`REDIS_HEALTH_CHECK_ACTIVE_CONNECTION`), Redis is healthy again on each new connection,
+    /// and unhealthy once none is open.
     fn follow(&self, pool: &fred::clients::Pool, health: Option<Arc<HealthChecker>>) {
-        use fred::interfaces::EventInterface;
+        use fred::interfaces::{ClientLike, EventInterface};
+        use std::collections::HashSet;
         use tokio::sync::broadcast::error::RecvError;
-        let clients = pool.clients().len();
-        self.total.add(clients as u64);
-        self.active.add(clients as u64);
-        let connected = Arc::new(Mutex::new(vec![true; clients]));
+        let connections: Vec<HashSet<fred::types::config::Server>> = pool
+            .clients()
+            .iter()
+            .map(|client| client.active_connections().into_iter().collect())
+            .collect();
+        let opened: usize = connections.iter().map(HashSet::len).sum();
+        self.total.add(opened as u64);
+        self.active.add(opened as u64);
+        let connected = Arc::new(Mutex::new(connections));
         // `hadConnError`: a failed connection since the last one made.
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         for (index, client) in pool.clients().iter().enumerate() {
@@ -103,8 +110,8 @@ impl PoolStats {
             let local_close = self.local_close.clone();
             tokio::spawn(async move {
                 loop {
-                    let opened = tokio::select! {
-                        event = reconnected.recv() => event.map(|_| true),
+                    let event = tokio::select! {
+                        event = reconnected.recv() => event.map(|server| (server, true)),
                         event = errors.recv() => match event {
                             Ok((error, None)) => {
                                 failed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -112,28 +119,29 @@ impl PoolStats {
                                 log::error(&format!("creating redis connection error : {error}"));
                                 continue;
                             }
-                            event => event.map(|_| false),
+                            Ok((_, Some(server))) => Ok((server, false)),
+                            Err(e) => Err(e),
                         },
                     };
                     // Counted and reported under the lock, so that health follows the counts.
                     let mut connected = connected.lock().unwrap();
-                    match opened {
-                        Ok(true) => {
+                    match event {
+                        Ok((server, true)) => {
                             total.inc();
                             if failed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                                 log::info("redis connection re-established after previous error");
                             }
                             // A connection replaced without its loss seen: that one is closed.
-                            match std::mem::replace(&mut connected[index], true) {
-                                true => local_close.inc(),
-                                false => active.add(1),
+                            match connected[index].insert(server) {
+                                false => local_close.inc(),
+                                true => active.add(1),
                             }
                             if let Some(health) = &health {
                                 let _ = health.ok(health::REDIS);
                             }
                         }
-                        Ok(false) => {
-                            if !std::mem::replace(&mut connected[index], false) {
+                        Ok((server, false)) => {
+                            if !connected[index].remove(&server) {
                                 continue;
                             }
                             active.sub(1);

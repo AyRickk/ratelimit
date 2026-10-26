@@ -8,7 +8,7 @@ use fred::prelude::*;
 use std::time::Duration;
 
 /// How to reach Redis, from the `REDIS_*` settings of upstream's main pool.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RedisConnection {
     /// `REDIS_SOCKET_TYPE`: Go's network (`unix`, `tcp`, `tcp4`, `tcp6`).
     pub network: String,
@@ -40,6 +40,30 @@ pub struct RedisConnection {
     pub tls: Option<Tls>,
     /// `REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR`, for both pools.
     pub close_on_readonly: bool,
+    /// `REDIS_PIPELINE_WINDOW` (nanoseconds) and `REDIS_CLUSTER_PIPELINE_PARALLELISM`, which
+    /// upstream reads in `CLUSTER` mode.
+    pub pipeline_window: i64,
+    pub cluster_pipeline_parallelism: i64,
+    /// `REDIS_URL` as given: in `CLUSTER` mode, the nodes to start from, comma-separated.
+    pub url: String,
+}
+
+impl std::fmt::Debug for RedisConnection {
+    /// Without the credentials: the URLs masked, the password and the auth left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisConnection")
+            .field("network", &self.network)
+            .field("address", &mask_credentials_in_url(&self.address))
+            .field("username", &self.username)
+            .field("database", &self.database)
+            .field("pool_size", &self.pool_size)
+            .field("masked_url", &self.masked_url)
+            .field("redis_type", &self.redis_type)
+            .field("prefix", &self.prefix)
+            .field("auth_file", &self.auth_file)
+            .field("tls", &self.tls.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A pool's TLS configuration (the same for both pools: equal when it is the same one).
@@ -66,6 +90,8 @@ struct PoolSettings<'a> {
     redis_type: &'a str,
     pipeline_limit: i64,
     close_on_readonly: bool,
+    pipeline_window: i64,
+    cluster_pipeline_parallelism: i64,
 }
 
 impl RedisConnection {
@@ -85,6 +111,8 @@ impl RedisConnection {
             redis_type: &s.redis_type,
             pipeline_limit: s.redis_pipeline_limit,
             close_on_readonly: s.redis_close_connection_on_readonly_error,
+            pipeline_window: s.redis_pipeline_window,
+            cluster_pipeline_parallelism: s.redis_cluster_pipeline_parallelism,
         })
     }
 
@@ -106,6 +134,8 @@ impl RedisConnection {
             redis_type: &s.redis_persecond_type,
             pipeline_limit: s.redis_persecond_pipeline_limit,
             close_on_readonly: s.redis_close_connection_on_readonly_error,
+            pipeline_window: s.redis_persecond_pipeline_window,
+            cluster_pipeline_parallelism: s.redis_persecond_cluster_pipeline_parallelism,
         })
     }
 
@@ -115,25 +145,13 @@ impl RedisConnection {
             size => usize::try_from(size)
                 .map_err(|_| format!("invalid {}_POOL_SIZE {size}", p.prefix))?,
         };
-        // createDialer: the auth is `user:password` or a password; radix then fills in what
-        // is still empty from a redis:// URL.
-        let (mut username, mut password) = match p.auth.split_once(':') {
-            Some((user, pass)) => (user.to_string(), pass.to_string()),
-            None => (String::new(), p.auth.to_string()),
-        };
-        let (address, url) = parse_redis_url(p.url);
-        if username.is_empty() {
-            username = url.username;
-        }
-        if password.is_empty() {
-            password = url.password;
-        }
+        let (address, username, password, database) = dialled(p.auth, p.url);
         Ok(Self {
             network: p.socket_type.to_string(),
             address,
             username,
             password,
-            database: url.database,
+            database,
             pool_size,
             timeout: crate::settings::duration(p.timeout),
             masked_url: mask_credentials_in_url(p.url),
@@ -146,7 +164,23 @@ impl RedisConnection {
             auth_file: p.auth_file.to_string(),
             tls: None,
             close_on_readonly: p.close_on_readonly,
+            pipeline_window: p.pipeline_window,
+            cluster_pipeline_parallelism: p.cluster_pipeline_parallelism,
+            url: p.url.to_string(),
         })
+    }
+
+    /// The node at `url` of a cluster, dialled over TCP as radix's cluster dials its nodes.
+    fn node(&self, url: &str) -> Self {
+        let (address, username, password, database) = dialled(&self.auth, url);
+        Self {
+            network: "tcp".into(),
+            address,
+            username,
+            password,
+            database,
+            ..self.clone()
+        }
     }
 
     /// Where to connect, as Go's dialer resolves the address for the network; failures are
@@ -257,23 +291,101 @@ impl RedisConnection {
     /// given, which Redis may refuse), then `PONG` to `PING`, then the pool. A failed dial is
     /// traced like radix's; `failed` is upstream's `hadConnError`.
     async fn attempt(&self, failed: &mut bool) -> Result<Pool, String> {
-        let probe = match self.probe().await {
+        let probe = match self.probe(Dial::Single).await {
             Ok(probe) => probe,
             Err(message) => {
-                *failed = true;
-                crate::log::error(&format!("creating redis connection error : {message}"));
+                traced_failure(failed, &message);
                 return Err(message);
             }
         };
-        if std::mem::take(failed) {
-            crate::log::info("redis connection re-established after previous error");
-        }
+        traced_success(failed);
         self.set_up(probe).await
+    }
+
+    /// One attempt of upstream's loop in `CLUSTER` mode (`ClusterConfig.New`): a pool on the
+    /// first node that dials (each failure traced), the topology from it (`CLUSTER SLOTS`), a
+    /// pool on each of its other nodes (`sync`, by their addresses, so with `REDIS_AUTH` but
+    /// not the seed URL's credentials), then `PONG` to `PING` from the cluster.
+    async fn attempt_cluster(&self, failed: &mut bool) -> Result<Pool, String> {
+        let mut last_error = String::new();
+        let mut probed = None;
+        for seed in self.url.split(',') {
+            match self.node(seed).probe(Dial::ClusterNode).await {
+                Ok((_, probe)) => {
+                    probed = Some((seed, probe));
+                    break;
+                }
+                Err(message) => {
+                    traced_failure(failed, &message);
+                    last_error = message;
+                }
+            }
+        }
+        let Some((seed, probe)) = probed else {
+            return Err(format!(
+                "could not connect to any redis instances, last error was: {last_error}"
+            ));
+        };
+        traced_success(failed);
+        let slots: Result<fred::types::Value, _> =
+            probe.custom(fred::cmd!("CLUSTER"), vec!["SLOTS"]).await;
+        let _ = probe.quit().await;
+        let slots = slots.map_err(|e| format!("response returned from Conn: {}", e.details()))?;
+        let mut primaries = Vec::new();
+        for (address, primary) in topology(&slots) {
+            // The seed's pool is under its URL: a node spelled alike is not dialled again.
+            if address != seed {
+                match self.node(&address).probe(Dial::ClusterNode).await {
+                    Ok((_, client)) => {
+                        let _ = client.quit().await;
+                        traced_success(failed);
+                    }
+                    Err(message) => {
+                        traced_failure(failed, &message);
+                        return Err(format!(
+                            "error creating client for {}: {message}",
+                            crate::go::quote(&address)
+                        ));
+                    }
+                }
+            }
+            if let (true, Ok((host, port))) = (primary, crate::go::split_host_port(&address))
+                && let Ok(port) = port.parse()
+            {
+                primaries.push(Server::new(host, port));
+            }
+        }
+        // fred's clients over the primaries, dialled as the nodes are.
+        let pool = self
+            .node("")
+            .builder(
+                ServerConfig::Clustered {
+                    hosts: primaries,
+                    policy: Default::default(),
+                },
+                false,
+            )
+            .set_policy(radix_reconnects())
+            .build_pool(self.pool_size)
+            .map_err(|e| e.to_string())?;
+        pool.init().await.map_err(|e| e.details().to_string())?;
+        let pong: String = pool
+            .next()
+            .ping(None)
+            .await
+            .map_err(|e| e.details().to_string())?;
+        if pong != "PONG" {
+            return Err(format!(
+                "unexpected PING response: {}",
+                crate::go::quote(&pong)
+            ));
+        }
+        Ok(pool)
     }
 
     /// radix's `Dialer.Dial`: the connection, then AUTH and SELECT as it sends them, which
     /// Redis may refuse. Then the probe, which answers `PING`.
-    async fn probe(&self) -> Result<(ServerConfig, Client), String> {
+    async fn probe(&self, dial: Dial) -> Result<(ServerConfig, Client), String> {
         // The auth file is read before dialling (radix's `CustomConn`).
         let credentials = self.credentials()?;
         let server = self.server().await?;
@@ -282,6 +394,10 @@ impl RedisConnection {
         commands.extend(Self::auth_arguments(&credentials).map(|a| ("AUTH", a)));
         if !self.database.is_empty() {
             commands.push(("SELECT", vec![self.database.clone()]));
+        }
+        // A cluster's dialer sends READONLY, unless upstream replaced it (`CustomConn`).
+        if dial == Dial::ClusterNode && self.auth_file.is_empty() && !self.close_on_readonly {
+            commands.push(("READONLY", Vec::new()));
         }
         for (name, arguments) in commands {
             // Sent by hand: fred reads Redis' refusal of an unneeded AUTH as `OK`.
@@ -469,6 +585,13 @@ impl RedisConnection {
                 self.pipeline_limit
             ));
         }
+        let cluster = self.redis_type.eq_ignore_ascii_case("cluster");
+        if cluster && self.pipeline_window > 0 {
+            crate::debug!(
+                "Cluster mode: setting WriteFlushInterval to {}",
+                crate::go::format_duration(self.pipeline_window)
+            );
+        }
         if !self.auth_file.is_empty() {
             crate::log::warn(&format!(
                 "Redis pool {masked}: resolving credentials on every connection attempt"
@@ -478,6 +601,23 @@ impl RedisConnection {
             crate::log::warn(&format!(
                 "Redis pool {masked}: closing connections on READONLY error replies"
             ));
+        }
+        if cluster {
+            let configured = self.cluster_pipeline_parallelism;
+            let effective = cluster_pipeline_parallelism(configured, self.pool_size_setting)?;
+            crate::log::warn(&match configured {
+                0 => format!(
+                    "Redis cluster pipeline parallelism: auto bounded to Redis pool size ({effective} concurrent groups)"
+                ),
+                _ if configured != effective => format!(
+                    "Redis cluster pipeline parallelism: configured value {configured} exceeds Redis pool size {}; bounded to {effective} concurrent groups",
+                    self.pool_size_setting
+                ),
+                1 => "Redis cluster pipeline parallelism: disabled (serial legacy behavior)".into(),
+                _ => format!(
+                    "Redis cluster pipeline parallelism: bounded to {effective} concurrent groups"
+                ),
+            });
         }
         match self.pool_on_empty_behavior.to_uppercase().as_str() {
             "WAIT" => crate::log::warn(&format!(
@@ -498,7 +638,16 @@ impl RedisConnection {
             match self.redis_type.to_lowercase().as_str() {
                 // Upstream logs REDIS_URL as given, credentials included (docs/parity.md §7).
                 "single" => crate::log::warn(&format!("Creating single with urls {masked}")),
-                "cluster" | "sentinel" => {
+                // `%v` of the URLs.
+                "cluster" => crate::log::warn(&format!(
+                    "Creating cluster with urls [{}]",
+                    self.url
+                        .split(',')
+                        .map(mask_credentials_in_url)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )),
+                "sentinel" => {
                     return Err(format!(
                         "{}_TYPE={} is not supported yet",
                         self.prefix, self.redis_type
@@ -506,7 +655,11 @@ impl RedisConnection {
                 }
                 _ => return Err(format!("Unrecognized redis type {}", self.redis_type)),
             }
-            let error = match self.attempt(&mut failed).await {
+            let attempted = match cluster {
+                true => self.attempt_cluster(&mut failed).await,
+                false => self.attempt(&mut failed).await,
+            };
+            let error = match attempted {
                 Ok(pool) => break pool,
                 Err(message) => message,
             };
@@ -547,6 +700,95 @@ impl RedisConnection {
         });
         Ok(pool)
     }
+}
+
+/// What radix dials: the server, or a cluster's node (which also gets `READONLY`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dial {
+    Single,
+    ClusterNode,
+}
+
+/// `poolTrace` of a failed connection: logged, and remembered (`hadConnError`).
+fn traced_failure(failed: &mut bool, message: &str) {
+    *failed = true;
+    crate::log::error(&format!("creating redis connection error : {message}"));
+}
+
+/// `poolTrace` of a connection made: logged if one failed before.
+fn traced_success(failed: &mut bool) {
+    if std::mem::take(failed) {
+        crate::log::info("redis connection re-established after previous error");
+    }
+}
+
+/// `ClusterTopo` of a `CLUSTER SLOTS` reply: each node's address (`host:port`) and whether
+/// it is a primary, by its first slot, a primary before its secondaries.
+fn topology(slots: &fred::types::Value) -> Vec<(String, bool)> {
+    use fred::types::Value;
+    let mut nodes: Vec<(String, i64, bool)> = Vec::new();
+    let Value::Array(sets) = slots else {
+        return Vec::new();
+    };
+    for set in sets {
+        let Value::Array(set) = set else { continue };
+        let Some(start) = set.first().and_then(Value::as_i64) else {
+            continue;
+        };
+        for (index, node) in set.iter().skip(2).enumerate() {
+            let Value::Array(node) = node else { continue };
+            let (Some(host), Some(port)) = (
+                node.first().and_then(Value::as_string),
+                node.get(1).and_then(Value::as_i64),
+            ) else {
+                continue;
+            };
+            let address = crate::net::join_host_port(&host, port);
+            match nodes.iter_mut().find(|(a, _, _)| *a == address) {
+                Some(known) => known.1 = known.1.min(start),
+                None => nodes.push((address, start, index == 0)),
+            }
+        }
+    }
+    nodes.sort_by_key(|(_, start, primary)| (*start, !*primary));
+    nodes
+        .into_iter()
+        .map(|(address, _, primary)| (address, primary))
+        .collect()
+}
+
+/// `effectiveClusterPipelineParallelism`: 1 stays serial; 0, or more than the pool's size (at
+/// least 1), is the pool's size; a negative value is what upstream panics with.
+fn cluster_pipeline_parallelism(configured: i64, pool_size: i64) -> Result<i64, String> {
+    if configured < 0 {
+        return Err("redis cluster pipeline parallelism must be >= 0".into());
+    }
+    if configured == 1 {
+        return Ok(1);
+    }
+    let ceiling = pool_size.max(1);
+    Ok(match configured == 0 || configured > ceiling {
+        true => ceiling,
+        false => configured,
+    })
+}
+
+/// What radix dials for `url`: the address, then the user, password and database. The auth
+/// (`createDialer`'s) is `user:password` or a password; radix fills in what is still empty from
+/// a redis:// URL.
+fn dialled(auth: &str, url: &str) -> (String, String, String, String) {
+    let (mut username, mut password) = match auth.split_once(':') {
+        Some((user, pass)) => (user.to_string(), pass.to_string()),
+        None => (String::new(), auth.to_string()),
+    };
+    let (address, url) = parse_redis_url(url);
+    if username.is_empty() {
+        username = url.username;
+    }
+    if password.is_empty() {
+        password = url.password;
+    }
+    (address, username, password, url.database)
 }
 
 /// fred's user and password for `credentials` (radix sends AUTH with a user even when the
@@ -881,6 +1123,121 @@ fn radix_reconnects() -> ReconnectPolicy {
     let mut policy = ReconnectPolicy::new_exponential(0, 125, 4000, 2);
     policy.set_jitter(0);
     policy
+}
+
+#[cfg(test)]
+mod cluster_tests {
+    use super::*;
+
+    /// A connection from these settings over the defaults.
+    fn connection(variables: &[(&str, &str)]) -> RedisConnection {
+        let lookup = |key: &str| {
+            variables
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        };
+        RedisConnection::from_settings(&Settings::from_lookup(&lookup).unwrap()).unwrap()
+    }
+
+    /// radix dials the topology's nodes by their addresses: with `REDIS_AUTH`, but not the
+    /// seed URL's credentials nor its database.
+    #[test]
+    fn cluster_nodes_take_the_auth_but_not_the_seed_url() {
+        let seeded = connection(&[("REDIS_URL", "redis://u:pw@10.0.0.1:7000/0")]);
+        let node = seeded.node("10.0.0.2:7001");
+        assert_eq!(
+            (
+                node.address.as_str(),
+                node.username.as_str(),
+                node.password.as_str()
+            ),
+            ("10.0.0.2:7001", "", "")
+        );
+        assert_eq!((node.database.as_str(), node.network.as_str()), ("", "tcp"));
+        let seed = seeded.node("redis://u:pw@10.0.0.1:7000/0");
+        assert_eq!(
+            (seed.username.as_str(), seed.password.as_str()),
+            ("u", "pw")
+        );
+        let authenticated = connection(&[("REDIS_AUTH", "user:secret")]).node("10.0.0.2:7001");
+        assert_eq!(
+            (
+                authenticated.username.as_str(),
+                authenticated.password.as_str()
+            ),
+            ("user", "secret")
+        );
+    }
+
+    /// Its debug form leaves the credentials out.
+    #[test]
+    fn a_connection_debugs_without_credentials() {
+        let printed = format!(
+            "{:?}",
+            connection(&[
+                ("REDIS_URL", "redis://u:hunter2@h:1"),
+                ("REDIS_AUTH", "x:s3cret")
+            ])
+        );
+        assert!(
+            !printed.contains("hunter2") && !printed.contains("s3cret"),
+            "{printed}"
+        );
+    }
+
+    /// `ClusterTopo`: nodes by their first slot, merged across ranges, primaries before their
+    /// secondaries.
+    #[test]
+    fn a_topology_is_read_like_radix() {
+        use fred::types::Value;
+        let node = |host: &str, port: i64| {
+            Value::Array(vec![
+                Value::String(host.into()),
+                Value::Integer(port),
+                Value::String("id".into()),
+            ])
+        };
+        let set = |start: i64, end: i64, nodes: Vec<Value>| {
+            let mut set = vec![Value::Integer(start), Value::Integer(end)];
+            set.extend(nodes);
+            Value::Array(set)
+        };
+        let slots = Value::Array(vec![
+            set(10923, 16383, vec![node("10.0.0.3", 7002)]),
+            set(
+                5461,
+                10922,
+                vec![node("10.0.0.2", 7001), node("10.0.0.5", 7004)],
+            ),
+            set(0, 100, vec![node("::1", 7000)]),
+            set(101, 5460, vec![node("::1", 7000)]),
+        ]);
+        assert_eq!(
+            topology(&slots),
+            [
+                ("[::1]:7000".to_string(), true),
+                ("10.0.0.2:7001".into(), true),
+                ("10.0.0.5:7004".into(), false),
+                ("10.0.0.3:7002".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn cluster_pipeline_parallelism_is_bounded_like_upstream() {
+        let bounded = |configured, size| cluster_pipeline_parallelism(configured, size);
+        assert_eq!(bounded(1, 10), Ok(1));
+        assert_eq!(bounded(0, 10), Ok(10));
+        assert_eq!(bounded(4, 10), Ok(4));
+        assert_eq!(bounded(11, 10), Ok(10));
+        assert_eq!(bounded(0, 0), Ok(1));
+        assert_eq!(bounded(3, 0), Ok(1));
+        assert_eq!(
+            bounded(-1, 10),
+            Err("redis cluster pipeline parallelism must be >= 0".into())
+        );
+    }
 }
 
 #[cfg(test)]
