@@ -489,10 +489,11 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             let e = crate::net::listen_error("tcp", &address, &e);
             Failure::Fatal(format!("Failed to listen for gRPC on '{address}': {e}"))
         })?;
-        let incoming = crate::net::closed_on(
+        let accepted = tokio_stream::StreamExt::map(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutting_down(server_stopping.clone()),
+            |stream| stream.inspect(crate::net::nodelay),
         );
+        let incoming = crate::net::closed_on(accepted, shutting_down(server_stopping.clone()));
         match &grpc_tls {
             Some(tls) => serve!(server, tls.incoming(incoming), stop),
             None => serve!(server, incoming, stop),

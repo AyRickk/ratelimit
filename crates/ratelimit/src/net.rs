@@ -53,6 +53,11 @@ pub async fn listen(addr: &str, reuse_port: bool) -> std::io::Result<tokio::net:
     bind(*address)
 }
 
+/// Go's TCP connections, accepted or dialled, are `TCP_NODELAY`.
+pub fn nodelay(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
 /// `net.JoinHostPort`: `host:port`, with brackets around a host containing `:`.
 pub fn join_host_port(host: &str, port: i64) -> String {
     match host.contains(':') {

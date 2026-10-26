@@ -731,11 +731,15 @@ fn http_client(config: &Config) -> HttpClient {
         })
         .expect("a TLS configuration with the system's roots")
     });
+    // Go's TCP connections are `TCP_NODELAY`.
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(http);
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build(connector)
 }

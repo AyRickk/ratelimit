@@ -87,3 +87,29 @@ jobs:
         env:
           RATELIMIT_IMAGE: ratelimit:ci
         run: cargo test -p ratelimit --test image
+
+  envoy-gateway:
+    name: envoy-gateway
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          # Envoy Gateway's chart reads REGISTRY/REPOSITORY:TAG.
+          tags: localhost/ratelimit:ci
+          cache-from: type=gha,scope=linux/amd64
+      - name: Install kind
+        run: |
+          curl -sSfLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum --check
+          sudo install kind /usr/local/bin/kind
+      - name: Envoy Gateway with our image, against upstream's
+        run: tools/envoy-gateway/test.sh localhost/ratelimit:ci
