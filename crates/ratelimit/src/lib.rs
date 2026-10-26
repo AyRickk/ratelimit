@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod debug;
+pub mod drain;
 pub mod go;
 pub mod goserver;
 pub mod grpc;

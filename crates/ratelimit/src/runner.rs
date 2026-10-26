@@ -391,8 +391,10 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     }
     // otelgrpc's handler, on every service.
     let uds = (!settings.grpc_uds.is_empty()).then(|| settings.grpc_uds.clone());
+    let in_flight = crate::drain::InFlight::default();
     let server = builder
         .layer(crate::trace::grpc::Layer::new(uds))
+        .layer(in_flight.clone())
         .add_service(health_service.server())
         .add_service(grpc::server(service.clone(), server_stats));
     // handleGracefulShutdown: on a signal, the line, then the server stops (its listeners
@@ -434,14 +436,25 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         }
     };
     // The server on its listener's connections, over TLS or not.
+    // grpc-go's drain: past its ping's timeout, connections left are closed once idle.
+    let drained = {
+        let (stopping, in_flight) = (shutting_down(server_stopping.clone()), in_flight.clone());
+        async move {
+            stopping.await;
+            tokio::time::sleep(crate::drain::PING_TIMEOUT).await;
+            in_flight.idle().await;
+        }
+    };
     macro_rules! serve {
         ($server:expr, $incoming:expr, $stop:expr) => {{
             let (server, incoming, stop) = ($server, $incoming, $stop);
             Box::pin(async move {
-                server
-                    .serve_with_incoming_shutdown(incoming, stop)
-                    .await
-                    .map_err(|e| e.to_string())
+                tokio::select! {
+                    served = server.serve_with_incoming_shutdown(incoming, stop) => {
+                        served.map_err(|e| e.to_string())
+                    }
+                    () = drained => Ok(()),
+                }
             })
         }};
     }
