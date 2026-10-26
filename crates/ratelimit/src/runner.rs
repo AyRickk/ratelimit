@@ -393,6 +393,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let uds = (!settings.grpc_uds.is_empty()).then(|| settings.grpc_uds.clone());
     let in_flight = crate::drain::InFlight::default();
     let server = builder
+        .layer(grpc::Requests)
         .layer(crate::trace::grpc::Layer::new(uds))
         .layer(in_flight.clone())
         .add_service(health_service.server())

@@ -4223,6 +4223,88 @@ async fn silent_grpc_clients_hold_the_stop_like_upstream() {
     }
 }
 
+/// Requests that are not gRPC get grpc-go's early answers: `415` for another content type,
+/// then `405` for another method than `POST`, with their `grpc-status` and `grpc-message`.
+#[tokio::test]
+async fn non_grpc_requests_are_refused_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("non-grpc");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let path = "/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit";
+    let cases: [(&str, Option<&str>); 7] = [
+        ("GET", None),
+        ("POST", Some("text/plain")),
+        ("POST", Some("application/grpcx")),
+        ("POST", Some("application/gRPC; x=\"é%\"")),
+        ("GET", Some("application/grpc")),
+        ("PUT", Some("application/grpc+proto")),
+        ("POST", Some("application/json")),
+    ];
+    let mut answers = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let mut environment = binary_environment(&runtime, &redis);
+        environment.extend([
+            ("GRPC_HOST", "127.0.0.1".to_string()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("PORT", http.to_string()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ]);
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut seen = Vec::new();
+        for (method, content_type) in cases {
+            let mut curl = std::process::Command::new("curl");
+            curl.args([
+                "-s",
+                "-i",
+                "--max-time",
+                "5",
+                "--http2-prior-knowledge",
+                "-X",
+                method,
+            ]);
+            if let Some(content_type) = content_type {
+                curl.args(["-H", &format!("content-type: {content_type}")]);
+            }
+            let output = curl
+                .arg(format!("http://127.0.0.1:{grpc}{path}"))
+                .output()
+                .unwrap();
+            // The status line and the gRPC headers.
+            let answer: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| {
+                    l.starts_with("HTTP/")
+                        || l.starts_with("content-type")
+                        || l.starts_with("grpc-")
+                })
+                .collect();
+            seen.push(answer);
+        }
+        logged.stop().await;
+        answers.push(seen);
+    }
+    assert!(
+        answers[0][0][0].starts_with("HTTP/2 415"),
+        "{:?}",
+        answers[0]
+    );
+    assert_eq!(answers[1], answers[0]);
+}
+
 /// Upstream's own service binary (`src/service_cmd`), built at the pinned commit.
 fn upstream_binary() -> PathBuf {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
