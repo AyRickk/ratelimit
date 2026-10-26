@@ -4151,6 +4151,160 @@ async fn config_reloads_reread_the_tls_files_like_upstream() {
     }
 }
 
+/// On SIGTERM, a gRPC client that answers grpc-go's drain (its ping) lets the service stop at
+/// once; one gone silent holds it 5 s, then is cut, as upstream's.
+#[tokio::test]
+async fn silent_grpc_clients_hold_the_stop_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("silent");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        for silent in [false, true] {
+            let (grpc, http) = (reserved_port(), reserved_port());
+            let mut environment = binary_environment(&runtime, &redis);
+            environment.extend([
+                ("GRPC_HOST", "127.0.0.1".to_string()),
+                ("GRPC_PORT", grpc.to_string()),
+                ("PORT", http.to_string()),
+                ("DEBUG_PORT", reserved_port().to_string()),
+            ]);
+            let logged = Logged::start(&binary, &environment, http).await;
+            // A client that sent HTTP/2's preface and settings, then reads nothing; or one
+            // kept connected, its connection task answering the ping.
+            let mut _silent = None;
+            let mut _client = None;
+            if silent {
+                use tokio::io::AsyncWriteExt;
+                let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", grpc))
+                    .await
+                    .unwrap();
+                stream
+                    .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+                    .await
+                    .unwrap();
+                _silent = Some(stream);
+            } else {
+                let mut client =
+                    RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
+                        .await
+                        .unwrap();
+                client
+                    .should_rate_limit(request("llm", &[&[("user", "a")]]))
+                    .await
+                    .unwrap();
+                _client = Some(client);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            logged.stop().await;
+            let took = started.elapsed();
+            let expected = match silent {
+                true => std::time::Duration::from_millis(4500)..std::time::Duration::from_secs(8),
+                false => std::time::Duration::ZERO..std::time::Duration::from_secs(2),
+            };
+            assert!(
+                expected.contains(&took),
+                "{} with a silent client: {silent}, stopped in {took:?}",
+                binary.display()
+            );
+        }
+    }
+}
+
+/// Requests that are not gRPC get grpc-go's early answers: `415` for another content type,
+/// then `405` for another method than `POST`, with their `grpc-status` and `grpc-message`.
+#[tokio::test]
+async fn non_grpc_requests_are_refused_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("non-grpc");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let redis = Redis::start().await;
+    let path = "/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit";
+    let cases: [(&str, Option<&str>); 7] = [
+        ("GET", None),
+        ("POST", Some("text/plain")),
+        ("POST", Some("application/grpcx")),
+        ("POST", Some("application/gRPC; x=\"é%\"")),
+        ("GET", Some("application/grpc")),
+        ("PUT", Some("application/grpc+proto")),
+        ("POST", Some("application/json")),
+    ];
+    let mut answers = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (grpc, http) = (reserved_port(), reserved_port());
+        let mut environment = binary_environment(&runtime, &redis);
+        environment.extend([
+            ("GRPC_HOST", "127.0.0.1".to_string()),
+            ("GRPC_PORT", grpc.to_string()),
+            ("PORT", http.to_string()),
+            ("DEBUG_PORT", reserved_port().to_string()),
+        ]);
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut seen = Vec::new();
+        for (method, content_type) in cases {
+            let mut curl = std::process::Command::new("curl");
+            curl.args([
+                "-s",
+                "-i",
+                "--max-time",
+                "5",
+                "--http2-prior-knowledge",
+                "-X",
+                method,
+            ]);
+            if let Some(content_type) = content_type {
+                curl.args(["-H", &format!("content-type: {content_type}")]);
+            }
+            let output = curl
+                .arg(format!("http://127.0.0.1:{grpc}{path}"))
+                .output()
+                .unwrap();
+            // The status line and the gRPC headers.
+            let answer: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| {
+                    l.starts_with("HTTP/")
+                        || l.starts_with("content-type")
+                        || l.starts_with("grpc-")
+                })
+                .collect();
+            seen.push(answer);
+        }
+        logged.stop().await;
+        answers.push(seen);
+    }
+    assert!(
+        answers[0][0][0].starts_with("HTTP/2 415"),
+        "{:?}",
+        answers[0]
+    );
+    assert_eq!(answers[1], answers[0]);
+}
+
 /// Upstream's own service binary (`src/service_cmd`), built at the pinned commit.
 fn upstream_binary() -> PathBuf {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -9330,9 +9484,9 @@ async fn the_grpc_listener_closes_on_sigterm_like_upstream() {
                     .await
                     .unwrap(),
             };
-            // A request held in Redis while the service stops.
+            // A request held in Redis while the service stops, past grpc-go's 5 s drain.
             assert_eq!(
-                redis_command(&redis, &["CLIENT", "PAUSE", "3000"]).await,
+                redis_command(&redis, &["CLIENT", "PAUSE", "7000"]).await,
                 "+OK\r\n"
             );
             let answered = tokio::spawn(async move {

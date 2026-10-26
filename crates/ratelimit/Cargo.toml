@@ -39,6 +39,9 @@ yaml-rust2.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify.workspace = true
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
 [dev-dependencies]
 rcgen = "0.14"
 tonic-prost.workspace = true

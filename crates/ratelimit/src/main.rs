@@ -2,6 +2,11 @@
 
 use ratelimit::settings::Settings;
 
+/// The image's static (musl) build: musl's allocator serialises threads.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn environment(key: &str) -> Option<String> {
     std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
 }
