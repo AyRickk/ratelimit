@@ -1,13 +1,21 @@
 // Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/config/core/v3/base.proto:
-// only HeaderValue is kept; validation and udpa annotations and comments removed;
+// only HeaderValue and Node (its id, cluster and metadata) are kept; validation and udpa annotations and comments removed;
 // packages, names and field numbers unchanged.
 
 syntax = "proto3";
 
 package envoy.config.core.v3;
 
+import "google/protobuf/struct.proto";
+
 message HeaderValue {
   string key = 1;
   string value = 2;
   bytes raw_value = 3;
+}
+
+message Node {
+  string id = 1;
+  string cluster = 2;
+  google.protobuf.Struct metadata = 3;
 }

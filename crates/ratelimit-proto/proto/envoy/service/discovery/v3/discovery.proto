@@ -1,0 +1,34 @@
+// Trimmed from envoyproxy/envoy@bc3dc71cdc67 api/envoy/service/discovery/v3/discovery.proto
+// and ads.proto: only the SotW stream, DiscoveryRequest and DiscoveryResponse (without their
+// resource locators, control plane and resource errors) are kept; validation and udpa
+// annotations and comments removed; packages, names and field numbers unchanged.
+
+syntax = "proto3";
+
+package envoy.service.discovery.v3;
+
+import "envoy/config/core/v3/base.proto";
+import "google/protobuf/any.proto";
+import "google/rpc/status.proto";
+
+service AggregatedDiscoveryService {
+  rpc StreamAggregatedResources(stream DiscoveryRequest) returns (stream DiscoveryResponse) {
+  }
+}
+
+message DiscoveryRequest {
+  string version_info = 1;
+  config.core.v3.Node node = 2;
+  repeated string resource_names = 3;
+  string type_url = 4;
+  string response_nonce = 5;
+  google.rpc.Status error_detail = 6;
+}
+
+message DiscoveryResponse {
+  string version_info = 1;
+  repeated google.protobuf.Any resources = 2;
+  bool canary = 3;
+  string type_url = 4;
+  string nonce = 5;
+}

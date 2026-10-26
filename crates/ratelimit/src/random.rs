@@ -37,6 +37,13 @@ pub fn below(n: u64) -> u64 {
     (u64::from_be_bytes(bytes) >> 1) % n
 }
 
+/// A random number in `[0, 1)`, like `rand.Float64`.
+pub fn float64() -> f64 {
+    let mut bytes = [0u8; 8];
+    fill(&mut bytes);
+    (u64::from_be_bytes(bytes) >> 11) as f64 / (1u64 << 53) as f64
+}
+
 pub(crate) fn now_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

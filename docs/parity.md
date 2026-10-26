@@ -28,23 +28,23 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `GRPC_CLIENT_TLS_SAN` | — | ✅ | with a CA, the client's certificate valid for this name (DNS name or IP), a mismatch logged: `grpc_over_tls_is_served_like_upstream` |
 | `LOG_LEVEL` | `WARN` | ✅ | `tests/differential.rs` (`the_binary_fails_to_start_like_upstream`, `logs_are_written_like_upstream`), `log.rs` unit tests |
 | `LOG_FORMAT` | `text` | ✅ | `logs_are_written_like_upstream` in `tests/differential.rs` |
-| `CONFIG_TYPE` | `FILE` | 🚧 | `FILE`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `GRPC_XDS_SOTW` not supported yet |
-| `FORCE_START_WITHOUT_INITIAL_CONFIG` | `false` | ✅ | the service waits for the file provider's first load unless set (the end state is the same, as upstream) |
-| `CONFIG_GRPC_XDS_NODE_ID` | `default` | ⬜ | |
-| `CONFIG_GRPC_XDS_NODE_METADATA` | — | ⬜ | |
-| `CONFIG_GRPC_XDS_SERVER_URL` | `localhost:18000` | ⬜ | |
-| `CONFIG_GRPC_XDS_SERVER_CONNECT_RETRY_INTERVAL` | `3s` | ⬜ | |
-| `CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS` | — | ⬜ | |
-| `CONFIG_GRPC_XDS_SERVER_USE_TLS` | `false` | ⬜ | |
-| `CONFIG_GRPC_XDS_CLIENT_TLS_CERT` | — | ⬜ | |
-| `CONFIG_GRPC_XDS_CLIENT_TLS_KEY` | — | ⬜ | |
-| `CONFIG_GRPC_XDS_SERVER_TLS_CACERT` | — | ⬜ | |
-| `CONFIG_GRPC_XDS_SERVER_TLS_SAN` | — | ⬜ | |
-| `XDS_CLIENT_BACKOFF_INITIAL_INTERVAL` | `10s` | ⬜ | |
-| `XDS_CLIENT_BACKOFF_MAX_INTERVAL` | `60s` | ⬜ | |
-| `XDS_CLIENT_BACKOFF_RANDOM_FACTOR` | `0.5` | ⬜ | |
-| `XDS_CLIENT_BACKOFF_JITTER` | `true` | ⬜ | |
-| `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ⬜ | |
+| `CONFIG_TYPE` | `FILE` | ✅ | `FILE`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `GRPC_XDS_SOTW`: the `xds_*_like_upstream` tests |
+| `FORCE_START_WITHOUT_INITIAL_CONFIG` | `false` | ✅ | the service waits for the provider's first config unless set (the end state is the same, as upstream); with xDS, no service while the server is unreachable: `xds_configs_are_acked_like_upstream`, and served meanwhile when set: `xds_streams_fail_like_upstream` |
+| `CONFIG_GRPC_XDS_NODE_ID` | `default` | ✅ | the node's ID in every request: `xds_configs_are_acked_like_upstream` |
+| `CONFIG_GRPC_XDS_NODE_METADATA` | — | ✅ | the node's metadata: its `KEY=VALUE` entries (split at the first `=`), others skipped: `xds_configs_are_acked_like_upstream` |
+| `CONFIG_GRPC_XDS_SERVER_URL` | `localhost:18000` | ✅ | dialled as grpc-go dials it (blocking, its connection backoff), connected once the server speaks: the `xds_*_like_upstream` tests; `dns:///`, `passthrough:///` and `unix:` targets and the `:authority`: `xds.rs` unit tests |
+| `CONFIG_GRPC_XDS_SERVER_CONNECT_RETRY_INTERVAL` | `3s` | ✅ | read, no effect, as upstream (its retry interceptor retries nothing by default) |
+| `CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS` | — | ✅ | sent with each stream, keys lowercased (`-bin` values in base64): `xds_configs_are_acked_like_upstream`; a key or value grpc-go refuses fails the stream: `xds_streams_fail_like_upstream` |
+| `CONFIG_GRPC_XDS_SERVER_USE_TLS` | `false` | ✅ | the server verified, `h2` negotiated unless `GRPC_ENFORCE_ALPN_ENABLED=false`, a failed handshake dialled again silently: `xds_over_tls_like_upstream`; its files read with the settings whatever `CONFIG_TYPE` (`the_binary_fails_to_start_like_upstream`) and again at each response, as every TLS file of the settings (`xds_responses_reread_the_tls_files_like_upstream`) |
+| `CONFIG_GRPC_XDS_CLIENT_TLS_CERT` | — | ✅ | with `CONFIG_GRPC_XDS_CLIENT_TLS_KEY`, the client's key pair: `xds_over_tls_like_upstream`, `the_binary_fails_to_start_like_upstream` |
+| `CONFIG_GRPC_XDS_CLIENT_TLS_KEY` | — | ✅ | as `CONFIG_GRPC_XDS_CLIENT_TLS_CERT` |
+| `CONFIG_GRPC_XDS_SERVER_TLS_CACERT` | — | ✅ | added to the system's roots: `xds_over_tls_like_upstream`, `the_binary_fails_to_start_like_upstream` |
+| `CONFIG_GRPC_XDS_SERVER_TLS_SAN` | — | ✅ | the name the server's certificate is verified for (else the URL's host), logged at each dial: `xds_over_tls_like_upstream` |
+| `XDS_CLIENT_BACKOFF_INITIAL_INTERVAL` | `10s` | ✅ | jpillora/backoff's, never reset, between streams: `xds_configs_are_acked_like_upstream`; `xds.rs` unit tests |
+| `XDS_CLIENT_BACKOFF_MAX_INTERVAL` | `60s` | ✅ | as `XDS_CLIENT_BACKOFF_INITIAL_INTERVAL` |
+| `XDS_CLIENT_BACKOFF_RANDOM_FACTOR` | `0.5` | ✅ | as `XDS_CLIENT_BACKOFF_INITIAL_INTERVAL` (the factor: the default `0.5` never grows) |
+| `XDS_CLIENT_BACKOFF_JITTER` | `true` | ✅ | as `XDS_CLIENT_BACKOFF_INITIAL_INTERVAL` |
+| `XDS_CLIENT_MAX_MSG_SIZE_IN_BYTES` | — | ✅ | grpc-go's limit (4 MiB when unset): a larger response fails the stream: `xds_streams_fail_like_upstream` |
 | `USE_DOG_STATSD` | `false` | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `USE_DOG_STATSD_MOGRIFIERS` | — | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `DOG_STATSD_MOGRIFIER_<NAME>_PATTERN`, `_NAME`, `_TAGS` | — | ✅ | behaviour: `tests/differential.rs`, `tests/dogstatsd.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
@@ -150,7 +150,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `TRACING_SERVICE_INSTANCE_ID` | — | ✅ | `traces_are_exported_like_upstream`; a random version 4 UUID by default: `trace/mod.rs` unit test |
 | `TRACING_EXPORTER_PROTOCOL` | `http` | ✅ | `traces_are_exported_like_upstream`; an unknown one is fatal: `the_binary_fails_to_start_like_upstream` |
 | `TRACING_SAMPLING_RATE` | `1` | ✅ | `traces_are_exported_like_upstream` (1, 0); the ratio's bound: `trace/mod.rs` unit test |
-| `GRPC_ENFORCE_ALPN_ENABLED` | (read by grpc-go) | ✅ | `false` (any case) serves TLS clients that negotiate no protocol: `grpc_over_tls_is_served_like_upstream` |
+| `GRPC_ENFORCE_ALPN_ENABLED` | (read by grpc-go) | ✅ | `false` (any case) serves TLS clients that negotiate no protocol: `grpc_over_tls_is_served_like_upstream`; and lets the xDS client use such a server |
 | `GRPC_SERVER_TLS_CA_CERT` | (injected by Envoy Gateway, read by no upstream code) | — ignored, as upstream | |
 | `OTEL_EXPORTER_OTLP_*` | (read by the OpenTelemetry SDK) | ✅ | `ENDPOINT`, `HEADERS`, `COMPRESSION`, `CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`: `traces_are_exported_like_upstream`; their `TRACES_` forms, `INSECURE`, `TIMEOUT`, URL and header parsing: `trace/export.rs` unit tests |
 
@@ -168,13 +168,14 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `detailed_metric`, `value_to_metric` (enriched stats key) | ✅ | `tests/config.rs` |
 | Duplicate domain ⇒ error, unless `MERGE_DOMAIN_CONFIG`; duplicate composite key ⇒ error | ✅ | `tests/config.rs` |
 | Reload: error ⇒ `config_load_error` + previous config kept | ✅ | `tests/differential.rs` |
+| Each config loaded reads the settings' TLS files again (`SetConfig`'s `NewSettings`): one gone stops the service with its error | ✅ | `config_reloads_reread_the_tls_files_like_upstream` (Linux), `xds_responses_reread_the_tls_files_like_upstream` |
 | YAML 1.1 input as yaml.v2 reads it: control characters refused, byte order marks (UTF-8, UTF-16) read, NEL as a line break | ✅ | `tests/differential.rs` |
 | Quoted scalars continued on less indented lines, as yaml.v2 reads them | ✅ | `quoted_scalars_continue_on_any_indentation_like_upstream` in `tests/differential.rs`; unit tests in `config/yaml.rs` |
 | Flow collections (`[a,`, `{a: b,`) continued on less indented lines, as yaml.v2 reads them | ⬜ | |
 | Multi-line quoted keys in flow mappings, and anchors not ASCII alphanumeric, refused as yaml.v2 refuses them | ⬜ | |
 | Startup without a valid config ⇒ gRPC error on every call (no exit) | ✅ | the service answers errors until a config loads: `tests/differential.rs` (a bad file at start) |
 | File provider: goruntime's loader (snapshot keys, dotfiles, symlinks, failures, nil loader), `SymlinkRefresher` / `DirectoryRefresher` on inotify events, reload coalescing, `runtime` scope | ✅ | snapshots and the first load: `tests/differential.rs`; reloads: `tests/differential.rs` on Linux (inotify, as upstream's fsnotify) |
-| xDS SotW provider (`RateLimitConfig`, ACK/NACK, backoff, mTLS) | ⬜ | |
+| xDS SotW provider: go-control-plane's ADS client (`RateLimitConfig` resources, all of a response loaded as one config; ACK, or NACK with the loader's or protobuf's error, the last ACKed version kept; a failed stream opened again after the backoff on a new connection, a NACKed version then reported as acknowledged), the service waiting for the first config unless `FORCE_START_WITHOUT_INITIAL_CONFIG`, the stream stopped on SIGTERM | ✅ | `xds_configs_are_acked_like_upstream`, `xds_streams_fail_like_upstream`, `xds_over_tls_like_upstream`, `xds_responses_reread_the_tls_files_like_upstream` |
 
 ## 3. gRPC and HTTP API
 
@@ -282,6 +283,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | U+2028 and U+2029 also break lines in YAML 1.1 (kept as characters in scalars) | characters only | the Rust parser is YAML 1.2; converting them would change scalars |
 | yaml.v2 reads only the first YAML document of a file: a control character or invalid byte after a later `---` (and beyond its 512-byte read-ahead) is not seen; and it decodes as it parses, so a syntax error before a bad byte further on is reported first | the whole file is checked first | rare inputs; the file is refused either way in the second case |
 | A snapshot's files are loaded in Go's random map order (which decides which error is reported, or the merge order) | in key order | one of upstream's orders, deterministic |
+| protobuf-go starts its errors (`proto: mismatched message type`, logged and in NACKs) with `proto:` and a space or a non-breaking space, depending on the build | always a space | Go randomises it on purpose |
+| On SIGTERM, upstream's process may exit before its xDS provider logs `Stopping xDS client watch for rate limit configurations` and the stream's `Canceled` error | always logged while a stream is up | one of upstream's outcomes, deterministic |
+| A stream whose connection is lost reads as grpc-go's transport error for how it was lost (a reset, a `GOAWAY`, a missing trailer) | `rpc error: code = Unavailable desc = error reading from server: EOF` for all | best effort (D3); the stream is opened again either way |
+| A `RateLimitConfig` (or `DiscoveryResponse`) protobuf-go cannot decode: its error for that input; a known field with the wrong wire type kept as an unknown field | `string field contains invalid UTF-8` or `proto: cannot parse invalid wire-format data`; a wrong wire type refused (NACKed, or the stream failed); messages nested over 100 levels refused (protobuf-go: 10000) | prost; malformed resources only |
+| The xDS client's `user-agent` is grpc-go's | tonic's | only the management server sees it |
+| A `unix://HOST/PATH` or `unix-abstract:` xDS URL: grpc-go's resolver refuses the first, dials the second | the path (or the host, without a path) dialled for the first; the second is not supported | not needed by the targeted deployments |
+| `LOG_LEVEL=trace` writes each xDS response as Go prints the structure (with memory addresses) | not written | best effort (D3) |
 | What upstream panics on at startup prints Go's panic and its stack trace, exit status 2 | a logrus `level=fatal` line with the panic's message, written whatever `LOG_LEVEL`, exit status 1 | D1: crashes are not reproduced; the stack trace has no equivalent |
 | radix opens one Redis connection at startup and the rest in the background | all the pool's connections at startup | the same once connected; a pool partly reachable at startup is not a target |
 | Redis connection errors read as Go's `net` errors | the startup dial's errors as Go's and radix's (`dial tcp 127.0.0.1:1: connect: connection refused`, `i/o timeout`, `response returned from Conn: <Redis' refusal of AUTH or SELECT>`); later ones (a failed reconnection, a command) as fred's; a name that does not resolve reads as the system resolver's error. Each startup attempt dials, authenticates and selects the database on a connection of its own, as radix's dial, before fred connects | different libraries; the messages around them are upstream's |

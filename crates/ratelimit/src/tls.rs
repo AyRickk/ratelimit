@@ -1,8 +1,10 @@
-//! `TlsConfigFromFiles` (`src/utils/tls.go`), shared by the Redis pools and the gRPC server:
+//! `TlsConfigFromFiles` (`src/utils/tls.go`), shared by the Redis pools, the gRPC server and
+//! the xDS client:
 //! a key pair and a CA added to the system's roots, read as Go reads them; and x509's name
 //! errors.
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
+use std::sync::Arc;
 
 /// The system's roots plus the certificates of `ca` (none if empty): `ca` must hold one.
 pub fn roots(ca: &str) -> Result<rustls::RootCertStore, String> {
@@ -73,6 +75,48 @@ pub fn key_pair(
         .keys_match()
         .map_err(|_| "tls: private key does not match public key".to_string())?;
     Ok((certs, key))
+}
+
+/// `TlsConfigFromFiles` with a server CA: the server verified against the system's roots plus
+/// `ca`, by name unless `skip_hostname_verification` (the chain still verified), with the
+/// key pair of `cert` and `key` if both are set; an error is what upstream panics with.
+pub fn server_ca_client(
+    cert: &str,
+    key: &str,
+    ca: &str,
+    skip_hostname_verification: bool,
+) -> Result<rustls::ClientConfig, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // A key pair needs both files.
+    let identity = match (cert, key) {
+        ("", _) | (_, "") => None,
+        (cert, key) => Some(
+            key_pair(cert, key, &provider)
+                .map_err(|e| format!("failed lo load TLS key pair ({cert},{key}): {e}"))?,
+        ),
+    };
+    let roots = Arc::new(roots(ca)?);
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?;
+    // With no root at all, every handshake fails, as Go's verification would.
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider)
+        .build()
+        .ok();
+    let builder = match skip_hostname_verification {
+        true => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NameNotVerified(verifier))),
+        false => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(GoNames(verifier))),
+    };
+    match identity {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("failed lo load TLS key pair: {e}")),
+        None => Ok(builder.with_no_client_auth()),
+    }
 }
 
 /// What x509's name checks read of a certificate: its SAN extension's DNS names and IP
@@ -246,6 +290,139 @@ fn match_hostnames(pattern: &str, host: &str) -> bool {
             .zip(&host)
             .enumerate()
             .all(|(i, (p, h))| (i == 0 && *p == "*") || p == h)
+}
+
+/// The chain verified against the roots, the name not (Go's `InsecureSkipVerify` with its
+/// own `VerifyPeerCertificate`).
+#[derive(Debug)]
+struct NameNotVerified(Option<Arc<rustls::client::WebPkiServerVerifier>>);
+
+impl NameNotVerified {
+    fn inner(&self) -> Result<&rustls::client::WebPkiServerVerifier, rustls::Error> {
+        self.0.as_deref().ok_or(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NameNotVerified {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::{CertificateError, Error};
+        match self.inner()?.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            verified => verified,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner()?.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner()?.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        match &self.0 {
+            Some(verifier) => verifier.supported_verify_schemes(),
+            None => rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
+    }
+}
+
+/// The chain verified against the roots, then the name as `Certificate.VerifyHostname`
+/// matches it, a mismatch carrying `HostnameError`'s text.
+#[derive(Debug)]
+struct GoNames(Option<Arc<rustls::client::WebPkiServerVerifier>>);
+
+/// `HostnameError`'s text, carried in a rustls error.
+#[derive(Debug)]
+struct HostnameError(String);
+
+impl std::fmt::Display for HostnameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostnameError {}
+
+impl rustls::client::danger::ServerCertVerifier for GoNames {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::{CertificateError, Error};
+        let verifier = NameNotVerified(self.0.clone());
+        let verified = verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let names = Names::of(end_entity)
+            .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        match names.verify_hostname(&server_name.to_str()) {
+            Ok(()) => Ok(verified),
+            Err(e) => Err(Error::InvalidCertificate(CertificateError::Other(
+                rustls::OtherError(Arc::new(HostnameError(e))),
+            ))),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        NameNotVerified(self.0.clone()).verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        NameNotVerified(self.0.clone()).verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        NameNotVerified(self.0.clone()).supported_verify_schemes()
+    }
 }
 
 #[cfg(test)]

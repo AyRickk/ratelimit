@@ -12,6 +12,7 @@ use crate::runtime::{self, FileProvider};
 use crate::service::RateLimitService;
 use crate::settings::{Lookup, Settings};
 use crate::stats::{self, Stats};
+use crate::xds::XdsProvider;
 use std::sync::{Arc, Mutex};
 
 /// `configureLogger`: the level (a fatal error, written before the format is set), then
@@ -156,9 +157,11 @@ impl PoolStats {
 /// Runs the service until it is told to stop (then stops gracefully): stats, config, Redis,
 /// then serving.
 pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> {
-    // NewSettings: the Redis TLS files, then the gRPC server's, are loaded with the settings.
-    let redis_tls = crate::redis::tls::from_settings(&settings)?.map(crate::redis::Tls);
-    let grpc_tls = crate::grpc_tls::from_settings(&settings)?;
+    let SettingsTls {
+        redis: redis_tls,
+        grpc: grpc_tls,
+        xds: xds_tls,
+    } = settings_tls(&settings)?;
     // NewRunner: the logger, then the stats sink and its flushes.
     configure_logger(&settings)?;
     let sink = stats::select_sink(&settings.sinks(lookup)?).map_err(stats::sink_failure)?;
@@ -192,12 +195,16 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let grpc_tls = grpc_tls
         .map(|tls| tls.acceptor(&stats, enforce_alpn))
         .transpose()?;
-    let loader = match settings.config_type.as_str() {
-        "FILE" => runtime::loader(&settings, &stats)?,
+    let provider = match settings.config_type.as_str() {
+        "FILE" => Provider::File(runtime::loader(&settings, &stats)?),
         "GRPC_XDS_SOTW" => {
-            return Err("CONFIG_TYPE=GRPC_XDS_SOTW is not supported yet"
-                .to_string()
-                .into());
+            let reloaded = settings.clone();
+            Provider::Xds(XdsProvider::start(
+                &settings,
+                xds_tls,
+                enforce_alpn,
+                move || settings_tls(&reloaded).map(drop),
+            ))
         }
         other => {
             return Err(Failure::Fatal(format!(
@@ -324,28 +331,46 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         // `NewService`'s update loop, which takes every event.
         crate::debug!("Waiting for config update event");
     }
-    let _provider = FileProvider::with_loader(loader, &settings, move |config| {
-        let mut first = first.lock().unwrap();
-        // The update loop takes every event but the initial one `NewService` waits for.
-        let looped = !wait || first.is_none();
-        if looped {
-            crate::debug!("Setting config retrieved from config provider");
+    let reread = settings.clone();
+    let update =
+        move |config: Result<crate::config::RateLimitConfig, crate::config::ConfigError>| {
+            let mut first = first.lock().unwrap();
+            // The update loop takes every event but the initial one `NewService` waits for.
+            let looped = !wait || first.is_none();
+            if looped {
+                crate::debug!("Setting config retrieved from config provider");
+            }
+            // `SetConfig`.
+            if let (true, Ok(config)) = (with_config, &config) {
+                let _ = match config.is_empty_domains() {
+                    false => config_health.ok(health::CONFIG),
+                    true => config_health.fail(health::CONFIG),
+                };
+            }
+            // `SetConfig` reads the settings again: a TLS file gone panics.
+            if config.is_ok()
+                && let Err(e) = settings_tls(&reread)
+            {
+                log::panic_exit(&e);
+            }
+            updated.update_config(config);
+            if looped {
+                crate::debug!("Waiting for config update event");
+            }
+            if let Some(first) = first.take() {
+                let _ = first.send(());
+            }
+        };
+    let (_file_provider, xds) = match provider {
+        Provider::File(loader) => (
+            Some(FileProvider::with_loader(loader, &settings, update)),
+            None,
+        ),
+        Provider::Xds(mut xds) => {
+            xds.deliver(update);
+            (None, Some(xds))
         }
-        // `SetConfig`.
-        if let (true, Ok(config)) = (with_config, &config) {
-            let _ = match config.is_empty_domains() {
-                false => config_health.ok(health::CONFIG),
-                true => config_health.fail(health::CONFIG),
-            };
-        }
-        updated.update_config(config);
-        if looped {
-            crate::debug!("Waiting for config update event");
-        }
-        if let Some(first) = first.take() {
-            let _ = first.send(());
-        }
-    });
+    };
     if wait {
         let _ = first_rx.await;
         log::info("Successfully loaded the initial ratelimit configs");
@@ -478,8 +503,45 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         let _ = debug.await;
     }
     let _ = http.await;
+    // Then the config provider stops.
+    if let Some(xds) = xds {
+        xds.stop().await;
+    }
     crate::trace::shutdown().await;
     served.map_err(Failure::from)
+}
+
+/// The TLS files `NewSettings` loads: Redis's, the gRPC server's, then the xDS client's (and
+/// Memcached's, not supported yet); an error is what upstream panics with.
+struct SettingsTls {
+    redis: Option<crate::redis::Tls>,
+    grpc: Option<crate::grpc_tls::ServerTls>,
+    xds: Option<rustls::ClientConfig>,
+}
+
+fn settings_tls(settings: &Settings) -> Result<SettingsTls, String> {
+    Ok(SettingsTls {
+        redis: crate::redis::tls::from_settings(settings)?.map(crate::redis::Tls),
+        grpc: crate::grpc_tls::from_settings(settings)?,
+        // `ConfigGrpcXdsServerTlsConfig`.
+        xds: settings
+            .config_grpc_xds_server_use_tls
+            .then(|| {
+                crate::tls::server_ca_client(
+                    &settings.config_grpc_xds_client_tls_cert,
+                    &settings.config_grpc_xds_client_tls_key,
+                    &settings.config_grpc_xds_server_tls_cacert,
+                    false,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+/// The config provider `CONFIG_TYPE` names.
+enum Provider {
+    File(runtime::Loader),
+    Xds(XdsProvider),
 }
 
 /// Resolves once gRPC has stopped.
