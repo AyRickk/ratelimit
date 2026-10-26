@@ -1,0 +1,20 @@
+# Envoy Gateway's chart values: global rate limiting on Redis. The ratelimit image is set
+# by test.sh (`global.images.ratelimit.image`).
+global:
+  images:
+    ratelimit:
+      pullPolicy: IfNotPresent
+config:
+  envoyGateway:
+    gateway:
+      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+    provider:
+      type: Kubernetes
+    logging:
+      level:
+        default: info
+    rateLimit:
+      backend:
+        type: Redis
+        redis:
+          url: redis.redis-system.svc.cluster.local:6379
