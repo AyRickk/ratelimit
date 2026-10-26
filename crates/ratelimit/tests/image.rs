@@ -23,7 +23,7 @@ domain: llm
 descriptors:
   - key: user
     rate_limit:
-      unit: hour
+      unit: day
       requests_per_unit: 2
 ";
 
@@ -46,14 +46,25 @@ fn container(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// A container or network, removed when dropped.
-struct Removed(&'static str, String);
+/// What a test creates, removed when dropped (on failure too).
+enum Created {
+    Container(String),
+    Network(String),
+    Directory(std::path::PathBuf),
+}
 
-impl Drop for Removed {
+impl Drop for Created {
     fn drop(&mut self) {
-        let _ = Command::new(cli())
-            .args([self.0, "rm", "-f", &self.1])
-            .output();
+        let remove = |args: &[&str]| {
+            let _ = Command::new(cli()).args(args).output();
+        };
+        match self {
+            Created::Container(id) => remove(&["rm", "-f", id]),
+            Created::Network(name) => remove(&["network", "rm", name]),
+            Created::Directory(path) => {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
     }
 }
 
@@ -80,6 +91,11 @@ fn status_inside(id: &str, url: &str) -> String {
             "%{http_code}",
             "--max-time",
             "3",
+            if url.contains(":8081") {
+                "--http2-prior-knowledge"
+            } else {
+                "--http1.1"
+            },
             url,
         ])
         .output()
@@ -106,6 +122,7 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
     let config =
         std::env::temp_dir().join(format!("ratelimit-image-{}-{}", std::process::id(), ipv6));
     std::fs::create_dir_all(&config).unwrap();
+    let _config = Created::Directory(config.clone());
     std::fs::write(config.join("llm.yaml"), CONFIG).unwrap();
     // Readable by the container's user.
     use std::os::unix::fs::PermissionsExt;
@@ -155,7 +172,7 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
         "127.0.0.1::6070",
         image,
     ]);
-    let _removed = Removed("container", id.clone());
+    let _container = Created::Container(id.clone());
     let (http, grpc, debug) = (
         host_port(&id, 8080),
         host_port(&id, 8081),
@@ -164,14 +181,27 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
     let healthcheck = format!("http://127.0.0.1:{http}/healthcheck");
     let mut healthy = false;
     for _ in 0..200 {
-        if reqwest_status(&healthcheck).await == Some(200) {
+        if http_status(&healthcheck).await == Some(200) {
             healthy = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(healthy, "{image}: {}", container(&["logs", &id]));
-    let mut observed = vec![];
+    // No shell: only `/bin/ratelimit` runs.
+    let shell = Command::new(cli())
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    let mut observed = vec![format!("shell runs: {}", shell.status.success())];
     let mut client = RateLimitServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
         .await
         .unwrap();
@@ -192,6 +222,9 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
         "http://[::1]:8080/healthcheck",
         "http://127.0.0.1:6070/rlconfig",
         "http://[::1]:6070/rlconfig",
+        // gRPC's port answers HTTP/2 there too.
+        "http://127.0.0.1:8081/",
+        "http://[::1]:8081/",
     ] {
         observed.push(format!("{url}: {}", status_inside(&id, url)));
     }
@@ -214,7 +247,7 @@ async fn observe(image: &str, network: &str, redis: &str, ipv6: bool) -> Vec<Str
 }
 
 /// A minimal HTTP/1.1 GET: the status, if the server answers.
-async fn reqwest_status(url: &str) -> Option<u16> {
+async fn http_status(url: &str) -> Option<u16> {
     let response = http_get(url).await?;
     response.split(' ').nth(1)?.parse().ok()
 }
@@ -252,7 +285,7 @@ async fn the_image_serves_like_upstreams() {
     let suffix = std::process::id();
     let network = format!("ratelimit-image-{suffix}");
     container(&["network", "create", &network]);
-    let _network = Removed("network", network.clone());
+    let _network = Created::Network(network.clone());
     let redis = format!("ratelimit-redis-{suffix}");
     let redis_id = container(&[
         "run",
@@ -266,14 +299,18 @@ async fn the_image_serves_like_upstreams() {
         "--save",
         "",
     ]);
-    let _redis = Removed("container", redis_id);
+    let _redis = Created::Container(redis_id);
     let flush = || container(&["exec", &redis, "redis-cli", "FLUSHALL"]);
     for ipv6 in [false, true] {
         flush();
         let upstream = observe(UPSTREAM_IMAGE, &network, &redis, ipv6).await;
         flush();
         // What upstream shows: the limit applies, IPv6 answers when enabled, a clean stop.
-        assert!(upstream[2].contains("OverLimit"), "{upstream:?}");
+        let calls: Vec<_> = upstream
+            .iter()
+            .filter(|o| o.starts_with("RateLimitResponse"))
+            .collect();
+        assert!(calls[2].contains("OverLimit"), "{upstream:?}");
         let ipv6_status = if ipv6 { "200" } else { "000" };
         assert!(
             upstream.contains(&format!("http://[::1]:8080/healthcheck: {ipv6_status}")),

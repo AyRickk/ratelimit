@@ -5,7 +5,10 @@ FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.99.0-slim-bookworm@sha25
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir ziglang==0.15.2 \
+    && printf '%s\n' \
+        'ziglang==0.15.2 --hash=sha256:806316453d1ede7174ed3fefb8e5348154629089c3bb5fe812dfd0e172fac130 --hash=sha256:edc0aa60ec964a4cf462d40f68d7de242ddf37fd9a80f2afaee6397059463230' \
+        > /tmp/zig.txt \
+    && pip3 install --break-system-packages --no-cache-dir --require-hashes -r /tmp/zig.txt \
     && cargo install --locked cargo-zigbuild@0.24.0 \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /src

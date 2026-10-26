@@ -13,14 +13,20 @@ pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The calls in flight on the server.
 #[derive(Clone, Default)]
-pub struct InFlight(Arc<(AtomicUsize, tokio::sync::Notify)>);
+pub struct InFlight(Arc<Calls>);
+
+#[derive(Default)]
+struct Calls {
+    count: AtomicUsize,
+    none_left: tokio::sync::Notify,
+}
 
 impl InFlight {
     /// Resolves once no call is in flight.
     pub async fn idle(&self) {
         loop {
-            let notified = self.0.1.notified();
-            if self.0.0.load(Ordering::SeqCst) == 0 {
+            let notified = self.0.none_left.notified();
+            if self.0.count.load(Ordering::SeqCst) == 0 {
                 return;
             }
             notified.await;
@@ -28,7 +34,7 @@ impl InFlight {
     }
 
     fn start(&self) -> Call {
-        self.0.0.fetch_add(1, Ordering::SeqCst);
+        self.0.count.fetch_add(1, Ordering::SeqCst);
         Call(self.clone())
     }
 }
@@ -38,8 +44,9 @@ struct Call(InFlight);
 
 impl Drop for Call {
     fn drop(&mut self) {
-        if self.0.0.0.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.0.1.notify_waiters();
+        let calls = &self.0.0;
+        if calls.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            calls.none_left.notify_waiters();
         }
     }
 }
