@@ -718,7 +718,7 @@ impl RedisConnection {
         let connector = tokio_rustls::TlsConnector::from(config.clone());
         match connector.connect(name, stream).await {
             Ok(tls) => Ok(Box::new(tls)),
-            Err(e) => Err(std::io::Error::other(TlsError(tls_error_text(&e)))),
+            Err(e) => Err(std::io::Error::other(TlsError(crate::tls::error_text(&e)))),
         }
     }
 
@@ -1229,53 +1229,6 @@ impl std::fmt::Display for TlsError {
 }
 
 impl std::error::Error for TlsError {}
-
-/// A rustls failure in Go's words where they are common (an unknown authority, a name the
-/// certificate is not for, an expired certificate); rustls' otherwise (docs/parity.md §7).
-fn tls_error_text(error: &std::io::Error) -> String {
-    use rustls::{CertificateError, Error};
-    let rustls = error.get_ref().and_then(|e| e.downcast_ref::<Error>());
-    let x509 = match rustls {
-        Some(Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
-            "certificate signed by unknown authority".to_string()
-        }
-        // `HostnameError`, from the certificate's names.
-        Some(Error::InvalidCertificate(CertificateError::Other(other))) => {
-            return format!("tls: failed to verify certificate: {}", other.0);
-        }
-        Some(Error::InvalidCertificate(CertificateError::NotValidForName)) => {
-            "certificate is not valid for the server's name".to_string()
-        }
-        Some(Error::InvalidCertificate(CertificateError::ExpiredContext { time, not_after })) => {
-            format!(
-                "certificate has expired or is not yet valid: current time {} is after {}",
-                rfc3339(time.as_secs()),
-                rfc3339(not_after.as_secs())
-            )
-        }
-        Some(Error::InvalidCertificate(CertificateError::NotValidYetContext {
-            time,
-            not_before,
-        })) => format!(
-            "certificate has expired or is not yet valid: current time {} is before {}",
-            rfc3339(time.as_secs()),
-            rfc3339(not_before.as_secs())
-        ),
-        Some(Error::InvalidCertificate(
-            CertificateError::Expired | CertificateError::NotValidYet,
-        )) => "certificate has expired or is not yet valid".to_string(),
-        Some(e) => return format!("tls: {e}"),
-        None => return error.to_string(),
-    };
-    format!("tls: failed to verify certificate: x509: {x509}")
-}
-
-/// `time.RFC3339` in UTC, as `x509` writes a validity error's times.
-fn rfc3339(seconds: u64) -> String {
-    jiff::Timestamp::from_second(seconds as i64)
-        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_default()
-}
 
 /// A dialled connection to Redis: TCP or Unix.
 type Stream = Box<dyn Io>;

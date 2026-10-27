@@ -6,7 +6,7 @@
 
 use crate::config::LoadOptions;
 use crate::go;
-use crate::redis::RedisCacheSettings;
+use crate::limiter::CacheSettings;
 use crate::service::{LimitHeaders, ServiceSettings};
 use crate::stats::{
     DogStatsdSettings, Mogrifier, PrometheusSettings, SinkSettings, StatsdProtocol,
@@ -456,8 +456,8 @@ impl Default for Settings {
 
 impl Settings {
     /// What the Redis cache takes from the settings.
-    pub fn redis_cache(&self) -> RedisCacheSettings {
-        RedisCacheSettings {
+    pub fn cache(&self) -> CacheSettings {
+        CacheSettings {
             cache_key_prefix: self.cache_key_prefix.clone(),
             // freecache raises any size below its minimum to that minimum, negative included.
             local_cache_size_in_bytes: match self.local_cache_size_in_bytes {

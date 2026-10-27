@@ -72,7 +72,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `LOCAL_CACHE_SIZE_IN_BYTES` | `0` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `NEAR_LIMIT_RATIO` | `0.8` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `CACHE_KEY_PREFIX` | — | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
-| `BACKEND_TYPE` | `redis` | 🚧 | `redis`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `memcache` not supported yet |
+| `BACKEND_TYPE` | `redis` | ✅ | `redis`, and an invalid value: `the_binary_fails_to_start_like_upstream`; `memcache`: `memcached_serves_like_upstream` |
 | `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` | `false` | ✅ | behaviour: section 4; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
 | `USE_CALENDAR_MONTH_RATE_LIMIT` | `false` | ✅ | `calendar_months_are_counted_like_upstream`: keys, TTLs, resets and the reset header across short, leap and year-end months |
 | `LIMIT_RESPONSE_HEADERS_ENABLED` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
@@ -131,15 +131,15 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_STARTUP_INITIAL_INTERVAL` | `1s` | ✅ | `tests/runner.rs` |
 | `REDIS_STARTUP_MAX_INTERVAL` | `30s` | ✅ | `tests/runner.rs` |
 | `REDIS_STARTUP_MAX_ELAPSED_TIME` | `0` | ✅ | `the_binary_fails_to_start_like_upstream` |
-| `MEMCACHE_HOST_PORT` | — | ⬜ | |
-| `MEMCACHE_MAX_IDLE_CONNS` | `2` | ⬜ | |
-| `MEMCACHE_SRV` | — | ⬜ | |
-| `MEMCACHE_SRV_REFRESH` | `0` | ⬜ | |
-| `MEMCACHE_TLS` | `false` | ⬜ | |
-| `MEMCACHE_TLS_CLIENT_CERT` | — | ⬜ | |
-| `MEMCACHE_TLS_CLIENT_KEY` | — | ⬜ | |
-| `MEMCACHE_TLS_CACERT` | — | ⬜ | |
-| `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ⬜ | |
+| `MEMCACHE_HOST_PORT` | — | ✅ | the servers, resolved at startup (one that does not resolve: none at all), each key on the one its CRC-32 picks: `memcached_keys_are_sharded_like_upstream`, `memcached_failures_are_logged_like_upstream`; with `MEMCACHE_SRV`, refused (`the_binary_fails_to_start_like_upstream`) |
+| `MEMCACHE_MAX_IDLE_CONNS` | `2` | ✅ | the connections kept per server, as gomemcache keeps them: `memcached_keeps_idle_connections_like_gomemcache` |
+| `MEMCACHE_SRV` | — | ✅ | the record's `target:port`, sorted (`memcached/srv.rs` unit tests, on a fake DNS); a record that does not parse or resolve logged and refused at startup (`the_binary_fails_to_start_like_upstream`, its lines compared by hand) |
+| `MEMCACHE_SRV_REFRESH` | `0` | ✅ | the record read again at that interval, the servers replaced, ticks missed dropped: `memcached/srv.rs` unit test, on a fake DNS |
+| `MEMCACHE_TLS` | `false` | ✅ | `memcached_over_tls_is_used_like_upstream`; its files read with the settings whatever the backend, after Redis's: `the_binary_fails_to_start_like_upstream` |
+| `MEMCACHE_TLS_CLIENT_CERT` | — | ✅ | `memcached_over_tls_is_used_like_upstream` |
+| `MEMCACHE_TLS_CLIENT_KEY` | — | ✅ | `memcached_over_tls_is_used_like_upstream` |
+| `MEMCACHE_TLS_CACERT` | — | ✅ | `memcached_over_tls_is_used_like_upstream`, `the_binary_fails_to_start_like_upstream` |
+| `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` | `false` | ✅ | a server on `[::1]` whose certificate is for 127.0.0.1: `memcached_over_tls_is_used_like_upstream` |
 | `SHADOW_MODE` | `false` | ✅ | `tests/service.rs`, `tests/differential.rs`; read by the binary: `tests/settings.rs` |
 | `QUOTA_MODE` | `false` | ✅ | `tests/service.rs`, `tests/differential.rs`; read by the binary: `tests/settings.rs` |
 | `RESPONSE_DYNAMIC_METADATA` | `false` | ✅ | behaviour: `tests/differential.rs`; read by the binary: `tests/settings.rs`, `tests/differential.rs` (`the_binary_*`) |
@@ -218,7 +218,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Redis cluster: the topology from the first seed that dials (`READONLY` sent on its connections unless upstream's dialer is replaced), each of its nodes dialled by address (with `REDIS_AUTH`, without the seed URL's credentials), keys on their slots' nodes, a pool per node, replicas included (`cx_*` count every node's), over TLS too; a node down at startup refused as upstream | ✅ | `a_redis_cluster_serves_like_upstream`, `a_redis_cluster_over_tls_serves_like_upstream`, `a_cluster_node_down_at_startup_is_logged_like_upstream`; `redis/connection.rs` unit tests |
 | Redis sentinel: the first sentinel that dials, the primary and its replicas it names (a pool on each: `cx_*` count theirs), by address with `REDIS_AUTH`; the failures as upstream's (an unknown primary, an unreachable sentinel, its auth refused, a URL without sentinels); after a failover, the new primary within radix's 5 s | ✅ | `a_redis_sentinel_serves_like_upstream`, `sentinel_startup_is_logged_like_upstream` |
 | Redis AWS IAM (ElastiCache): a SigV4-presigned token as each connection's password, reused until 14 min or a minute before the AWS credentials expire; the credentials from the source Go's SDK picks (the environment's keys, a web identity, the profile's keys, role, web identity, SSO, login or process, the container's endpoint, IMDS), cached as its cache does (the container's 5 min early); `AWS_CA_BUNDLE` (or the profile's `ca_bundle`) as the only roots of its AWS calls but the container's | ✅ | `elasticache_iam_tokens_authenticate_like_upstream`, `aws_credentials_are_found_like_upstream`, `expiring_aws_credentials_are_refreshed_like_upstream`, `an_aws_ca_bundle_is_trusted_like_upstream`, `the_binary_fails_to_start_like_upstream`; `redis/aws.rs` unit test |
-| Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
+| Memcached: one `GetMulti` answers the request, then asynchronous increments (`incr`, `add` when absent with the window's expiration, a Unix time past 30 days, `incr` again on a lost race), a refund's `decr`; keys gomemcache refuses (> 250 B, spaces, control characters), values not 32-bit numbers and failures logged, the request answered from what was read; the local cache | ✅ | `memcached_serves_like_upstream`, `memcached_failures_are_logged_like_upstream`, `memcached_keys_are_sharded_like_upstream`, `memcached_over_tls_is_used_like_upstream`; `memcached/client.rs` unit tests |
 
 ## 5. Metrics, logs, traces
 
@@ -230,7 +230,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `ratelimit_server.<method>.total_requests` / `response_time` (health `Check` and `List` included) | ✅ | `server_stats_are_reported_like_upstream` in `tests/differential.rs` (statsd, DogStatsD, Prometheus with the default mapper's histogram); timer lines: `tests/stats.rs`, `tests/dogstatsd.rs` |
 | `runtime.load_attempts`, `runtime.load_failures` (with `EXTRA_TAGS`, `reserved_tag` counted again) | ✅ | `tests/differential.rs` |
 | Gauges (flushed every interval, after the stat generators): `redis_pool.cx_active`, `cx_total`, `cx_local_close`; `localcache.*` (freecache's counts); `runtime.num_values` | ✅ | `gauges_are_reported_like_upstream` in `tests/differential.rs` (at startup; after a Redis restart, ours only: see §7); freecache's counts against freecache itself: `tests/freecache.rs`; gauge lines: `tests/stats.rs`, `tests/dogstatsd.rs` |
-| `memcache.*` | ⬜ | with Memcached |
+| `memcache.*`: `multiget`, `increment`, `decrement`, `add` by `code` (tagged, with `EXTRA_TAGS`), `keys_requested`, `keys_found` | ✅ | `memcached_serves_like_upstream`, `memcached_failures_are_logged_like_upstream` |
 | Exclusive sinks: selection and its fatal error, statsd over **TCP** (default) or UDP, log | ✅ | statsd over TCP: `tests/differential.rs`; selection, UDP datagrams, dropping, reconnecting, log lines: `tests/stats.rs` |
 | DogStatsD (+ mogrifiers, global tags, origin detection) | ✅ | lines and tags: `tests/differential.rs`; datagrams, `int64` values, mogrifier rules and errors, origin detection: `tests/dogstatsd.rs` |
 | Native Prometheus + statsd_exporter mapper: counters, gauges, histograms, TTLs, self-metrics, scrape answers | ✅ | mapper (loading, globs, regexes, templates) against statsd_exporter itself, series, text format, Gather errors, HTTP answers: `tests/differential.rs`; what panics upstream: `tests/prometheus.rs` |
@@ -239,7 +239,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `EXTRA_TAGS`, `STATS_FLUSH_INTERVAL` | ✅ | `EXTRA_TAGS`, `reserved_tag`: `tests/differential.rs`, `tests/stats.rs`; flush interval: `tests/stats.rs` |
 | logrus' text (and terminal) and JSON (`@timestamp`, `@message`) formats, in Go's local time zone; the info, warning, error and fatal lines of the features ported (runner, sinks, runtime directory, Redis startup and pool, config, listeners, `/json`, local cache) | ✅ | `tests/differential.rs` (`logs_are_written_like_upstream`, `redis_startup_is_logged_like_upstream`, `a_late_redis_is_logged_like_upstream`, `the_binary_fails_to_start_like_upstream`), `log.rs` unit tests |
 | Debug lines (`LOG_LEVEL=debug`), best effort (D3): config loading, each lookup, the cache and local cache, requests, statuses and responses as Go's `%+v` (prototext), errors, `/json`, the runtime and config update loops, health, Prometheus flushes. Today they match upstream's; they may change for the extensions | ✅ | `tests/differential.rs` (`debug_lines_are_written_like_upstream`, `prometheus_flushes_are_logged_like_upstream`, `messages_are_printed_like_upstream`) |
-| OTLP traces, over gRPC or HTTP (gzip, TLS, client certificates): the resource (semconv 1.7 schema, `service.*`, `OTEL_RESOURCE_ATTRIBUTES`); otelgrpc 0.70's server span on every gRPC method (semconv 1.43 attributes, `OTEL_SEMCONV_STABILITY_OPT_IN` `rpc/old` and `rpc/dup`, status code and error status, flags); `ShouldRateLimit Execution` and `Redis Pipeline Execution` beside it; `/json`'s three root spans with `NewJsonHandler Remaining Execution`; W3C TraceContext (with `tracestate`) and B3 (single and multiple, winning, deferred not sampled) extraction; `ParentBased(TraceIDRatioBased)` sampling; the span limits (`OTEL_*ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_*ATTRIBUTE_COUNT_LIMIT`); only registered methods traced; the batch processor (`OTEL_BSP_*`) and the shutdown flush; an HTTP exporter given TLS settings for an insecure endpoint is fatal | ✅ | `traces_are_exported_like_upstream` in `tests/differential.rs`; parsing: unit tests in `trace/propagation.rs`, `trace/export.rs`, `trace/grpc.rs` |
+| OTLP traces, over gRPC or HTTP (gzip, TLS, client certificates): the resource (semconv 1.7 schema, `service.*`, `OTEL_RESOURCE_ATTRIBUTES`); otelgrpc 0.70's server span on every gRPC method (semconv 1.43 attributes, `OTEL_SEMCONV_STABILITY_OPT_IN` `rpc/old` and `rpc/dup`, status code and error status, flags); `ShouldRateLimit Execution` and `Redis Pipeline Execution` (with Memcached, `Memcached Fetch Execution`) beside it; `/json`'s three root spans with `NewJsonHandler Remaining Execution`; W3C TraceContext (with `tracestate`) and B3 (single and multiple, winning, deferred not sampled) extraction; `ParentBased(TraceIDRatioBased)` sampling; the span limits (`OTEL_*ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_*ATTRIBUTE_COUNT_LIMIT`); only registered methods traced; the batch processor (`OTEL_BSP_*`) and the shutdown flush; an HTTP exporter given TLS settings for an insecure endpoint is fatal | ✅ | `traces_are_exported_like_upstream`, `memcached_calls_are_traced_like_upstream` in `tests/differential.rs`; parsing: unit tests in `trace/propagation.rs`, `trace/export.rs`, `trace/grpc.rs` |
 
 ## 6. Image and deployment
 
@@ -314,6 +314,13 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A cache name that is not a host (`/`, a space, …) fails each connection's token (`building the ElastiCache IAM authentication request`) or signs part of it as a path | signed as the host as it is | ElastiCache names are `[a-z0-9-]` |
 | With `AWS_DEFAULT_PROFILE`, the container's and IMDS' own settings (`ec2_metadata_service_endpoint`, …) are read from that profile | from `AWS_PROFILE`'s, or `default` | aws-config reads them so; the credentials' profile is Go's |
 | The role session name Go sends by default (`aws-go-sdk-<ns>`, a web identity's `<ns>`) is the time of the first request | of the startup | the same form; only the time differs |
+| On Memcached, the healthcheck and `grpc.health.v1` never report healthy: the Redis component starts unhealthy and only Redis marks it | healthy once the Memcached client is made | maintainer's decision: a service behind health probes could not run on Memcached; `memcached_serves_like_upstream` |
+| Memcached over TLS on a Unix socket sends the socket's path as the TLS server name (which a server may refuse) | sends `memcached.invalid`, so the certificate is only accepted with `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` (as upstream's) | rustls names a server by DNS name or IP only |
+| `MEMCACHE_HOST_PORT` accepts what `net.ResolveTCPAddr` does: an empty host (the local system), an empty port (0), a service name for the port | such an entry does not resolve: no server at all | none is a memcached address one writes |
+| `LookupSRV` refuses an answer with a target that is not a domain name; gomemcache fails on a reply line over 4 KiB (`bufio: buffer full`), reads a negative item size, and panics on an `incr` reply of a bare `\n` | such targets kept; no line limit; a negative size and a bare `\n` are errors | servers that do not answer as memcached and DNS do (D1 for the panic) |
+| A failed `MEMCACHE_SRV` lookup reads as Go's resolver words it (`lookup <name> on <server>: no such host` for a name without such records) | the same for a name without records; hickory-resolver's words otherwise (a timeout, a refused query) | best effort (D3) for the rarer failures |
+| gomemcache's read and write errors on a connection read as Go's `net.OpError` (`read tcp <local>-><remote>: i/o timeout`) | the same for timeouts and system errors; rustls' words for TLS alerts during an operation | best effort (D3) |
+| Memcached's background increments run on goroutines that a busy service reuses, one task after another | a task per request | the order of increments across requests is not atomic anyway (D24) |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |
@@ -366,5 +373,5 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | The exporter's `User-Agent` is `OTel OTLP Exporter Go/1.45.0` (and grpc-go's) | `ratelimit/<version>` (and tonic's) | it names the software that sends |
 | The HTTP exporter honours `HTTPS_PROXY`/`HTTP_PROXY` and negotiates HTTP/2 over TLS | no proxy; HTTP/1.1 | best effort (D3) |
 | Baggage is extracted and the propagators can inject | neither | nothing reads baggage and the service makes no traced call |
-| Memcached's `Memcached Fetch Execution` span and the CLI client's tracing | not yet | with Memcached and the client |
+| The CLI client's tracing | not yet | with the client |
 | On what upstream panics on (D1), the debug lines it writes before the panic (the cache's, for a client limit with an unknown unit) | the request stops at its check, after `caught error during call: <error>` | D1 |

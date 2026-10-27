@@ -37,5 +37,5 @@ The goal and every design decision are in `docs/design.md`; what is already prov
 
 ### Running tests
 
-- `RATELIMIT_REQUIRE_DIFFERENTIAL=1 cargo test --workspace` needs `go` and `redis-server` on the PATH. Without the variable, differential tests are skipped when a tool is missing.
+- `RATELIMIT_REQUIRE_DIFFERENTIAL=1 cargo test --workspace` needs `go`, `redis-server` and `memcached` on the PATH (`RATELIMIT_MEMCACHED_SERVER=<path>` for another memcached). Without the variable, differential tests are skipped when a tool is missing.
 - `RATELIMIT_REDIS_SERVER=<path to valkey-server>` runs them against Valkey (built from source if it conflicts with Homebrew's `redis`).

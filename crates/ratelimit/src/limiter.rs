@@ -321,3 +321,36 @@ pub(crate) fn hits_to_count(
         RequestState::SomeGoingOver => 0,
     }
 }
+
+/// What a cache (Redis, Memcached) takes from the settings.
+#[derive(Debug, Clone)]
+pub struct CacheSettings {
+    /// `CACHE_KEY_PREFIX`.
+    pub cache_key_prefix: String,
+    /// `LOCAL_CACHE_SIZE_IN_BYTES`: memory for remembering keys over their limit, so later
+    /// requests skip the backend. 0 disables it.
+    pub local_cache_size_in_bytes: usize,
+    /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: Redis's only, as upstream's.
+    pub stop_cache_key_increment_when_overlimit: bool,
+    /// `NEAR_LIMIT_RATIO`: the share of a limit past which hits count as `near_limit`
+    /// (upstream's default: 0.8).
+    pub near_limit_ratio: f32,
+    /// `EXPIRATION_JITTER_MAX_SECONDS`: each key's TTL gets a random extra in `[0, max)`,
+    /// so that keys do not all expire at once; none at 0 or less.
+    pub expiration_jitter_max_seconds: i64,
+    /// `USE_CALENDAR_MONTH_RATE_LIMIT`: a month is the UTC calendar month, not 30 days.
+    pub use_calendar_month: bool,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            cache_key_prefix: String::new(),
+            local_cache_size_in_bytes: 0,
+            stop_cache_key_increment_when_overlimit: false,
+            near_limit_ratio: 0.8,
+            expiration_jitter_max_seconds: 0,
+            use_calendar_month: false,
+        }
+    }
+}

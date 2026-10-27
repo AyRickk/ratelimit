@@ -107,6 +107,8 @@ pub struct Stats {
     sink: SinkCell,
     /// `EXTRA_TAGS`, serialized as gostats appends them to every name.
     tags: String,
+    /// `EXTRA_TAGS` themselves, their values' `.`, `:` and `|` made `_`.
+    tag_set: BTreeMap<String, String>,
     /// How many `EXTRA_TAGS` keys are reserved words.
     reserved_tags: u64,
 }
@@ -128,6 +130,18 @@ impl Scope {
 }
 
 const SERVICE: &str = "ratelimit.service";
+
+/// `ReplaceChars`: a tag's value with `.`, `:` and `|` made `_`.
+fn tag_value(value: &str) -> String {
+    value.replace(['.', ':', '|'], "_")
+}
+
+/// `TagSet.Serialize`: `.__key=value` for each tag, in their order.
+fn serialize_tags(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(key, value)| format!(".__{key}={value}"))
+        .collect()
+}
 
 /// Tag keys gostats counts in `reserved_tag` when a scope uses them.
 const RESERVED_TAG_WORDS: &[&str] = &[
@@ -157,12 +171,14 @@ impl Stats {
     /// counts once in `reserved_tag`, empty keys and values are left out, and `.`, `:` and `|`
     /// in values become `_`.
     pub fn new(extra_tags: &BTreeMap<String, String>) -> Self {
+        let tag_set: BTreeMap<String, String> = extra_tags
+            .iter()
+            .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            .map(|(key, value)| (key.clone(), tag_value(value)))
+            .collect();
         let stats = Self {
-            tags: extra_tags
-                .iter()
-                .filter(|(key, value)| !key.is_empty() && !value.is_empty())
-                .map(|(key, value)| format!(".__{key}={}", value.replace(['.', ':', '|'], "_")))
-                .collect(),
+            tags: serialize_tags(&tag_set),
+            tag_set,
             ..Default::default()
         };
         let reserved_tags = extra_tags
@@ -195,6 +211,23 @@ impl Stats {
     /// The counter `name` of `scope`, with the tags.
     pub fn scope_counter(&self, scope: &Scope, name: &str) -> Counter {
         self.counter(&format!("{}.{name}{}", scope.name, self.tags))
+    }
+
+    /// `NewCounterWithTags(name, tags)` of `scope`: `tags` merged into the store's, theirs
+    /// winning, sorted by key.
+    pub fn scope_counter_with_tags(
+        &self,
+        scope: &Scope,
+        name: &str,
+        tags: &[(&str, &str)],
+    ) -> Counter {
+        let mut merged = self.tag_set.clone();
+        for (key, value) in tags {
+            if !key.is_empty() && !value.is_empty() {
+                merged.insert(key.to_string(), tag_value(value));
+            }
+        }
+        self.counter(&format!("{}.{name}{}", scope.name, serialize_tags(&merged)))
     }
 
     /// The gauge `name` of `scope`, with the tags, created at 0 the first time.
