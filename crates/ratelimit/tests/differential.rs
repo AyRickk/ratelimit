@@ -4664,7 +4664,8 @@ async fn the_binary_fails_to_start_like_upstream() {
         // A `logger.Fatal` upstream: the same logrus lines.
         let fatal = upstream.contains("level=fatal");
         if fatal {
-            let lines = |stderr: &str| logrus_lines(&stderr.replace("\n", "\\n"), &[]);
+            // Line by line: each line's time masked.
+            let lines = |stderr: &str| logrus_lines(stderr, &[]);
             assert_eq!(lines(&ours), lines(&upstream), "{environment:?}");
         }
     }
