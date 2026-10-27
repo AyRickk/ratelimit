@@ -4014,6 +4014,42 @@ async fn quoted_scalars_continue_on_any_indentation_like_upstream() {
     h.assert_same_redis().await;
 }
 
+/// yaml.v2 reads a flow collection continued on lines less indented than its key (libyaml
+/// does not check a flow collection's indentation either), and refuses what libyaml refuses: an
+/// implicit key over several lines, an anchor with other characters than `[A-Za-z0-9_-]`.
+#[tokio::test]
+async fn flow_collections_continue_on_any_indentation_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let mut h = Harness::start(TOKENS).await;
+    for config in [
+        "domain: d\ndescriptors: [{\"ke\ny\": k}]\n",
+        "domain: d\ndescriptors:\n  - \"ke\n  y\": k\n",
+        "domain: &d.x d\n",
+        "domain: &x: d\n",
+    ] {
+        assert!(h.load_config(config).await.is_err(), "{config:?}");
+    }
+    // An anchor's name ends at its first char out of `[A-Za-z0-9_-]`, the rest read on; a
+    // document after the first is not read.
+    h.load_config("domain: &d:x d\n").await.unwrap();
+    h.call(request(":x d", &[&[("k", "v")]])).await.unwrap();
+    h.load_config("domain: d\n---\nbad: &a.b c\n")
+        .await
+        .unwrap();
+    let config = "domain: d\ndescriptors: [{key: k,\nrate_limit: {unit: second,\nrequests_per_unit: 1}},\n  {key: &n-1 j, value: [v,\nw], rate_limit: {unit: second, requests_per_unit: 2}}]\n";
+    let config = config.replace("value: [v,\nw]", "value: \"v\nw\"");
+    h.load_config(&config).await.unwrap();
+    h.at(1_700_000_000).await;
+    for _ in 0..3 {
+        h.call(request("d", &[&[("k", "x")], &[("j", "v w")]]))
+            .await
+            .unwrap();
+    }
+    h.assert_same_redis().await;
+}
+
 /// yaml.v2's reader refuses control characters, and skips a byte order mark.
 #[tokio::test]
 async fn config_characters_are_read_like_upstream() {
