@@ -38,6 +38,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 x509-parser = "0.18"
 bytes = "1"
+crc32fast = "1"
+hickory-resolver = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 flate2 = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }

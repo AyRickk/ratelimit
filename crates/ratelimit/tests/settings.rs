@@ -22,18 +22,15 @@ fn the_cache_takes_its_settings() {
         ("STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT", "true"),
         ("NEAR_LIMIT_RATIO", "0.5"),
     ]);
-    let cache = s.redis_cache();
+    let cache = s.cache();
     assert_eq!(cache.cache_key_prefix, "p_");
     assert_eq!(cache.local_cache_size_in_bytes, 1_048_576);
     assert!(cache.stop_cache_key_increment_when_overlimit);
     assert_eq!(cache.near_limit_ratio, 0.5);
     // freecache raises a negative size to its minimum: the cache still exists.
-    let negative = settings(&[("LOCAL_CACHE_SIZE_IN_BYTES", "-1")]).redis_cache();
+    let negative = settings(&[("LOCAL_CACHE_SIZE_IN_BYTES", "-1")]).cache();
     assert!(negative.local_cache_size_in_bytes > 0);
-    assert_eq!(
-        Settings::default().redis_cache().local_cache_size_in_bytes,
-        0
-    );
+    assert_eq!(Settings::default().cache().local_cache_size_in_bytes, 0);
 }
 
 #[test]

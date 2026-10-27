@@ -50,6 +50,11 @@ pub const REDIS: Scope = Scope {
     name: "redis.fixedCacheImpl",
     version: "",
 };
+/// The Memcached cache's spans (`Memcached Fetch Execution`).
+pub const MEMCACHED: Scope = Scope {
+    name: "memcached.cacheImpl",
+    version: "",
+};
 /// `/json`'s span (`NewJsonHandler Remaining Execution`).
 pub const SERVER: Scope = Scope {
     name: "ratelimit server",

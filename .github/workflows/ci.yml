@@ -44,6 +44,8 @@ jobs:
           echo "${VALKEY_SHA256}  ${archive}.tar.gz" | sha256sum --check
           tar -xzf "${archive}.tar.gz"
           echo "RATELIMIT_REDIS_SERVER=$PWD/${archive}/bin/valkey-server" >> "$GITHUB_ENV"
+      - name: Install memcached
+        run: sudo apt-get update && sudo apt-get install -y memcached
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
         run: |

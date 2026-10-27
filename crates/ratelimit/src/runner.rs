@@ -7,6 +7,7 @@ use crate::grpc;
 use crate::health::{self, HealthChecker, HealthService};
 use crate::limiter::SystemClock;
 use crate::log::{self, Failure};
+use crate::memcached::MemcacheCache;
 use crate::redis::{RedisCache, RedisConnection, StartupBackoff};
 use crate::runtime::{self, FileProvider};
 use crate::service::RateLimitService;
@@ -183,6 +184,7 @@ impl PoolStats {
 pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> {
     let SettingsTls {
         redis: redis_tls,
+        memcache: memcache_tls,
         grpc: grpc_tls,
         xds: xds_tls,
     } = settings_tls(&settings)?;
@@ -252,7 +254,7 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     });
 
     // runner.go: the local cache, whose counts NewServer reports as gauges.
-    let local_cache_bytes = settings.redis_cache().local_cache_size_in_bytes;
+    let local_cache_bytes = settings.cache().local_cache_size_in_bytes;
     let local_cache = (local_cache_bytes > 0)
         .then(|| Arc::new(crate::local_cache::LocalCache::new(local_cache_bytes)));
     if let Some(local_cache) = &local_cache {
@@ -263,38 +265,89 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
         );
     }
 
-    // createLimiter: Redis, healthy once connected.
-    // The per-second pool comes first, as in `NewRateLimiterCacheImplFromSettings`.
-    let (per_second_connection, connection) = match settings.backend_type.as_str() {
+    // createLimiter: Redis, healthy once connected; or Memcached.
+    let clock = Arc::new(SystemClock);
+    // The Redis replicas' pools live as long as the service.
+    let mut _replicas = None;
+    let cache = match settings.backend_type.as_str() {
         "redis" | "" => {
-            // fred would open a Unix socket in clear: TLS over one is refused.
-            let with_tls = |mut connection: RedisConnection, tls: bool| {
-                connection.tls = redis_tls.clone().filter(|_| tls);
-                match (connection.tls.is_some(), connection.network.as_str()) {
-                    (true, "unix") => Err(format!(
-                        "{}_TLS over a Unix socket is not supported",
-                        connection.prefix
-                    )),
-                    _ => Ok(connection),
-                }
+            // The per-second pool comes first, as in `NewRateLimiterCacheImplFromSettings`.
+            let (per_second_connection, connection) = {
+                // fred would open a Unix socket in clear: TLS over one is refused.
+                let with_tls = |mut connection: RedisConnection, tls: bool| {
+                    connection.tls = redis_tls.clone().filter(|_| tls);
+                    match (connection.tls.is_some(), connection.network.as_str()) {
+                        (true, "unix") => Err(format!(
+                            "{}_TLS over a Unix socket is not supported",
+                            connection.prefix
+                        )),
+                        _ => Ok(connection),
+                    }
+                };
+                (
+                    settings
+                        .redis_persecond
+                        .then(|| RedisConnection::per_second_from_settings(&settings))
+                        .transpose()?
+                        .map(|c| with_tls(c, settings.redis_persecond_tls))
+                        .transpose()?,
+                    with_tls(
+                        RedisConnection::from_settings(&settings)?,
+                        settings.redis_tls,
+                    )?,
+                )
             };
-            (
-                settings
-                    .redis_persecond
-                    .then(|| RedisConnection::per_second_from_settings(&settings))
-                    .transpose()?
-                    .map(|c| with_tls(c, settings.redis_persecond_tls))
-                    .transpose()?,
-                with_tls(
-                    RedisConnection::from_settings(&settings)?,
-                    settings.redis_tls,
-                )?,
-            )
+            // Each pool connects as `newClientImpl` does, the per-second one first, and makes Redis
+            // healthy once connected.
+            let active_health = settings.redis_health_check_active_connection;
+            let backoff = StartupBackoff::from_settings(&settings);
+            // The pool's stats exist before it connects (`newPoolStats`), so are flushed meanwhile.
+            let mut per_second = None;
+            if let Some(connection) = per_second_connection {
+                let pool_stats =
+                    PoolStats::new(&stats, &server_scope.scope("redis_per_second_pool"));
+                let connected = connection
+                    .connect(&backoff, shutting_down(signals.stop.clone()))
+                    .await?;
+                pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
+                let _ = health.ok(health::REDIS);
+                per_second = Some(connected);
+            }
+            let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
+            let connected = connection
+                .connect(&backoff, shutting_down(signals.stop.clone()))
+                .await?;
+            pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
+            let _ = health.ok(health::REDIS);
+            let pool = connected.pool.clone();
+            _replicas = Some((connected, per_second.as_ref().map(|c| c.replicas.clone())));
+            let per_second = per_second.map(|c| c.pool);
+            let mut cache = RedisCache::with_local_cache(
+                pool,
+                clock.clone(),
+                stats.clone(),
+                settings.cache(),
+                local_cache,
+            );
+            if let Some(pool) = per_second {
+                cache = cache.with_per_second(pool);
+            }
+            Backend::Redis(cache)
         }
         "memcache" => {
-            return Err("BACKEND_TYPE=memcache is not supported yet"
-                .to_string()
-                .into());
+            let cache = memcache_cache(
+                &settings,
+                memcache_tls,
+                &stats,
+                &server_scope,
+                clock.clone(),
+                local_cache,
+            )
+            .await?;
+            // Upstream's health starts with Redis unhealthy and only Redis marks it healthy:
+            // never healthy on Memcached. Ours is (docs/parity.md §7).
+            let _ = health.ok(health::REDIS);
+            Backend::Memcache(cache)
         }
         other => {
             return Err(Failure::Fatal(format!(
@@ -302,42 +355,6 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
             )));
         }
     };
-    // Each pool connects as `newClientImpl` does, the per-second one first, and makes Redis
-    // healthy once connected.
-    let active_health = settings.redis_health_check_active_connection;
-    let backoff = StartupBackoff::from_settings(&settings);
-    // The pool's stats exist before it connects (`newPoolStats`), so are flushed meanwhile.
-    let mut per_second = None;
-    if let Some(connection) = per_second_connection {
-        let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_per_second_pool"));
-        let connected = connection
-            .connect(&backoff, shutting_down(signals.stop.clone()))
-            .await?;
-        pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
-        let _ = health.ok(health::REDIS);
-        per_second = Some(connected);
-    }
-    let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
-    let connected = connection
-        .connect(&backoff, shutting_down(signals.stop.clone()))
-        .await?;
-    pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
-    let _ = health.ok(health::REDIS);
-    // The replicas' pools live as long as the service.
-    let pool = connected.pool.clone();
-    let _replicas = (connected, per_second.as_ref().map(|c| c.replicas.clone()));
-    let per_second = per_second.map(|c| c.pool);
-    let clock = Arc::new(SystemClock);
-    let mut cache = RedisCache::with_local_cache(
-        pool,
-        clock.clone(),
-        stats.clone(),
-        settings.redis_cache(),
-        local_cache,
-    );
-    if let Some(pool) = per_second {
-        cache = cache.with_per_second(pool);
-    }
 
     // NewService: loads each config the provider sends (with
     // HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED, healthy only with domains); waits for the first
@@ -554,10 +571,11 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     served.map_err(Failure::from)
 }
 
-/// The TLS files `NewSettings` loads: Redis's, the gRPC server's, then the xDS client's (and
-/// Memcached's, not supported yet); an error is what upstream panics with.
+/// The TLS files `NewSettings` loads: Redis's, Memcached's, the gRPC server's, then the xDS
+/// client's; an error is what upstream panics with.
 struct SettingsTls {
     redis: Option<crate::redis::Tls>,
+    memcache: Option<Arc<rustls::ClientConfig>>,
     grpc: Option<crate::grpc_tls::ServerTls>,
     xds: Option<rustls::ClientConfig>,
 }
@@ -565,6 +583,19 @@ struct SettingsTls {
 fn settings_tls(settings: &Settings) -> Result<SettingsTls, String> {
     Ok(SettingsTls {
         redis: crate::redis::tls::from_settings(settings)?.map(crate::redis::Tls),
+        // `MemcacheTlsConfig`.
+        memcache: settings
+            .memcache_tls
+            .then(|| {
+                crate::tls::server_ca_client(
+                    &settings.memcache_tls_client_cert,
+                    &settings.memcache_tls_client_key,
+                    &settings.memcache_tls_cacert,
+                    settings.memcache_tls_skip_hostname_verification,
+                )
+            })
+            .transpose()?
+            .map(Arc::new),
         grpc: crate::grpc_tls::from_settings(settings)?,
         // `ConfigGrpcXdsServerTlsConfig`.
         xds: settings
@@ -579,6 +610,88 @@ fn settings_tls(settings: &Settings) -> Result<SettingsTls, String> {
             })
             .transpose()?,
     })
+}
+
+/// The cache `BACKEND_TYPE` names.
+enum Backend {
+    Redis(RedisCache),
+    Memcache(MemcacheCache),
+}
+
+impl crate::service::RateLimitCache for Backend {
+    async fn do_limit(
+        &self,
+        request: &ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest,
+        limits: &[Option<crate::config::RateLimit>],
+    ) -> Result<
+        Vec<ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::DescriptorStatus>,
+        crate::service::CacheError,
+    > {
+        match self {
+            Backend::Redis(cache) => cache.do_limit(request, limits).await,
+            Backend::Memcache(cache) => cache.do_limit(request, limits).await,
+        }
+    }
+}
+
+/// `newMemcacheFromSettings`: the servers of `MEMCACHE_HOST_PORT`, or of `MEMCACHE_SRV`
+/// (refreshed every `MEMCACHE_SRV_REFRESH`), over TLS with `MEMCACHE_TLS`.
+async fn memcache_cache(
+    settings: &Settings,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    stats: &Arc<Stats>,
+    scope: &crate::stats::Scope,
+    clock: Arc<SystemClock>,
+    local_cache: Option<Arc<crate::local_cache::LocalCache>>,
+) -> Result<MemcacheCache, String> {
+    use crate::memcached::{client, srv};
+    let srv_name = &settings.memcache_srv;
+    if !srv_name.is_empty() && !settings.memcache_host_port.is_empty() {
+        return Err("Both MEMCACHE_HOST_PORT and MEMCACHE_SRV are set".into());
+    }
+    let client = if srv_name.is_empty() {
+        let servers = &settings.memcache_host_port;
+        crate::debug!("Using MEMCACHE_HOST_PORT: [{}]", servers.join(" "));
+        // `memcache.New` ignores servers that do not resolve: then it has none.
+        let resolved = client::resolve(servers).await.unwrap_or_default();
+        Arc::new(client::Client::new(
+            resolved,
+            settings.memcache_max_idle_conns,
+            tls,
+        ))
+    } else {
+        crate::debug!("Using MEMCACHE_SRV: {srv_name}");
+        let unable = || {
+            let text = "Unable to fetch servers from SRV";
+            log::error(text);
+            text.to_string()
+        };
+        let resolved = srv::fetch(srv_name).await.ok_or_else(unable)?;
+        let client = Arc::new(client::Client::new(
+            resolved,
+            settings.memcache_max_idle_conns,
+            tls,
+        ));
+        let refresh = crate::settings::duration(settings.memcache_srv_refresh);
+        if refresh.is_zero() {
+            crate::debug!("not periodically refreshing memcached hosts");
+        } else {
+            log::info(&format!(
+                "refreshing memcache hosts every: {} milliseconds",
+                refresh.as_millis()
+            ));
+            srv::refresh_every(client.clone(), srv_name.clone(), refresh);
+        }
+        client
+    };
+    Ok(MemcacheCache::new(
+        client,
+        clock,
+        stats.clone(),
+        scope,
+        settings.cache(),
+        local_cache,
+    ))
 }
 
 /// The config provider `CONFIG_TYPE` names.

@@ -11,8 +11,9 @@ use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use ratelimit::config::{self, ConfigFile, LoadOptions};
 use ratelimit::grpc;
+use ratelimit::limiter::CacheSettings;
 use ratelimit::limiter::Clock;
-use ratelimit::redis::{RedisCache, RedisCacheSettings};
+use ratelimit::redis::RedisCache;
 use ratelimit::service::{LimitHeaders, RateLimitService, ServiceSettings};
 use ratelimit::stats::prometheus::{self, PrometheusSettings, PrometheusSink};
 use ratelimit::stats::{
@@ -634,7 +635,7 @@ struct Harness {
 /// Everything both sides are configured with.
 #[derive(Default)]
 struct Settings {
-    cache: RedisCacheSettings,
+    cache: CacheSettings,
     /// `REDIS_PERSECOND`: limits in seconds in a second Redis on each side.
     per_second: bool,
     service: ServiceSettings,
@@ -1048,18 +1049,18 @@ impl StatsdServer {
 
 impl Harness {
     async fn start(config: &str) -> Self {
-        Self::with_settings(config, RedisCacheSettings::default()).await
+        Self::with_settings(config, CacheSettings::default()).await
     }
 
     async fn with_prefix(config: &str, prefix: &str) -> Self {
-        let settings = RedisCacheSettings {
+        let settings = CacheSettings {
             cache_key_prefix: prefix.to_string(),
             ..Default::default()
         };
         Self::with_settings(config, settings).await
     }
 
-    async fn with_settings(config: &str, cache: RedisCacheSettings) -> Self {
+    async fn with_settings(config: &str, cache: CacheSettings) -> Self {
         let settings = Settings {
             cache,
             ..Default::default()
@@ -1429,7 +1430,7 @@ descriptors:
 ";
     for calendar in [true, false] {
         let settings = Settings {
-            cache: RedisCacheSettings {
+            cache: CacheSettings {
                 local_cache_size_in_bytes: 1 << 20,
                 use_calendar_month: calendar,
                 ..Default::default()
@@ -1488,7 +1489,7 @@ descriptors:
     for stop_increment in [false, true] {
         let settings = Settings {
             per_second: true,
-            cache: RedisCacheSettings {
+            cache: CacheSettings {
                 stop_cache_key_increment_when_overlimit: stop_increment,
                 ..Default::default()
             },
@@ -1806,7 +1807,7 @@ async fn stop_cache_key_increment_when_overlimit_like_upstream() {
     if !tools_available() {
         return;
     }
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         stop_cache_key_increment_when_overlimit: true,
         ..Default::default()
     };
@@ -1831,7 +1832,7 @@ async fn local_cache_skips_redis_for_keys_over_the_limit_like_upstream() {
     if !tools_available() {
         return;
     }
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         local_cache_size_in_bytes: 1024 * 1024,
         ..Default::default()
     };
@@ -1861,7 +1862,7 @@ async fn local_cache_and_stop_increment_together_like_upstream() {
     if !tools_available() {
         return;
     }
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         local_cache_size_in_bytes: 1024 * 1024,
         stop_cache_key_increment_when_overlimit: true,
         ..Default::default()
@@ -1883,7 +1884,7 @@ async fn keys_too_long_for_freecache_are_never_cached_like_upstream() {
         return;
     }
     // At freecache's 512 KiB minimum, entries over 2048 / 4 - 24 = 488 bytes are refused.
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         local_cache_size_in_bytes: 1,
         ..Default::default()
     };
@@ -1903,7 +1904,7 @@ async fn unreadable_counters_fail_like_upstream() {
     if !tools_available() {
         return;
     }
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         stop_cache_key_increment_when_overlimit: true,
         ..Default::default()
     };
@@ -1927,7 +1928,7 @@ async fn stop_increment_branches_like_upstream() {
     if !tools_available() {
         return;
     }
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         local_cache_size_in_bytes: 1024 * 1024,
         stop_cache_key_increment_when_overlimit: true,
         ..Default::default()
@@ -1956,7 +1957,7 @@ async fn a_full_local_cache_evicts_like_freecache() {
         return;
     }
     // freecache's minimum: 256 segments of 2 KiB, about 45 of these keys each.
-    let settings = RedisCacheSettings {
+    let settings = CacheSettings {
         local_cache_size_in_bytes: 1,
         ..Default::default()
     };
@@ -2371,7 +2372,7 @@ async fn near_and_over_limit_hits_are_split_like_upstream() {
         return;
     }
     let settings = Settings {
-        cache: RedisCacheSettings {
+        cache: CacheSettings {
             near_limit_ratio: 0.29,
             ..Default::default()
         },
@@ -2415,7 +2416,7 @@ async fn uncounted_hits_wrap_in_the_stats_like_upstream() {
         return;
     }
     let settings = Settings {
-        cache: RedisCacheSettings {
+        cache: CacheSettings {
             near_limit_ratio: 0.29,
             stop_cache_key_increment_when_overlimit: true,
             ..Default::default()
@@ -2566,7 +2567,7 @@ async fn a_near_threshold_past_the_limit_wraps_like_upstream() {
         return;
     }
     let settings = Settings {
-        cache: RedisCacheSettings {
+        cache: CacheSettings {
             near_limit_ratio: 1.5,
             ..Default::default()
         },
@@ -2731,7 +2732,7 @@ async fn counters_are_exposed_to_prometheus_like_upstream() {
         return;
     }
     let settings = Settings {
-        cache: RedisCacheSettings {
+        cache: CacheSettings {
             local_cache_size_in_bytes: 1024 * 1024,
             ..Default::default()
         },
@@ -4550,6 +4551,14 @@ async fn the_binary_fails_to_start_like_upstream() {
         (iam(&[("REDIS_PERSECOND", "true"), ("REDIS_PERSECOND_AWS_IAM_AUTH", "true")]), "REDIS_PERSECOND_AWS_IAM_CACHE_NAME and REDIS_PERSECOND_AWS_IAM_USER_ID are required when REDIS_PERSECOND_AWS_IAM_AUTH is enabled".into()),
         (iam(&[("REDIS_AWS_IAM_USER_ID", "")]), "REDIS_AWS_IAM_CACHE_NAME and REDIS_AWS_IAM_USER_ID are required when REDIS_AWS_IAM_AUTH is enabled".into()),
         (iam(&[("AWS_REGION", "")]), "REDIS_AWS_IAM_REGION is required when the AWS SDK cannot resolve a region".into()),
+        // Memcached: its TLS files, read with the settings whatever the backend, after Redis's;
+        // its servers from one place; an SRV record that does not parse or resolve.
+        (vec![("REDIS_TLS", "true".into()), ("REDIS_TLS_CACERT", "/nowhere/redis.pem".into()), ("MEMCACHE_TLS", "true".into()), ("MEMCACHE_TLS_CACERT", "/nowhere/mc.pem".into())], "failed to read file: /nowhere/redis.pem: open /nowhere/redis.pem: no such file or directory".into()),
+        (vec![("MEMCACHE_TLS", "true".into()), ("MEMCACHE_TLS_CACERT", "/nowhere/mc.pem".into())], "failed to read file: /nowhere/mc.pem: open /nowhere/mc.pem: no such file or directory".into()),
+        (vec![("MEMCACHE_TLS", "true".into()), ("MEMCACHE_TLS_CACERT", "/nowhere/mc.pem".into()), ("GRPC_SERVER_USE_TLS", "true".into()), ("GRPC_CLIENT_TLS_CACERT", "/nowhere/grpc.pem".into())], "failed to read file: /nowhere/mc.pem: open /nowhere/mc.pem: no such file or directory".into()),
+        (vec![("BACKEND_TYPE", "memcache".into()), ("MEMCACHE_HOST_PORT", "127.0.0.1:1".into()), ("MEMCACHE_SRV", "_memcache._tcp.example.com".into())], "Both MEMCACHE_HOST_PORT and MEMCACHE_SRV are set".into()),
+        (vec![("BACKEND_TYPE", "memcache".into()), ("MEMCACHE_SRV", "memcache.example.com".into())], "Unable to fetch servers from SRV".into()),
+        (vec![("BACKEND_TYPE", "memcache".into()), ("MEMCACHE_SRV", "_memcache._tcp.nosuch.invalid".into())], "Unable to fetch servers from SRV".into()),
         // The AWS configuration's own failures, before the region's.
         (iam(&[("AWS_REGION", ""), ("AWS_PROFILE", "nope")]), "failed to get shared config profile, nope".into()),
         (iam(&[("AWS_PROFILE", "bogus-source")]), "credential_source values must be EcsContainer, Ec2InstanceMetadata, or Environment".into()),
@@ -12146,4 +12155,771 @@ async fn an_aws_ca_bundle_is_trusted_like_upstream() {
     }
     assert!(tokens[0].contains("ASIAWEB"), "{tokens:?}");
     assert_eq!(tokens[1], tokens[0]);
+}
+
+/// The memcached server to run.
+fn memcached_server() -> String {
+    std::env::var("RATELIMIT_MEMCACHED_SERVER").unwrap_or_else(|_| "memcached".to_string())
+}
+
+/// Whether the Memcached scenarios can run: the differential tools and `memcached`.
+fn memcached_available() -> bool {
+    if !tools_available() {
+        return false;
+    }
+    let found = std::process::Command::new(memcached_server())
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !found {
+        assert!(
+            std::env::var_os("RATELIMIT_REQUIRE_DIFFERENTIAL").is_none(),
+            "Memcached scenarios need `{}`",
+            memcached_server()
+        );
+        eprintln!(
+            "skipping: Memcached scenarios need `{}`",
+            memcached_server()
+        );
+    }
+    found
+}
+
+/// A memcached server on a port of its own.
+struct Memcached {
+    address: String,
+    _process: Option<Child>,
+}
+
+impl Memcached {
+    /// The server, once it answers and is the one started here (its port may be taken first by
+    /// another test's server).
+    async fn start() -> Self {
+        for _ in 0..5 {
+            let port = reserved_port();
+            let mut process = Command::new(memcached_server())
+                // memcached refuses to run as root without `-u`, which it ignores otherwise.
+                .args([
+                    "-p",
+                    &port.to_string(),
+                    "-l",
+                    "127.0.0.1",
+                    "-U",
+                    "0",
+                    "-u",
+                    "root",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("start memcached");
+            let pid = format!("STAT pid {}\r\n", process.id().unwrap());
+            let mut memcached = Self {
+                address: format!("127.0.0.1:{port}"),
+                _process: None,
+            };
+            for _ in 0..250 {
+                if process.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if let Some(stats) = memcached.try_ask("stats\r\n").await {
+                    if stats.contains(&pid) {
+                        memcached._process = Some(process);
+                        return memcached;
+                    }
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        panic!("could not start {}", memcached_server());
+    }
+
+    /// A text-protocol command, and its answer up to its last line (`END`, or a single one).
+    async fn ask(&self, command: &str) -> String {
+        self.try_ask(command).await.expect("memcached answers")
+    }
+
+    /// [`ask`](Self::ask), `None` if the server does not answer.
+    async fn try_ask(&self, command: &str) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(&self.address).await.ok()?;
+        stream.write_all(command.as_bytes()).await.ok()?;
+        let multi = ["get", "lru_crawler", "stats"]
+            .iter()
+            .any(|c| command.starts_with(c));
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk);
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+                .await
+                .ok()?
+                .ok()?;
+            if n == 0 {
+                break;
+            }
+            answer.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&answer);
+            // A crawl already running answers `BUSY`; errors are one line.
+            let refused = ["BUSY", "ERROR", "CLIENT_ERROR", "SERVER_ERROR"]
+                .iter()
+                .any(|p| text.starts_with(p));
+            if text.ends_with("\r\n") && (!multi || refused || text.ends_with("END\r\n")) {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    /// Each key with its value and its time to live, to two significant digits (`-` for none),
+    /// sorted: a window's end in a run a few seconds after another reads the same.
+    /// The LRU crawler's dump skips an item in use: dumps until they hold every item.
+    async fn dump(&self) -> Vec<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let items: usize = self
+            .ask("stats\r\n")
+            .await
+            .lines()
+            .find_map(|l| l.strip_prefix("STAT curr_items "))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        let mut expirations = BTreeMap::new();
+        for _ in 0..20 {
+            if expirations.len() >= items {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            for line in self.ask("lru_crawler metadump all\r\n").await.lines() {
+                let fields: BTreeMap<&str, &str> = line
+                    .split(' ')
+                    .filter_map(|field| field.split_once('='))
+                    .collect();
+                if let (Some(key), Some(exp)) = (fields.get("key"), fields.get("exp")) {
+                    expirations.insert(key.to_string(), exp.parse::<i64>().unwrap());
+                }
+            }
+        }
+        assert!(
+            expirations.len() >= items,
+            "{items} items, dumped: {expirations:?}"
+        );
+        let mut entries = Vec::new();
+        for (key, exp) in expirations {
+            let answer = self.ask(&format!("get {key}\r\n")).await;
+            let Some(value) = answer
+                .lines()
+                .nth(1)
+                .filter(|_| answer.starts_with("VALUE"))
+            else {
+                continue;
+            };
+            let ttl = match exp {
+                -1 => "-".to_string(),
+                exp => significant(exp - now).to_string(),
+            };
+            entries.push(format!("{key}={value} ttl={ttl}"));
+        }
+        entries
+    }
+}
+
+/// `n` rounded to two significant digits.
+fn significant(n: i64) -> i64 {
+    let mut scale = 1;
+    while n.abs() / scale >= 100 {
+        scale *= 10;
+    }
+    (n + n.signum() * scale / 2) / scale * scale
+}
+
+/// The variables of a service on Memcached at `servers` (comma-separated), its stats sent to
+/// `statsd`.
+fn memcached_environment(
+    runtime: &std::path::Path,
+    servers: &str,
+    statsd: &StatsdServer,
+) -> Vec<(&'static str, String)> {
+    let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+    vec![
+        (
+            "RUNTIME_ROOT",
+            runtime.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("BACKEND_TYPE", "memcache".into()),
+        ("MEMCACHE_HOST_PORT", servers.into()),
+        ("EXPIRATION_JITTER_MAX_SECONDS", "0".into()),
+        ("STATSD_HOST", "127.0.0.1".into()),
+        ("STATSD_PORT", statsd.address.port().to_string()),
+        ("STATS_FLUSH_INTERVAL", "100ms".into()),
+        ("LOG_LEVEL", "warn".into()),
+        ("GRPC_HOST", "127.0.0.1".into()),
+        ("GRPC_PORT", grpc.to_string()),
+        ("HOST", "127.0.0.1".into()),
+        ("PORT", http.to_string()),
+        ("DEBUG_HOST", "127.0.0.1".into()),
+        ("DEBUG_PORT", debug.to_string()),
+    ]
+}
+
+const MEMCACHED_CONFIG: &[u8] = b"domain: llm
+descriptors:
+  - key: user
+    rate_limit: {unit: hour, requests_per_unit: 3}
+  - key: plan
+    rate_limit: {unit: month, requests_per_unit: 5}
+  - key: shadow
+    shadow_mode: true
+    rate_limit: {unit: hour, requests_per_unit: 1}
+  - key: yearly
+    rate_limit: {unit: year, requests_per_unit: 10}
+";
+
+/// What a run on Memcached shows: the answers, then memcached's keys, the stats, the
+/// healthcheck's status and the log lines (windows' starts and servers masked).
+#[derive(Debug, PartialEq)]
+struct MemcachedRun {
+    answers: Vec<String>,
+    keys: Vec<String>,
+    stats: BTreeMap<String, u64>,
+    health: u16,
+    lines: Vec<String>,
+}
+
+/// The same run but for the healthcheck: upstream's is never healthy on Memcached (its Redis
+/// component starts unhealthy and only Redis marks it); ours is (docs/parity.md §7).
+fn assert_same_memcached_runs(upstream: &MemcachedRun, ours: &MemcachedRun, context: &str) {
+    assert_eq!((upstream.health, ours.health), (500, 200), "{context}");
+    let ours = MemcachedRun {
+        health: upstream.health,
+        answers: ours.answers.clone(),
+        keys: ours.keys.clone(),
+        stats: ours.stats.clone(),
+        lines: ours.lines.clone(),
+    };
+    assert_eq!(&ours, upstream, "{context}");
+}
+
+/// `requests` sent one at a time to `binary` on the Memcached `servers` (comma-separated;
+/// `memcached` those running, dumped after), with `extra` variables, each after the last one's
+/// background increments.
+async fn memcached_run(
+    binary: &std::path::Path,
+    runtime: &std::path::Path,
+    servers: &str,
+    memcached: &[&Memcached],
+    extra: &[(&'static str, String)],
+    requests: &[RateLimitRequest],
+) -> MemcachedRun {
+    let statsd = StatsdServer::start().await;
+    let mut environment = memcached_environment(runtime, servers, &statsd);
+    environment.extend(extra.iter().cloned());
+    let http: u16 = variable(&environment, "PORT").parse().unwrap();
+    let logged = Logged::start(binary, &environment, http).await;
+    let mut client = RateLimitServiceClient::connect(format!(
+        "http://127.0.0.1:{}",
+        variable(&environment, "GRPC_PORT")
+    ))
+    .await
+    .unwrap();
+    let mut answers = Vec::new();
+    for request in requests {
+        let mut response = client
+            .should_rate_limit(request.clone())
+            .await
+            .map(|r| r.into_inner());
+        if let Ok(response) = &mut response {
+            for status in &mut response.statuses {
+                status.duration_until_reset = None;
+            }
+        }
+        answers.push(format!("{response:?}"));
+        // The increments run after the answer.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let masked: Vec<(String, &str)> = servers
+        .split(',')
+        .enumerate()
+        .map(|(i, s)| (s.to_string(), ["MEMCACHED0", "MEMCACHED1"][i.min(1)]))
+        .collect();
+    // The windows' starts: a run may begin in the next window.
+    let bucket = regex::Regex::new(r"_\d{10}\b").unwrap();
+    let mask = |text: &str| {
+        let mut text = bucket.replace_all(text, "_START").into_owned();
+        for (from, to) in &masked {
+            text = text.replace(from, to);
+        }
+        text
+    };
+    let mut keys = Vec::new();
+    for m in memcached {
+        for key in m.dump().await {
+            keys.push(mask(&format!("{}: {key}", m.address)));
+        }
+    }
+    let health = http_request(&format!("127.0.0.1:{http}"), "GET", "/healthcheck", &[])
+        .await
+        .status;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let stats = stat_values(&statsd.lines.lock().unwrap(), |name| {
+        name.contains(".memcache.") || name.contains(".rate_limit.")
+    });
+    let port = |name| format!("127.0.0.1:{}", variable(&environment, name));
+    let replace = [
+        (port("GRPC_PORT"), "GRPC"),
+        (port("PORT"), "HTTP"),
+        (port("DEBUG_PORT"), "DEBUG"),
+    ];
+    let lines = logrus_lines(&logged.stop().await, &replace)
+        .iter()
+        .map(|l| mask(l))
+        .collect();
+    MemcachedRun {
+        answers,
+        keys,
+        stats,
+        health,
+        lines,
+    }
+}
+
+/// `BACKEND_TYPE=memcache` as upstream's: the counters read, the answer, then the increments
+/// (`incr`, else `add` with the window's expiration: past 30 days, a year's, a Unix time; a
+/// calendar month's, until its end); a refund's `decr`; the local cache skipping memcached for a key
+/// over its limit; shadow mode; the `memcache.*` and limits' stats, and the log lines.
+#[tokio::test]
+async fn memcached_serves_like_upstream() {
+    if !memcached_available() {
+        return;
+    }
+    let runtime = temp_dir("memcached");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", MEMCACHED_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let user = |u: &str| request("llm", &[&[("user", u)]]);
+    let mut requests = vec![user("a"), user("a"), user("a"), user("a"), user("a")];
+    // A refund, then more for that user, with the plan's month and the shadow rule.
+    requests.push(refund(user("b"), 2));
+    requests.push(user("b"));
+    requests.push(with_hits(user("b"), 0, &[Some(3)]));
+    requests.push(request("llm", &[&[("plan", "p")], &[("shadow", "s")]]));
+    requests.push(request("llm", &[&[("plan", "p")], &[("shadow", "s")]]));
+    requests.push(request("llm", &[&[("unknown", "x")]]));
+    // A year is over 30 days: its expiration is a Unix time.
+    requests.push(request("llm", &[&[("yearly", "y")]]));
+    let extra = [
+        ("LOCAL_CACHE_SIZE_IN_BYTES", "1048576".to_string()),
+        ("USE_CALENDAR_MONTH_RATE_LIMIT", "true".into()),
+    ];
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let memcached = Memcached::start().await;
+        let servers = memcached.address.clone();
+        runs.push(
+            memcached_run(
+                &binary,
+                &runtime,
+                &servers,
+                &[&memcached],
+                &extra,
+                &requests,
+            )
+            .await,
+        );
+    }
+    assert!(
+        runs[0].answers[3].contains("OverLimit"),
+        "{:?}",
+        runs[0].answers
+    );
+    assert_same_memcached_runs(&runs[0], &runs[1], "");
+}
+
+/// Memcached's failures, logged as upstream logs them and answered from what was read: a key
+/// gomemcache refuses (a space in it), a value that is not a 32-bit number (`incr` refused for
+/// one that is not a number), a server down, a host that does not resolve (no server at all).
+/// Upstream's healthcheck fails throughout (it starts with Redis unhealthy, and only Redis makes
+/// it healthy); ours does not.
+#[tokio::test]
+async fn memcached_failures_are_logged_like_upstream() {
+    if !memcached_available() {
+        return;
+    }
+    let runtime = temp_dir("memcached-failures");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", MEMCACHED_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let user = |u: &str| request("llm", &[&[("user", u)]]);
+    let requests = [user("a b"), user("c"), user("d"), user("c")];
+    let down = format!("127.0.0.1:{}", reserved_port());
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let memcached = Memcached::start().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = now - now % 3600;
+        for (key, value) in [("c", "abc"), ("d", "3000000000")] {
+            let set = format!(
+                "set llm_user_{key}_{start} 0 3600 {}\r\n{value}\r\n",
+                value.len()
+            );
+            assert_eq!(memcached.ask(&set).await, "STORED\r\n");
+        }
+        let servers = memcached.address.clone();
+        let mut run =
+            vec![memcached_run(&binary, &runtime, &servers, &[&memcached], &[], &requests).await];
+        for servers in [down.as_str(), "nosuch.invalid:11211"] {
+            run.push(memcached_run(&binary, &runtime, servers, &[], &[], &[user("a")]).await);
+        }
+        runs.push(run);
+    }
+    assert!(
+        runs[0][0]
+            .lines
+            .iter()
+            .any(|l| l.contains("Unexpected non-numeric value")),
+        "{:?}",
+        runs[0][0].lines
+    );
+    for (upstream, ours) in runs[0].iter().zip(&runs[1]) {
+        assert_same_memcached_runs(upstream, ours, "");
+    }
+}
+
+/// A TLS server's acceptor with `certificate`, asking for a client certificate issued by
+/// `client_ca` when given.
+fn tls_acceptor(
+    certificate: &(String, String),
+    client_ca: Option<&std::path::Path>,
+) -> tokio_rustls::TlsAcceptor {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap();
+    let builder = match client_ca {
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_file_iter(ca).unwrap() {
+                roots.add(cert.unwrap()).unwrap();
+            }
+            builder.with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider,
+                )
+                .build()
+                .unwrap(),
+            )
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let config = builder
+        .with_single_cert(
+            CertificateDer::pem_slice_iter(certificate.0.as_bytes())
+                .map(Result::unwrap)
+                .collect(),
+            PrivateKeyDer::from_pem_slice(certificate.1.as_bytes()).unwrap(),
+        )
+        .unwrap();
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
+
+/// A TLS proxy in front of `target` (memcached) with `acceptor`, on `host`; its address.
+async fn tls_proxy(
+    target: &str,
+    acceptor: tokio_rustls::TlsAcceptor,
+    host: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(format!("{host}:0")).await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let target = target.to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, target) = (acceptor.clone(), target.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let Ok(mut server) = tokio::net::TcpStream::connect(&target).await else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut tls, &mut server).await;
+            });
+        }
+    });
+    (address, task)
+}
+
+/// `MEMCACHE_TLS`: memcached over TLS, verified against the system's roots and
+/// `MEMCACHE_TLS_CACERT`, with `MEMCACHE_TLS_CLIENT_CERT` and `MEMCACHE_TLS_CLIENT_KEY` when the
+/// server asks for one; a certificate refused (an unknown authority, expired) fails each
+/// operation, as upstream logs it. On `[::1]`, an address the certificate does not name, with
+/// `MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION` (when the host has IPv6).
+#[tokio::test]
+async fn memcached_over_tls_is_used_like_upstream() {
+    if !memcached_available() {
+        return;
+    }
+    let runtime = temp_dir("memcached-tls");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", MEMCACHED_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let pki = pki(&runtime.join("pki"));
+    let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    let user = |u: &str| request("llm", &[&[("user", u)]]);
+    let requests = [user("a"), user("a")];
+    // Go on macOS asks the system about an unknown authority, in its own words.
+    let untrusted = regex::Regex::new(
+        r"x509: (“[^”]*” certificate is not trusted|certificate signed by unknown authority)",
+    )
+    .unwrap();
+    let now = regex::Regex::new(r"current time \S+ is after").unwrap();
+    let ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
+    // Each case: a CA given, a client certificate asked (and given), the server's certificate
+    // expired, on `[::1]` with the hostname not verified.
+    let cases = [
+        ("the CA given", true, false, false, false),
+        ("no CA", false, false, false, false),
+        ("a client certificate asked", true, true, false, false),
+        ("expired", true, false, true, false),
+        ("[::1]", true, false, false, true),
+    ];
+    for (name, ca, client_certificate, expired, on_ipv6) in cases {
+        if on_ipv6 && !ipv6 {
+            continue;
+        }
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let memcached = Memcached::start().await;
+            let certificate = if expired {
+                &pki.expired_server
+            } else {
+                &pki.server
+            };
+            let asked = client_certificate.then_some(pki.ca.as_path());
+            let host = if on_ipv6 { "[::1]" } else { "127.0.0.1" };
+            let (proxy, _task) =
+                tls_proxy(&memcached.address, tls_acceptor(certificate, asked), host).await;
+            let mut extra = vec![("MEMCACHE_TLS", "true".to_string())];
+            if ca {
+                extra.push(("MEMCACHE_TLS_CACERT", path(&pki.ca)));
+            }
+            if client_certificate {
+                extra.push(("MEMCACHE_TLS_CLIENT_CERT", path(&pki.client_cert)));
+                extra.push(("MEMCACHE_TLS_CLIENT_KEY", path(&pki.client_key)));
+            }
+            if on_ipv6 {
+                extra.push(("MEMCACHE_TLS_SKIP_HOSTNAME_VERIFICATION", "true".into()));
+            }
+            let mut run =
+                memcached_run(&binary, &runtime, &proxy, &[&memcached], &extra, &requests).await;
+            run.keys = run
+                .keys
+                .iter()
+                .map(|k| k.replace(&memcached.address, "MEMCACHED0"))
+                .collect();
+            run.lines = run
+                .lines
+                .iter()
+                .map(|l| {
+                    let l = untrusted.replace_all(l, "x509: UNTRUSTED");
+                    now.replace_all(&l, "current time NOW is after")
+                        .into_owned()
+                })
+                .collect();
+            runs.push(run);
+        }
+        assert_same_memcached_runs(&runs[0], &runs[1], name);
+        let works = ca && !expired;
+        assert_eq!(runs[0].keys.is_empty(), !works, "{name}: {:?}", runs[0]);
+    }
+}
+
+/// Several `MEMCACHE_HOST_PORT` servers: each key on the one gomemcache picks (the CRC-32 of the
+/// key), its operations there.
+#[tokio::test]
+async fn memcached_keys_are_sharded_like_upstream() {
+    if !memcached_available() {
+        return;
+    }
+    let runtime = temp_dir("memcached-shards");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", MEMCACHED_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let users = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let requests: Vec<RateLimitRequest> = users
+        .iter()
+        .map(|u| request("llm", &[&[("user", u)], &[("plan", u)]]))
+        .collect();
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let (first, second) = (Memcached::start().await, Memcached::start().await);
+        let servers = format!("{},{}", first.address, second.address);
+        runs.push(
+            memcached_run(
+                &binary,
+                &runtime,
+                &servers,
+                &[&first, &second],
+                &[],
+                &requests,
+            )
+            .await,
+        );
+    }
+    assert!(
+        runs[0].keys.iter().any(|k| k.starts_with("MEMCACHED0"))
+            && runs[0].keys.iter().any(|k| k.starts_with("MEMCACHED1")),
+        "{:?}",
+        runs[0].keys
+    );
+    assert_same_memcached_runs(&runs[0], &runs[1], "");
+}
+
+/// `MEMCACHE_MAX_IDLE_CONNS`, as gomemcache keeps connections: each operation takes an idle one
+/// or dials a new one, and at most that many are kept once done; the rest are closed.
+#[tokio::test]
+async fn memcached_keeps_idle_connections_like_gomemcache() {
+    if !memcached_available() {
+        return;
+    }
+    use ratelimit::memcached::client::{Address, Client, Error};
+    let memcached = Memcached::start().await;
+    let total = || async {
+        memcached
+            .ask("stats\r\n")
+            .await
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("STAT total_connections ")?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap()
+    };
+    let client = Client::new(
+        vec![Address::Tcp(memcached.address.parse().unwrap())],
+        1,
+        None,
+    );
+    let before = total().await;
+    // Three at once: three connections, one kept.
+    let (a, b, c) = tokio::join!(
+        client.add("a", b"1", 60),
+        client.add("b", b"1", 60),
+        client.add("c", b"1", 60)
+    );
+    assert_eq!((a, b, c), (Ok(()), Ok(()), Ok(())));
+    // Each `ask` is a connection of its own.
+    assert_eq!(total().await - before, 3 + 1);
+    // One after the other: the kept one, every time.
+    for key in ["a", "b", "c"] {
+        assert_eq!(client.increment(key, 1).await, Ok(2));
+    }
+    assert_eq!(total().await - before, 3 + 2);
+    // A miss keeps the connection; another error closes it: the next operation dials.
+    assert_eq!(client.increment("missing", 1).await, Err(Error::CacheMiss));
+    assert_eq!(client.add("text", b"abc", 60).await, Ok(()));
+    assert!(client.increment("text", 1).await.is_err());
+    assert_eq!(client.increment("a", 1).await, Ok(3));
+    assert_eq!(total().await - before, 3 + 3 + 1);
+}
+
+/// With Memcached, a call's spans: the service's, and `Memcached Fetch Execution` with the
+/// number of keys it gets.
+#[tokio::test]
+async fn memcached_calls_are_traced_like_upstream() {
+    if !memcached_available() {
+        return;
+    }
+    let runtime = temp_dir("memcached-traces");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", MEMCACHED_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let memcached = Memcached::start().await;
+        let statsd = StatsdServer::start().await;
+        let collector_port = reserved_port();
+        let collected = otlp_collector(collector_port, true, None).await;
+        let mut environment = memcached_environment(&runtime, &memcached.address, &statsd);
+        environment.extend([
+            ("TRACING_ENABLED", "true".to_string()),
+            ("TRACING_EXPORTER_PROTOCOL", "grpc".into()),
+            // Random otherwise.
+            ("TRACING_SERVICE_INSTANCE_ID", "instance-1".into()),
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                format!("http://127.0.0.1:{collector_port}"),
+            ),
+        ]);
+        let http: u16 = variable(&environment, "PORT").parse().unwrap();
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut client = RateLimitServiceClient::connect(format!(
+            "http://127.0.0.1:{}",
+            variable(&environment, "GRPC_PORT")
+        ))
+        .await
+        .unwrap();
+        client
+            .should_rate_limit(request("llm", &[&[("user", "a")], &[("plan", "p")]]))
+            .await
+            .unwrap();
+        logged.stop().await;
+        runs.push(received_spans(&collected.lock().unwrap(), &[]));
+    }
+    assert!(
+        runs[0]
+            .iter()
+            .any(|s| s.contains("Memcached Fetch Execution")),
+        "{:#?}",
+        runs[0]
+    );
+    assert_eq!(runs[1], runs[0]);
 }

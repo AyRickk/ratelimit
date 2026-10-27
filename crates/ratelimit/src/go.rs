@@ -351,6 +351,46 @@ pub fn parse_int(text: &str, bits: u32) -> Result<i64, String> {
     }
 }
 
+/// `strconv.ParseInt(text, 10, bits)`: a sign, then decimal digits only.
+pub fn parse_int10(text: &str, bits: u32) -> Result<i64, String> {
+    let error = |e| num_error("ParseInt", text, e);
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let magnitude = parse_decimal(unsigned).map_err(error)?;
+    let cutoff = 1u64 << (bits - 1);
+    match negative {
+        false if magnitude < cutoff => Ok(magnitude as i64),
+        true if magnitude <= cutoff => Ok((magnitude as i64).wrapping_neg()),
+        _ => Err(error(NumError::Range)),
+    }
+}
+
+/// `strconv.ParseUint(text, 10, 64)`.
+pub fn parse_uint10(text: &str) -> Result<u64, String> {
+    parse_decimal(text).map_err(|e| num_error("ParseUint", text, e))
+}
+
+/// Decimal digits, none other: Go's base-10 parse.
+fn parse_decimal(text: &str) -> Result<u64, NumError> {
+    if text.is_empty() {
+        return Err(NumError::Syntax);
+    }
+    let mut value: u64 = 0;
+    for c in text.bytes() {
+        if !c.is_ascii_digit() {
+            return Err(NumError::Syntax);
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(c - b'0')))
+            .ok_or(NumError::Range)?;
+    }
+    Ok(value)
+}
+
 /// `strconv.ParseUint(text, 0, bits)`.
 pub fn parse_uint_bits(text: &str, bits: u32) -> Result<u64, String> {
     let error = |e| num_error("ParseUint", text, e);
