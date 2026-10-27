@@ -18,14 +18,6 @@ pub fn duration(nanos: i64) -> std::time::Duration {
     std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(0))
 }
 
-/// Refuses at startup the first enabled feature of a later slice.
-pub fn refuse_unsupported(features: &[(bool, &str)]) -> Result<(), String> {
-    match features.iter().find(|(enabled, _)| *enabled) {
-        Some((_, name)) => Err(format!("{name} is not supported yet")),
-        None => Ok(()),
-    }
-}
-
 /// Reads one environment variable; `None` when unset.
 pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
