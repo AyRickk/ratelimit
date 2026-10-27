@@ -10944,13 +10944,25 @@ fn resp_length(bytes: &[u8]) -> Option<usize> {
 /// `REDIS_TYPE=SENTINEL` as upstream's: the primary the sentinel names, a pool on it and on
 /// its replica (both in `cx_active`), and after a failover, the new primary within radix's
 /// 5 s, the counters going on.
-#[tokio::test]
-async fn a_redis_sentinel_serves_like_upstream() {
+#[test]
+fn a_redis_sentinel_serves_like_upstream() {
     if !tools_available() {
         return;
     }
-    // On the heap: on the test thread's stack, its state overflows it.
-    Box::pin(sentinel_serves_like_upstream()).await;
+    // A test thread's 2 MiB stack is too small for it in a debug build.
+    let run = std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(sentinel_serves_like_upstream())
+        })
+        .unwrap();
+    if let Err(panic) = run.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 async fn sentinel_serves_like_upstream() {
@@ -11013,9 +11025,9 @@ async fn sentinel_serves_like_upstream() {
             .await
             .unwrap();
         let mut answers = Vec::new();
-        let mut ask = async |answers: &mut Vec<String>| {
+        let mut ask = async |answers: &mut Vec<String>, user: &str| {
             let call =
-                client.should_rate_limit(request("llm", &[&[("user", "a")], &[("burst", "b")]]));
+                client.should_rate_limit(request("llm", &[&[("user", user)], &[("burst", user)]]));
             let mut response =
                 match tokio::time::timeout(std::time::Duration::from_secs(5), call).await {
                     Ok(answer) => answer.map(|r| r.into_inner()),
@@ -11029,19 +11041,35 @@ async fn sentinel_serves_like_upstream() {
             answers.push(format!("{response:?}"));
         };
         for _ in 0..2 {
-            ask(&mut answers).await;
+            ask(&mut answers, "a").await;
         }
         topology.failover().await;
         // radix asks the sentinels every 5 s.
         tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        // The failover closed the new primary's connections: radix fails a command on each one
+        // its PING has not found yet (docs/parity.md §7), so other counters warm the pools up.
+        let mut in_a_row = 0;
+        for _ in 0..20 {
+            let mut warm = Vec::new();
+            ask(&mut warm, "warm").await;
+            in_a_row = if warm[0].starts_with("Ok") {
+                in_a_row + 1
+            } else {
+                0
+            };
+            if in_a_row == 3 {
+                break;
+            }
+        }
+        assert_eq!(in_a_row, 3, "no answer from the new primary");
         for _ in 0..3 {
-            ask(&mut answers).await;
+            ask(&mut answers, "a").await;
         }
         // Over a connection of its own: a failover drops the harness's.
         let primary = topology.primary().await;
         let mut keys = Vec::new();
-        // The hour's counters only: the second's are named after their second.
-        for key in resp_bulk_strings(&resp_command(&primary, &["KEYS", "llm_user_*"]).await) {
+        // User a's hour counters only: the second's are named after their second.
+        for key in resp_bulk_strings(&resp_command(&primary, &["KEYS", "llm_user_a_*"]).await) {
             let value = resp_bulk_strings(&resp_command(&primary, &["GET", &key]).await);
             keys.push(format!("{key}={}", value.join("")));
         }
