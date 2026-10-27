@@ -5,7 +5,7 @@
 mod connection;
 pub mod tls;
 
-pub use connection::{RedisConnection, StartupBackoff, Tls, mask_credentials_in_url};
+pub use connection::{Connected, RedisConnection, StartupBackoff, Tls, mask_credentials_in_url};
 
 use crate::config::RateLimit;
 use crate::limiter::{self, Clock, Count, Hits, RequestState};

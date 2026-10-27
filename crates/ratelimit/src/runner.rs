@@ -82,6 +82,13 @@ impl PoolStats {
         }
     }
 
+    /// [`follow`](Self::follow) for every pool of `connected`.
+    fn follow_all(&self, connected: &crate::redis::Connected, health: Option<Arc<HealthChecker>>) {
+        for pool in std::iter::once(&connected.pool).chain(&connected.replicas) {
+            self.follow(pool, health.clone());
+        }
+    }
+
     /// `poolTrace` for `pool`: each client's connections (one, or one per node of a cluster, as
     /// radix keeps a pool per node) are followed from its own events (all open at first); a
     /// failed reconnection, which names no server, changes nothing. With `health`
@@ -103,6 +110,9 @@ impl PoolStats {
         // `hadConnError`: a failed connection since the last one made.
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         for (index, client) in pool.clients().iter().enumerate() {
+            // Outside a cluster, a client has one connection: a new one replaces it (fred moves
+            // a sentinel's client to the new primary without reporting the old one's loss).
+            let single = !client.is_clustered();
             let (mut reconnected, mut errors) = (client.reconnect_rx(), client.error_rx());
             let (connected, health) = (connected.clone(), health.clone());
             let failed = failed.clone();
@@ -132,9 +142,15 @@ impl PoolStats {
                                 log::info("redis connection re-established after previous error");
                             }
                             // A connection replaced without its loss seen: that one is closed.
-                            match connected[index].insert(server) {
-                                false => local_close.inc(),
-                                true => active.add(1),
+                            let replaced: Vec<_> = match single {
+                                true => connected[index].drain().collect(),
+                                false => connected[index].take(&server).into_iter().collect(),
+                            };
+                            connected[index].insert(server);
+                            local_close.add(replaced.len() as u64);
+                            match replaced.len() {
+                                0 => active.add(1),
+                                closed => active.sub(closed as u64 - 1),
                             }
                             if let Some(health) = &health {
                                 let _ = health.ok(health::REDIS);
@@ -294,19 +310,23 @@ pub async fn run(settings: Settings, lookup: Lookup<'_>) -> Result<(), Failure> 
     let mut per_second = None;
     if let Some(connection) = per_second_connection {
         let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_per_second_pool"));
-        let pool = connection
+        let connected = connection
             .connect(&backoff, shutting_down(signals.stop.clone()))
             .await?;
-        pool_stats.follow(&pool, active_health.then(|| health.clone()));
+        pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
         let _ = health.ok(health::REDIS);
-        per_second = Some(pool);
+        per_second = Some(connected);
     }
     let pool_stats = PoolStats::new(&stats, &server_scope.scope("redis_pool"));
-    let pool = connection
+    let connected = connection
         .connect(&backoff, shutting_down(signals.stop.clone()))
         .await?;
-    pool_stats.follow(&pool, active_health.then(|| health.clone()));
+    pool_stats.follow_all(&connected, active_health.then(|| health.clone()));
     let _ = health.ok(health::REDIS);
+    // The replicas' pools live as long as the service.
+    let pool = connected.pool.clone();
+    let _replicas = (connected, per_second.as_ref().map(|c| c.replicas.clone()));
+    let per_second = per_second.map(|c| c.pool);
     let clock = Arc::new(SystemClock);
     let mut cache = RedisCache::with_local_cache(
         pool,
