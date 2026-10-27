@@ -4511,7 +4511,64 @@ async fn the_binary_fails_to_start_like_upstream() {
     // A server key pair whose files are in two directories.
     let (server_cert, _) = server_files(&runtime.join("pki"), &test_pki.server);
     let (_, apart_key) = server_files(&runtime.join("apart"), &test_pki.server);
+    // ElastiCache IAM: a home without AWS files, IMDS off, and profiles of their own.
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let aws_config = runtime.join("aws-config");
+    std::fs::write(
+        &aws_config,
+        "[profile bogus-source]\ncredential_source = Elsewhere\nrole_arn = arn:aws:iam::1:role/r\n\
+         [profile orphan]\nsource_profile = missing\nrole_arn = arn:aws:iam::1:role/r\n\
+         [profile no-role]\nsource_profile = keys\n\
+         [profile keys]\naws_access_key_id = AKID\naws_secret_access_key = secret\n\
+         [profile mfa]\nsource_profile = keys\nrole_arn = arn:aws:iam::1:role/r\nmfa_serial = arn:aws:iam::1:mfa/me\n\
+         [profile two-kinds]\ncredential_process = /bin/true\ncredential_source = Environment\nrole_arn = arn:aws:iam::1:role/r\n\
+         [profile bundle]\nca_bundle = /nowhere/profile-ca.pem\n\
+         [profile loop-a]\nrole_arn = arn:aws:iam::1:role/a\nsource_profile = loop-b\n\
+         [profile loop-b]\nrole_arn = arn:aws:iam::1:role/b\nsource_profile = loop-a\n\
+         [profile itself]\nrole_arn = arn:aws:iam::1:role/i\nsource_profile = itself\n\
+         [profile from-environment]\nrole_arn = arn:aws:iam::1:role/e\ncredential_source = Environment\n",
+    )
+    .unwrap();
+    let iam = |extra: &[(&'static str, &str)]| {
+        let mut variables: Vec<(&'static str, String)> = vec![
+            ("HOME", home.to_string_lossy().into_owned()),
+            ("AWS_CONFIG_FILE", aws_config.to_string_lossy().into_owned()),
+            ("AWS_EC2_METADATA_DISABLED", "true".into()),
+            ("REDIS_AWS_IAM_AUTH", "true".into()),
+            ("REDIS_AWS_IAM_CACHE_NAME", "MyCache".into()),
+            ("REDIS_AWS_IAM_USER_ID", "app".into()),
+            ("AWS_REGION", "eu-west-3".into()),
+        ];
+        variables.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        variables
+    };
     let cases: Vec<(Vec<(&'static str, String)>, String)> = vec![
+        (iam(&[("REDIS_AUTH", "pw")]), "REDIS_AWS_IAM_AUTH cannot be combined with REDIS_AUTH or REDIS_AUTH_FILE".into()),
+        // The per-second pool, its own variables named.
+        (iam(&[("REDIS_PERSECOND", "true"), ("REDIS_PERSECOND_AWS_IAM_AUTH", "true"), ("REDIS_PERSECOND_AUTH_FILE", "/nowhere")]), "REDIS_PERSECOND_AWS_IAM_AUTH cannot be combined with REDIS_PERSECOND_AUTH or REDIS_PERSECOND_AUTH_FILE".into()),
+        (iam(&[("REDIS_PERSECOND", "true"), ("REDIS_PERSECOND_AWS_IAM_AUTH", "true")]), "REDIS_PERSECOND_AWS_IAM_CACHE_NAME and REDIS_PERSECOND_AWS_IAM_USER_ID are required when REDIS_PERSECOND_AWS_IAM_AUTH is enabled".into()),
+        (iam(&[("REDIS_AWS_IAM_USER_ID", "")]), "REDIS_AWS_IAM_CACHE_NAME and REDIS_AWS_IAM_USER_ID are required when REDIS_AWS_IAM_AUTH is enabled".into()),
+        (iam(&[("AWS_REGION", "")]), "REDIS_AWS_IAM_REGION is required when the AWS SDK cannot resolve a region".into()),
+        // The AWS configuration's own failures, before the region's.
+        (iam(&[("AWS_REGION", ""), ("AWS_PROFILE", "nope")]), "failed to get shared config profile, nope".into()),
+        (iam(&[("AWS_PROFILE", "bogus-source")]), "credential_source values must be EcsContainer, Ec2InstanceMetadata, or Environment".into()),
+        (iam(&[("AWS_PROFILE", "orphan")]), "failed to load assume role arn:aws:iam::1:role/r, of profile missing, failed to get shared config profile, missing".into()),
+        (iam(&[("AWS_PROFILE", "no-role")]), "credential type source_profile requires role_arn, profile no-role".into()),
+        (iam(&[("AWS_PROFILE", "mfa")]), "assume role with MFA enabled, but AssumeRoleTokenProvider session option not set.".into()),
+        (iam(&[("AWS_PROFILE", "two-kinds")]), "only one credential type may be specified per profile: source profile, credential source, credential process, web identity token".into()),
+        (iam(&[("AWS_WEB_IDENTITY_TOKEN_FILE", "/nowhere/token")]), "role ARN is not set".into()),
+        // A chain of source profiles back to one met before, which then has no credentials.
+        (iam(&[("AWS_PROFILE", "loop-a")]), "failed to load assume role arn:aws:iam::1:role/b, of profile loop-a, <nil>".into()),
+        (iam(&[("AWS_PROFILE", "itself")]), "failed to load assume role arn:aws:iam::1:role/i, of profile itself, <nil>".into()),
+        // The environment's keys, absent: refused at each connection, before any call to STS
+        // (the SDK's context around the error is its own, docs/parity.md §7).
+        (iam(&[("AWS_PROFILE", "from-environment"), ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s")]), "static credentials are empty".into()),
+        // A CA bundle, the environment's before the profile's, must hold a certificate.
+        (iam(&[("AWS_PROFILE", "bundle"), ("AWS_CA_BUNDLE", "/nowhere/ca.pem")]), "open /nowhere/ca.pem: no such file or directory".into()),
+        (iam(&[("AWS_PROFILE", "bundle")]), "open /nowhere/profile-ca.pem: no such file or directory".into()),
+        (iam(&[("AWS_CA_BUNDLE", &aws_config.to_string_lossy())]), "failed to load custom CA bundle PEM file".into()),
+        (iam(&[("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://10.1.2.3/creds")]), "invalid endpoint host, \"10.1.2.3\", only loopback/ecs/eks hosts are allowed".into()),
         (vec![("PORT", "x".into())], "envconfig.Process: assigning PORT to Port: converting 'x' to type int. details: strconv.ParseInt: parsing \"x\": invalid syntax".into()),
         (vec![("LOG_LEVEL", "bogus".into())], "Could not parse log level. not a valid logrus Level: \"bogus\"".into()),
         (vec![("DISABLE_STATS", "false".into()), ("USE_DOG_STATSD", "true".into())], "Error: unable to use more than one stats sink at the same time. Set one of USE_DOG_STATSD, USE_STATSD, USE_PROMETHEUS.".into()),
@@ -10554,10 +10611,35 @@ async fn cluster_run(
                 .collect()
         })
         .collect();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let pools = stat_values(&statsd.lines.lock().unwrap(), |name| {
-        name.contains("_pool.")
-    });
+    // Each pool full: a connection per node and per pool slot. radix opens a replica's pool
+    // once its topology, refreshed every 5 s, holds it.
+    let size = |name| {
+        variables
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+    };
+    let nodes = cluster.nodes.len() as u64;
+    let full = [
+        ("ratelimit.redis_pool.cx_active|g", size("REDIS_POOL_SIZE")),
+        (
+            "ratelimit.redis_per_second_pool.cx_active|g",
+            size("REDIS_PERSECOND_POOL_SIZE"),
+        ),
+    ];
+    let mut pools = BTreeMap::new();
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        pools = stat_values(&statsd.lines.lock().unwrap(), |name| {
+            name.contains("_pool.")
+        });
+        if full.iter().all(|(gauge, size)| {
+            !pools.contains_key(*gauge) || size.is_none_or(|size| pools[*gauge] == size * nodes)
+        }) {
+            break;
+        }
+    }
     let stderr = logged.stop().await;
     let mut masked = masked.to_vec();
     masked.extend([
@@ -11299,4 +11381,769 @@ async fn a_password_protected_sentinel_is_used_like_upstream() {
         "{upstream:?}"
     );
     assert_eq!(ours, upstream);
+}
+
+/// A TCP proxy to a Redis server that records the commands its clients send.
+struct RecordingProxy {
+    address: String,
+    commands: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingProxy {
+    async fn start(target: &str) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (target, sink) = (target.to_string(), commands.clone());
+        let accept = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let (target, sink) = (target.clone(), sink.clone());
+                tokio::spawn(async move {
+                    let Ok(server) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    let replies = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+                    });
+                    let (mut pending, mut chunk) = (Vec::new(), [0u8; 4096]);
+                    loop {
+                        let n = match client_read.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if server_write.write_all(&chunk[..n]).await.is_err() {
+                            break;
+                        }
+                        pending.extend_from_slice(&chunk[..n]);
+                        while let Some(length) = resp_length(&pending) {
+                            let frame: Vec<u8> = pending.drain(..length).collect();
+                            let command = resp_bulk_strings(&String::from_utf8_lossy(&frame));
+                            sink.lock().unwrap().push(command);
+                        }
+                    }
+                    replies.abort();
+                });
+            }
+        });
+        Self {
+            address,
+            commands,
+            accept,
+        }
+    }
+
+    /// The arguments of each `AUTH` so far.
+    fn auths(&self) -> Vec<Vec<String>> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.first()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("AUTH"))
+            })
+            .map(|c| c[1..].to_vec())
+            .collect()
+    }
+
+    /// Waits until `count` `AUTH`s have been sent.
+    async fn wait_for_auths(&self, count: usize) {
+        for _ in 0..200 {
+            if self.auths().len() >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("fewer than {count} AUTH: {:?}", self.auths());
+    }
+}
+
+impl Drop for RecordingProxy {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// An ElastiCache IAM token without what changes with the time: the date and the signature.
+fn timeless_token(token: &str) -> String {
+    let date = regex::Regex::new(r"\d{8}T\d{6}Z").unwrap();
+    let day = regex::Regex::new(r"%2F\d{8}%2F").unwrap();
+    let signature = regex::Regex::new(r"X-Amz-Signature=[0-9a-f]{64}").unwrap();
+    let token = date.replace_all(token, "DATE");
+    let token = day.replace_all(&token, "%2FDAY%2F");
+    signature
+        .replace_all(&token, "X-Amz-Signature=SIGNATURE")
+        .into_owned()
+}
+
+/// A fake of the AWS services credentials come from: STS (`AssumeRole`,
+/// `AssumeRoleWithWebIdentity`), a container's endpoint and IMDSv2; it records each request.
+struct FakeAws {
+    url: String,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl FakeAws {
+    async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// Over TLS with `pki`'s server certificate when given.
+    async fn start_with(pki: Option<&Pki>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scheme = if pki.is_some() { "https" } else { "http" };
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let acceptor = pki.map(|pki| {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    CertificateDer::pem_slice_iter(pki.server.0.as_bytes())
+                        .map(Result::unwrap)
+                        .collect(),
+                    PrivateKeyDer::from_pem_slice(pki.server.1.as_bytes()).unwrap(),
+                )
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        });
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = requests.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (sink, acceptor) = (sink.clone(), acceptor.clone());
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                Self::serve(stream, sink).await;
+                            }
+                        }
+                        None => Self::serve(stream, sink).await,
+                    }
+                });
+            }
+        });
+        Self {
+            url,
+            requests,
+            accept,
+        }
+    }
+
+    /// Answers one request on `stream`, and records it.
+    async fn serve(
+        mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        sink: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (head, body) = loop {
+            let Ok(n) = stream.read(&mut chunk).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if body.len() >= length {
+                break (head.to_string(), body.to_string());
+            }
+        };
+        let (status, response) = Self::answer(&head, &body);
+        sink.lock().unwrap().push(format!("{head}\n\n{body}"));
+        let reply = format!(
+            // IMDS gives its tokens' lifetime.
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nX-Aws-Ec2-Metadata-Token-Ttl-Seconds: 21600\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        );
+        let _ = stream.write_all(reply.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    fn answer(head: &str, body: &str) -> (&'static str, String) {
+        let line = head.lines().next().unwrap_or_default();
+        let sts = |action: &str, key: &str| {
+            format!(
+                "<{action}Response xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><{action}Result>\
+                 <Credentials><AccessKeyId>{key}</AccessKeyId><SecretAccessKey>{key}-secret</SecretAccessKey>\
+                 <SessionToken>{key}-session</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials>\
+                 <AssumedRoleUser><Arn>arn:aws:sts::1:assumed-role/r/s</Arn><AssumedRoleId>AROA:s</AssumedRoleId></AssumedRoleUser>\
+                 </{action}Result><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></{action}Response>"
+            )
+        };
+        let json = |key: &str| {
+            format!(
+                "{{\"Code\":\"Success\",\"Type\":\"AWS-HMAC\",\"LastUpdated\":\"2026-01-01T00:00:00Z\",\
+                 \"AccessKeyId\":\"{key}\",\"SecretAccessKey\":\"{key}-secret\",\"Token\":\"{key}-session\",\
+                 \"Expiration\":\"2099-01-01T00:00:00Z\"}}"
+            )
+        };
+        match line.split(' ').take(2).collect::<Vec<_>>()[..] {
+            ["POST", _] if body.contains("Action=AssumeRoleWithWebIdentity") => {
+                ("200 OK", sts("AssumeRoleWithWebIdentity", "ASIAWEB"))
+            }
+            ["POST", _] if body.contains("Action=AssumeRole") => {
+                ("200 OK", sts("AssumeRole", "ASIAROLE"))
+            }
+            ["GET", "/ecs-credentials"] => ("200 OK", json("ASIAECS")),
+            // Credentials expiring in `/ecs-expiring/<seconds>`.
+            ["GET", path] if path.starts_with("/ecs-expiring/") => {
+                let seconds: i64 = path["/ecs-expiring/".len()..].parse().unwrap();
+                let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds);
+                let expiration = expires.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
+                (
+                    "200 OK",
+                    json("ASIAEXPIRING").replace("2099-01-01T00:00:00Z", &expiration),
+                )
+            }
+            ["PUT", "/latest/api/token"] => ("200 OK", "imds-token".into()),
+            ["GET", "/latest/meta-data/iam/security-credentials/"] => {
+                ("200 OK", "imds-role".into())
+            }
+            [
+                "GET",
+                "/latest/meta-data/iam/security-credentials/imds-role",
+            ] => ("200 OK", json("ASIAIMDS")),
+            _ => ("404 Not Found", String::new()),
+        }
+    }
+
+    /// The requests so far for `what` (a path or an STS action): the headers and parameters
+    /// that the credentials depend on.
+    fn requests(&self, what: &str) -> Vec<String> {
+        let parameter = regex::Regex::new(
+            r"(Action|RoleArn|RoleSessionName|WebIdentityToken|ExternalId|DurationSeconds)=[^&]*",
+        )
+        .unwrap();
+        let header =
+            regex::Regex::new(r"(?im)^(authorization|x-aws-ec2-metadata-token):.*$").unwrap();
+        let key = regex::Regex::new(r"(?i)credential=([a-z0-9]+)/").unwrap();
+        let digits = regex::Regex::new(r"\d{10,}").unwrap();
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains(what))
+            .map(|r| {
+                let mut seen: Vec<String> = parameter
+                    .find_iter(r)
+                    .map(|m| m.as_str().to_string())
+                    // A session name by default is the time.
+                    .map(|p| digits.replace_all(&p, "N").into_owned())
+                    .collect();
+                for h in header.find_iter(r) {
+                    // Of a signature, only the key that signs.
+                    seen.push(match key.captures(h.as_str()) {
+                        Some(k) => format!("signed by {}", &k[1]),
+                        None => h.as_str().trim().to_lowercase(),
+                    });
+                }
+                seen.sort();
+                seen.join(" ")
+            })
+            .collect()
+    }
+}
+
+impl Drop for FakeAws {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// The variables of a service whose pools authenticate with ElastiCache IAM through `proxy`,
+/// in `home`, with no IMDS unless the case sets it.
+fn iam_environment(
+    runtime: &std::path::Path,
+    proxy: &RecordingProxy,
+    home: &std::path::Path,
+) -> Vec<(&'static str, String)> {
+    let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
+    vec![
+        (
+            "RUNTIME_ROOT",
+            runtime.join("current").to_string_lossy().into_owned(),
+        ),
+        ("RUNTIME_SUBDIRECTORY", "ratelimit".into()),
+        ("REDIS_SOCKET_TYPE", "tcp".into()),
+        ("REDIS_URL", proxy.address.clone()),
+        ("REDIS_POOL_SIZE", "1".into()),
+        ("REDIS_AWS_IAM_AUTH", "true".into()),
+        ("REDIS_AWS_IAM_CACHE_NAME", "MyCache".into()),
+        ("REDIS_AWS_IAM_USER_ID", "app".into()),
+        ("HOME", home.to_string_lossy().into_owned()),
+        ("AWS_EC2_METADATA_DISABLED", "true".into()),
+        ("DISABLE_STATS", "true".into()),
+        ("EXPIRATION_JITTER_MAX_SECONDS", "0".into()),
+        ("LOG_LEVEL", "warn".into()),
+        ("GRPC_HOST", "127.0.0.1".into()),
+        ("GRPC_PORT", grpc.to_string()),
+        ("HOST", "127.0.0.1".into()),
+        ("PORT", http.to_string()),
+        ("DEBUG_HOST", "127.0.0.1".into()),
+        ("DEBUG_PORT", debug.to_string()),
+    ]
+}
+
+/// The value of `name` in `environment` (the last one, which wins).
+fn variable(environment: &[(&str, String)], name: &str) -> String {
+    environment
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+/// A Redis server whose users `app` and `app2` take any password (any token).
+async fn redis_with_iam_users() -> Redis {
+    let redis = Redis::start().await;
+    for user in ["app", "app2"] {
+        resp_command(
+            &redis.address,
+            &["ACL", "SETUSER", user, "on", "nopass", "~*", "&*", "+@all"],
+        )
+        .await;
+    }
+    redis
+}
+
+/// `REDIS_AWS_IAM_AUTH` as upstream's: each pool authenticates as its user with a token
+/// presigned for its cache (lowercased), its region (`*_AWS_IAM_REGION`, else the AWS
+/// configuration's) and the AWS credentials (a session token included), serverless or not;
+/// the same lines logged; a connection made again reuses the token.
+#[tokio::test]
+async fn elasticache_iam_tokens_authenticate_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("iam");
+    write_tree(
+        &runtime,
+        &[
+            (
+                "v1/ratelimit/config/llm.yaml",
+                b"domain: llm\ndescriptors:\n  - key: user\n    rate_limit: {unit: hour, requests_per_unit: 2}\n  - key: burst\n    rate_limit: {unit: second, requests_per_unit: 100}\n",
+            ),
+            ("current", b"->v1"),
+        ],
+    );
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let redis = redis_with_iam_users().await;
+    let mut runs = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        resp_command(&redis.address, &["FLUSHALL"]).await;
+        let proxy = RecordingProxy::start(&redis.address).await;
+        let mut environment = iam_environment(&runtime, &proxy, &home);
+        environment.extend([
+            ("AWS_REGION", "eu-west-3".to_string()),
+            ("AWS_ACCESS_KEY_ID", "AKIDENV".into()),
+            ("AWS_SECRET_ACCESS_KEY", "env-secret".into()),
+            ("AWS_SESSION_TOKEN", "env/session+token=".into()),
+            // The per-second pool: serverless, another user and region.
+            ("REDIS_PERSECOND", "true".into()),
+            ("REDIS_PERSECOND_SOCKET_TYPE", "tcp".into()),
+            ("REDIS_PERSECOND_URL", proxy.address.clone()),
+            ("REDIS_PERSECOND_POOL_SIZE", "1".into()),
+            ("REDIS_PERSECOND_AWS_IAM_AUTH", "true".into()),
+            ("REDIS_PERSECOND_AWS_IAM_CACHE_NAME", "Serverless-1".into()),
+            ("REDIS_PERSECOND_AWS_IAM_USER_ID", "app2".into()),
+            ("REDIS_PERSECOND_AWS_IAM_SERVERLESS", "true".into()),
+            ("REDIS_PERSECOND_AWS_IAM_REGION", "us-east-2".into()),
+        ]);
+        let http: u16 = variable(&environment, "PORT").parse().unwrap();
+        let logged = Logged::start(&binary, &environment, http).await;
+        let mut client = RateLimitServiceClient::connect(format!(
+            "http://127.0.0.1:{}",
+            variable(&environment, "GRPC_PORT")
+        ))
+        .await
+        .unwrap();
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let response = client
+                .should_rate_limit(request("llm", &[&[("user", "a")], &[("burst", "b")]]))
+                .await
+                .map(|r| r.into_inner().overall_code);
+            answers.push(format!("{response:?}"));
+        }
+        // Each user's tokens, then its connections made again.
+        let tokens = |user: &str| -> Vec<String> {
+            proxy
+                .auths()
+                .iter()
+                .filter(|a| a.len() == 2 && a[0] == user)
+                .map(|a| a[1].clone())
+                .collect()
+        };
+        // A second later: a token made again would differ (its date).
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let before = proxy.auths().len();
+        resp_command(&redis.address, &["CLIENT", "KILL", "TYPE", "normal"]).await;
+        proxy.wait_for_auths(before + 2).await;
+        let mut observed = Vec::new();
+        for user in ["app", "app2"] {
+            let tokens = tokens(user);
+            let mut distinct = tokens.clone();
+            distinct.dedup();
+            observed.push(format!(
+                "{user}: {} (one token: {})",
+                timeless_token(&tokens[0]),
+                distinct.len() == 1
+            ));
+        }
+        let port = |name| format!("127.0.0.1:{}", variable(&environment, name));
+        let lines = logrus_lines(
+            &logged.stop().await,
+            &[
+                (proxy.address.clone(), "PROXY"),
+                (port("GRPC_PORT"), "GRPC"),
+                (port("PORT"), "HTTP"),
+                (port("DEBUG_PORT"), "DEBUG"),
+            ],
+        );
+        runs.push((answers, observed, lines));
+    }
+    // OVER_LIMIT at the third.
+    assert_eq!(runs[0].0[2], "Ok(2)", "{:?}", runs[0].0);
+    assert!(
+        runs[0].1[0].starts_with("app: mycache/?Action=connect&User=app&X-Amz-Algorithm"),
+        "{:?}",
+        runs[0].1
+    );
+    assert_eq!(runs[1].0, runs[0].0, "answers");
+    assert_eq!(runs[1].1, runs[0].1, "tokens");
+    assert_eq!(runs[1].2, runs[0].2, "log lines");
+}
+
+/// Where the AWS credentials come from, as `config.LoadDefaultConfig` picks them: the
+/// environment's keys (their aliases too), then a web identity, then the profile (`AWS_PROFILE`,
+/// else `AWS_DEFAULT_PROFILE`, else `default`; from the config or the credentials file): its
+/// keys, a role assumed from another profile's or from the container's credentials, a web
+/// identity, a process; then the container's endpoint, then IMDS. The same token (its access
+/// key, session token and region) and the same calls to STS and the container.
+#[tokio::test]
+async fn aws_credentials_are_found_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("iam-sources");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = |name: &str| runtime.join(name).to_string_lossy().into_owned();
+    std::fs::write(path("web-token"), "web-identity-jwt").unwrap();
+    std::fs::write(
+        path("process.sh"),
+        "#!/bin/sh\necho '{\"Version\": 1, \"AccessKeyId\": \"AKIDPROCESS\", \"SecretAccessKey\": \"process-secret\", \"SessionToken\": \"process-session\"}'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path("process.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        path("aws-credentials"),
+        "[default]\naws_access_key_id = AKIDDEFAULT\naws_secret_access_key = default-secret\n\
+         [keys2]\naws_access_key_id = AKIDKEYS2\naws_secret_access_key = keys2-secret\n",
+    )
+    .unwrap();
+    std::fs::write(
+        path("aws-config"),
+        format!(
+            "[profile keys]\naws_access_key_id = AKIDKEYS\naws_secret_access_key = keys-secret\nregion = ap-south-1\n\
+             [profile process]\ncredential_process = {}\n\
+             [profile role]\nrole_arn = arn:aws:iam::1:role/r\nsource_profile = keys\nrole_session_name = my-session\nexternal_id = ext-1\nduration_seconds = 3600\n\
+             [profile web]\nrole_arn = arn:aws:iam::1:role/web\nweb_identity_token_file = {}\nrole_session_name = web-session\n\
+             [profile from-container]\nrole_arn = arn:aws:iam::1:role/c\ncredential_source = EcsContainer\n",
+            path("process.sh"),
+            path("web-token")
+        ),
+    )
+    .unwrap();
+    let web = [
+        ("AWS_WEB_IDENTITY_TOKEN_FILE", path("web-token")),
+        ("AWS_ROLE_ARN", "arn:aws:iam::1:role/env-web".into()),
+        ("AWS_ROLE_SESSION_NAME", "env-session".into()),
+    ];
+    let keys = [
+        ("AWS_ACCESS_KEY_ID", "AKIDENV".to_string()),
+        ("AWS_SECRET_ACCESS_KEY", "env-secret".into()),
+    ];
+    let cases: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+        (
+            "the environment's aliases",
+            vec![
+                ("AWS_ACCESS_KEY", "AKIDALIAS".into()),
+                ("AWS_SECRET_KEY", "alias-secret".into()),
+            ],
+        ),
+        (
+            "the environment before a web identity",
+            [&keys[..], &web[..]].concat(),
+        ),
+        ("a web identity before the default profile", web.to_vec()),
+        ("the default profile", vec![]),
+        (
+            "AWS_PROFILE, and its region",
+            vec![
+                ("AWS_PROFILE", "keys".into()),
+                ("AWS_REGION", String::new()),
+            ],
+        ),
+        (
+            "AWS_DEFAULT_PROFILE",
+            vec![("AWS_DEFAULT_PROFILE", "keys2".into())],
+        ),
+        // Run by `sh`, found on the `PATH`.
+        (
+            "a process",
+            vec![
+                ("AWS_PROFILE", "process".into()),
+                ("PATH", "/bin:/usr/bin".into()),
+            ],
+        ),
+        (
+            "a role assumed from another profile",
+            vec![("AWS_PROFILE", "role".into())],
+        ),
+        (
+            "a profile's web identity",
+            vec![("AWS_PROFILE", "web".into())],
+        ),
+        (
+            "a role assumed from the container's",
+            vec![
+                ("AWS_PROFILE", "from-container".into()),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    "FAKE/ecs-credentials".into(),
+                ),
+            ],
+        ),
+        (
+            "the container's",
+            vec![
+                ("AWS_SHARED_CREDENTIALS_FILE", path("missing")),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    "FAKE/ecs-credentials".into(),
+                ),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN", "container-auth".into()),
+            ],
+        ),
+        (
+            "IMDS",
+            vec![
+                ("AWS_SHARED_CREDENTIALS_FILE", path("missing")),
+                ("AWS_EC2_METADATA_DISABLED", "false".into()),
+                ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "FAKE".into()),
+            ],
+        ),
+    ];
+    let redis = redis_with_iam_users().await;
+    for (case, variables) in cases {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let proxy = RecordingProxy::start(&redis.address).await;
+            let aws = FakeAws::start().await;
+            let mut environment = iam_environment(&runtime, &proxy, &home);
+            environment.extend([
+                ("AWS_REGION", "eu-west-3".to_string()),
+                ("AWS_CONFIG_FILE", path("aws-config")),
+                ("AWS_SHARED_CREDENTIALS_FILE", path("aws-credentials")),
+                ("AWS_ENDPOINT_URL_STS", aws.url.clone()),
+            ]);
+            environment.extend(
+                variables
+                    .iter()
+                    .map(|(k, v)| (*k, v.replace("FAKE", &aws.url))),
+            );
+            let http: u16 = variable(&environment, "PORT").parse().unwrap();
+            let logged = Logged::start(&binary, &environment, http).await;
+            proxy.wait_for_auths(1).await;
+            let token = timeless_token(&proxy.auths()[0][1]);
+            logged.stop().await;
+            runs.push((
+                token,
+                aws.requests("Action="),
+                aws.requests("/ecs-credentials"),
+            ));
+        }
+        assert_eq!(runs[1], runs[0], "{case}");
+    }
+}
+
+/// Credentials that expire: the container's are taken as expiring 5 minutes early, and a token
+/// is not reused past a minute before they expire. Expiring in 4 minutes, each connection made
+/// again asks the container and signs a new token; in 10, neither.
+#[tokio::test]
+async fn expiring_aws_credentials_are_refreshed_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("iam-expiring");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let redis = redis_with_iam_users().await;
+    for seconds in [240, 600] {
+        let mut runs = Vec::new();
+        for binary in [
+            upstream_binary(),
+            PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+        ] {
+            let proxy = RecordingProxy::start(&redis.address).await;
+            let aws = FakeAws::start().await;
+            let mut environment = iam_environment(&runtime, &proxy, &home);
+            environment.extend([
+                ("AWS_REGION", "eu-west-3".to_string()),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    format!("{}/ecs-expiring/{seconds}", aws.url),
+                ),
+            ]);
+            let http: u16 = variable(&environment, "PORT").parse().unwrap();
+            let logged = Logged::start(&binary, &environment, http).await;
+            proxy.wait_for_auths(1).await;
+            let asked = aws.requests("/ecs-expiring").len();
+            // A second later: a token made again would differ (its date).
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            let before = proxy.auths().len();
+            resp_command(&redis.address, &["CLIENT", "KILL", "TYPE", "normal"]).await;
+            proxy.wait_for_auths(before + 1).await;
+            // Tokens signed in the same second are the same: only the reconnection's tells.
+            let auths = proxy.auths();
+            let (earlier, again) = auths.split_at(before);
+            runs.push(format!(
+                "container asked again: {}, new token: {}",
+                aws.requests("/ecs-expiring").len() > asked,
+                again.iter().any(|a| earlier.iter().all(|e| e[1] != a[1]))
+            ));
+            logged.stop().await;
+        }
+        assert_eq!(runs[1], runs[0], "expiring in {seconds} s");
+        assert_eq!(
+            runs[0],
+            match seconds {
+                240 => "container asked again: true, new token: true",
+                _ => "container asked again: false, new token: false",
+            },
+            "expiring in {seconds} s"
+        );
+    }
+}
+
+/// `AWS_CA_BUNDLE`: STS over HTTPS, its certificate from the bundle's CA, gives the
+/// credentials of a web identity; without the bundle, the certificate is refused at each
+/// connection. The container's endpoint is asked without the bundle, as Go's.
+#[tokio::test]
+async fn an_aws_ca_bundle_is_trusted_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("iam-ca-bundle");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(runtime.join("web-token"), "web-identity-jwt").unwrap();
+    let pki = pki(&runtime.join("pki"));
+    let redis = redis_with_iam_users().await;
+    let mut tokens = Vec::new();
+    for binary in [
+        upstream_binary(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratelimit")),
+    ] {
+        let proxy = RecordingProxy::start(&redis.address).await;
+        let aws = FakeAws::start_with(Some(&pki)).await;
+        let base = iam_environment(&runtime, &proxy, &home);
+        let bundle = ("AWS_CA_BUNDLE", pki.ca.to_string_lossy().into_owned());
+        let web = [
+            ("AWS_REGION", "eu-west-3".to_string()),
+            ("AWS_ENDPOINT_URL_STS", aws.url.clone()),
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                runtime.join("web-token").to_string_lossy().into_owned(),
+            ),
+            ("AWS_ROLE_ARN", "arn:aws:iam::1:role/web".into()),
+        ];
+        let environment = [&base[..], &web[..], std::slice::from_ref(&bundle)].concat();
+        let http: u16 = variable(&environment, "PORT").parse().unwrap();
+        let logged = Logged::start(&binary, &environment, http).await;
+        proxy.wait_for_auths(1).await;
+        tokens.push(timeless_token(&proxy.auths()[0][1]));
+        logged.stop().await;
+        // Refused: STS without the bundle (the system's roots do not hold the test CA), and
+        // the container's endpoint even with it.
+        let gives_up = ("REDIS_STARTUP_MAX_ELAPSED_TIME", "1s".to_string());
+        let container = [
+            ("AWS_REGION", "eu-west-3".to_string()),
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                format!("{}/ecs-credentials", aws.url),
+            ),
+        ];
+        for environment in [
+            [&base[..], &web[..], std::slice::from_ref(&gives_up)].concat(),
+            [
+                &base[..],
+                &container[..],
+                &[bundle.clone(), gives_up.clone()],
+            ]
+            .concat(),
+        ] {
+            let failure = startup_failure(&binary, &environment).await;
+            assert!(
+                failure.contains("retrieving AWS credentials for ElastiCache IAM authentication: failed to refresh cached credentials, "),
+                "{}: {failure}",
+                binary.display()
+            );
+        }
+    }
+    assert!(tokens[0].contains("ASIAWEB"), "{tokens:?}");
+    assert_eq!(tokens[1], tokens[0]);
 }

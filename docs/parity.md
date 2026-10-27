@@ -91,11 +91,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_POOL_SIZE` | `10` | ✅ | `tests/runner.rs` (0 is radix's 4) |
 | `REDIS_AUTH` | — | ✅ | `user:password` or a password: `tests/runner.rs` |
 | `REDIS_AUTH_FILE` | — | ✅ | read at each connection (trimmed; missing or empty, the dial fails; with `REDIS_AUTH`, refused): `a_password_protected_redis_is_logged_like_upstream`, `auth_files_are_reread_like_upstream`, `the_binary_fails_to_start_like_upstream` |
-| `REDIS_AWS_IAM_AUTH` | `false` | ⬜ | |
-| `REDIS_AWS_IAM_CACHE_NAME` | — | ⬜ | |
-| `REDIS_AWS_IAM_USER_ID` | — | ⬜ | |
-| `REDIS_AWS_IAM_SERVERLESS` | `false` | ⬜ | |
-| `REDIS_AWS_IAM_REGION` | — | ⬜ | |
+| `REDIS_AWS_IAM_AUTH` | `false` | ✅ | each connection authenticates as the user with a presigned token, reused 14 min (`elasticache_iam_tokens_authenticate_like_upstream`, `expiring_aws_credentials_are_refreshed_like_upstream`); the AWS credentials found as Go's SDK finds them (`aws_credentials_are_found_like_upstream`); with `REDIS_AUTH` or `REDIS_AUTH_FILE`, and the AWS configuration's failures, refused at startup (`the_binary_fails_to_start_like_upstream`); the signature: `redis/aws.rs` unit test |
+| `REDIS_AWS_IAM_CACHE_NAME` | — | ✅ | the token's host, lowercased; required (`the_binary_fails_to_start_like_upstream`) |
+| `REDIS_AWS_IAM_USER_ID` | — | ✅ | the `AUTH` user and the token's `User`; required |
+| `REDIS_AWS_IAM_SERVERLESS` | `false` | ✅ | `ResourceType=ServerlessCache` in the token |
+| `REDIS_AWS_IAM_REGION` | — | ✅ | the token's region; else the AWS configuration's (`AWS_REGION`, `AWS_DEFAULT_REGION`, the profile's); none refused at startup |
 | `REDIS_TLS` | `false` | ✅ | `redis_over_tls_is_used_like_upstream` (its warning, the handshake within the dial, failures retried) |
 | `REDIS_TLS_CLIENT_CERT` | — | ✅ | `redis_over_tls_is_used_like_upstream`; a file that does not load: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_TLS_CLIENT_KEY` | — | ✅ | `redis_over_tls_is_used_like_upstream`; a file that does not load: `the_binary_fails_to_start_like_upstream` |
@@ -111,11 +111,11 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | `REDIS_PERSECOND_POOL_SIZE` | `10` | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AUTH` | — | ✅ | `a_per_second_redis_starts_like_upstream`; `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
 | `REDIS_PERSECOND_AUTH_FILE` | — | ✅ | as `REDIS_AUTH_FILE`, for the per-second pool: `the_per_second_pool_has_its_own_settings` in `tests/redis_connection.rs` |
-| `REDIS_PERSECOND_AWS_IAM_AUTH` | `false` | ⬜ | |
-| `REDIS_PERSECOND_AWS_IAM_CACHE_NAME` | — | ⬜ | |
-| `REDIS_PERSECOND_AWS_IAM_USER_ID` | — | ⬜ | |
-| `REDIS_PERSECOND_AWS_IAM_SERVERLESS` | `false` | ⬜ | |
-| `REDIS_PERSECOND_AWS_IAM_REGION` | — | ⬜ | |
+| `REDIS_PERSECOND_AWS_IAM_AUTH` | `false` | ✅ | as `REDIS_AWS_IAM_AUTH`, for the per-second pool: `elasticache_iam_tokens_authenticate_like_upstream`, `the_binary_fails_to_start_like_upstream` |
+| `REDIS_PERSECOND_AWS_IAM_CACHE_NAME` | — | ✅ | as `REDIS_AWS_IAM_CACHE_NAME` |
+| `REDIS_PERSECOND_AWS_IAM_USER_ID` | — | ✅ | as `REDIS_AWS_IAM_USER_ID` |
+| `REDIS_PERSECOND_AWS_IAM_SERVERLESS` | `false` | ✅ | as `REDIS_AWS_IAM_SERVERLESS` |
+| `REDIS_PERSECOND_AWS_IAM_REGION` | — | ✅ | as `REDIS_AWS_IAM_REGION` |
 | `REDIS_PERSECOND_TLS` | `false` | ✅ | the same configuration, for the per-second pool; its files loaded even with the pool off: `the_binary_fails_to_start_like_upstream` |
 | `REDIS_SENTINEL_AUTH` | — | ✅ | the sentinels' credentials (`user:password` or a password), their dialer's line at each attempt, a refusal retried: `sentinel_startup_is_logged_like_upstream` |
 | `REDIS_PERSECOND_SENTINEL_AUTH` | — | ✅ | as `REDIS_SENTINEL_AUTH`, for the per-second pool (the same code) |
@@ -217,7 +217,7 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Redis TLS, AUTH file | ✅ | `redis_over_tls_is_used_like_upstream`, `auth_files_are_reread_like_upstream` |
 | Redis cluster: the topology from the first seed that dials (`READONLY` sent on its connections unless upstream's dialer is replaced), each of its nodes dialled by address (with `REDIS_AUTH`, without the seed URL's credentials), keys on their slots' nodes, a pool per node, replicas included (`cx_*` count every node's), over TLS too; a node down at startup refused as upstream | ✅ | `a_redis_cluster_serves_like_upstream`, `a_redis_cluster_over_tls_serves_like_upstream`, `a_cluster_node_down_at_startup_is_logged_like_upstream`; `redis/connection.rs` unit tests |
 | Redis sentinel: the first sentinel that dials, the primary and its replicas it names (a pool on each: `cx_*` count theirs), by address with `REDIS_AUTH`; the failures as upstream's (an unknown primary, an unreachable sentinel, its auth refused, a URL without sentinels); after a failover, the new primary within radix's 5 s | ✅ | `a_redis_sentinel_serves_like_upstream`, `sentinel_startup_is_logged_like_upstream` |
-| Redis AWS IAM | ⬜ | |
+| Redis AWS IAM (ElastiCache): a SigV4-presigned token as each connection's password, reused until 14 min or a minute before the AWS credentials expire; the credentials from the source Go's SDK picks (the environment's keys, a web identity, the profile's keys, role, web identity, SSO, login or process, the container's endpoint, IMDS), cached as its cache does (the container's 5 min early); `AWS_CA_BUNDLE` (or the profile's `ca_bundle`) as the only roots of its AWS calls but the container's | ✅ | `elasticache_iam_tokens_authenticate_like_upstream`, `aws_credentials_are_found_like_upstream`, `expiring_aws_credentials_are_refreshed_like_upstream`, `an_aws_ca_bundle_is_trusted_like_upstream`, `the_binary_fails_to_start_like_upstream`; `redis/aws.rs` unit test |
 | Memcached: `GET` then asynchronous increments, `add` when absent, SRV, TLS, absolute expiry > 30 d, key ≤ 250 B | ⬜ | |
 
 ## 5. Metrics, logs, traces
@@ -306,6 +306,14 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | On SIGTERM, grpc-go closes each connection whose client does not answer its drain's ping 5 s later, once that connection's calls are done; a connection still in its TLS handshake or before its HTTP/2 preface holds the stop up to 120 s | the server stops 5 s later once no call is in flight on any connection | the process stops at the same time; `silent_grpc_clients_hold_the_stop_like_upstream` |
 | `GRPC_MAX_CONNECTION_AGE` gets ±10% of jitter (grpc-go) | applied as it is (tonic) | spreads reconnections only |
 | A `redis://` URL's `password` and `username` query parameters appear in startup messages (upstream masks only the user info), and `Creating single with urls %v` and `Creating cluster with urls %v` print `REDIS_URL` as given | masked too | keeps secrets out of logs |
+| Failing to get AWS credentials at a connection, Go's SDK error text follows `retrieving AWS credentials for ElastiCache IAM authentication: failed to refresh cached credentials, `, after its retries (IMDS: 3 attempts) | the Rust SDK's (aws-config) text and retries | best effort (D3): the same prefix, the same retries of the connection |
+| `config.LoadDefaultConfig` refuses at startup what it cannot parse in the environment or the profile for its other features (`AWS_MAX_ATTEMPTS=x`, `AWS_USE_FIPS_ENDPOINT=yes`, an incomplete SSO profile, …), and reads what it can of a malformed config or credentials file | such values ignored (an incomplete SSO profile fails at each connection instead); a file the Rust parser refuses is skipped whole | the credentials' and the region's own failures are reproduced; these are of settings the service does not use |
+| Go's STS client for the credentials ignores `AWS_ENDPOINT_URL` (only `AWS_ENDPOINT_URL_STS` reaches it) | both honoured | a global endpoint override meant for every service |
+| A `credential_process` without `PATH` in the environment fails (`sh` not found) | `sh` found in `/bin:/usr/bin` | Rust's default search path |
+| Under a role, the container's or IMDS' credentials have a cache of their own | asked again at each refresh of the role | a few more calls, at the role's refresh only |
+| A cache name that is not a host (`/`, a space, …) fails each connection's token (`building the ElastiCache IAM authentication request`) or signs part of it as a path | signed as the host as it is | ElastiCache names are `[a-z0-9-]` |
+| With `AWS_DEFAULT_PROFILE`, the container's and IMDS' own settings (`ec2_metadata_service_endpoint`, …) are read from that profile | from `AWS_PROFILE`'s, or `default` | aws-config reads them so; the credentials' profile is Go's |
+| The role session name Go sends by default (`aws-go-sdk-<ns>`, a web identity's `<ns>`) is the time of the first request | of the startup | the same form; only the time differs |
 | A refund has no effect on the local cache | clears the local entry (new types only) | D18 |
 | YAML syntax error text and line (Go's libyaml port) | the Rust parser's wording and position | different parser; the message structure is kept |
 | `invalid map key` message escapes strings with Go's `%#v` | Rust escaping for unusual characters | only differs for non-ASCII or control characters |

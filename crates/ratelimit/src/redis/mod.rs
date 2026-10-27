@@ -2,6 +2,7 @@
 //! `src/redis/fixed_cache_impl.go`: one pipeline of `INCRBY` + `EXPIRE` per request, and a Lua
 //! script for refunds. How the service reaches Redis is in [`connection`].
 
+mod aws;
 mod connection;
 pub mod tls;
 

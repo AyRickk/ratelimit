@@ -52,6 +52,20 @@ pub struct RedisConnection {
     /// For a pool through sentinels: the sentinels and their credentials, which the auth
     /// file (upstream's pool dialer only) must not replace.
     sentinel_dial: Option<(Vec<Server>, (String, String))>,
+    /// `REDIS_AWS_IAM_*` (or `REDIS_PERSECOND_AWS_IAM_*`) when enabled.
+    pub aws_iam: Option<super::aws::IamSettings>,
+    /// The ElastiCache IAM credentials, once loaded.
+    iam: Option<Iam>,
+}
+
+/// The pool's ElastiCache IAM credentials (equal when they are the same).
+#[derive(Debug, Clone)]
+struct Iam(std::sync::Arc<super::aws::IamCredentials>);
+
+impl PartialEq for Iam {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl std::fmt::Debug for RedisConnection {
@@ -67,6 +81,7 @@ impl std::fmt::Debug for RedisConnection {
             .field("redis_type", &self.redis_type)
             .field("prefix", &self.prefix)
             .field("auth_file", &self.auth_file)
+            .field("aws_iam", &self.aws_iam)
             .field("tls", &self.tls.is_some())
             .finish_non_exhaustive()
     }
@@ -99,13 +114,13 @@ struct PoolSettings<'a> {
     pipeline_window: i64,
     cluster_pipeline_parallelism: i64,
     sentinel_auth: &'a str,
+    aws_iam: Option<super::aws::IamSettings>,
 }
 
 impl RedisConnection {
     /// The main pool's connection (`REDIS_*`), or why upstream refuses to start (or what is
     /// not supported yet).
     pub fn from_settings(s: &Settings) -> Result<Self, String> {
-        crate::settings::refuse_unsupported(&[(s.redis_aws_iam_auth, "REDIS_AWS_IAM_AUTH")])?;
         Self::new(PoolSettings {
             prefix: "REDIS",
             socket_type: &s.redis_socket_type,
@@ -121,15 +136,18 @@ impl RedisConnection {
             pipeline_window: s.redis_pipeline_window,
             cluster_pipeline_parallelism: s.redis_cluster_pipeline_parallelism,
             sentinel_auth: &s.redis_sentinel_auth,
+            aws_iam: s.redis_aws_iam_auth.then(|| super::aws::IamSettings {
+                prefix: "REDIS",
+                cache_name: s.redis_aws_iam_cache_name.clone(),
+                user_id: s.redis_aws_iam_user_id.clone(),
+                serverless: s.redis_aws_iam_serverless,
+                region: s.redis_aws_iam_region.clone(),
+            }),
         })
     }
 
     /// The per-second pool's connection (`REDIS_PERSECOND_*`), for limits in seconds.
     pub fn per_second_from_settings(s: &Settings) -> Result<Self, String> {
-        crate::settings::refuse_unsupported(&[(
-            s.redis_persecond_aws_iam_auth,
-            "REDIS_PERSECOND_AWS_IAM_AUTH",
-        )])?;
         Self::new(PoolSettings {
             prefix: "REDIS_PERSECOND",
             socket_type: &s.redis_persecond_socket_type,
@@ -145,6 +163,15 @@ impl RedisConnection {
             pipeline_window: s.redis_persecond_pipeline_window,
             cluster_pipeline_parallelism: s.redis_persecond_cluster_pipeline_parallelism,
             sentinel_auth: &s.redis_persecond_sentinel_auth,
+            aws_iam: s
+                .redis_persecond_aws_iam_auth
+                .then(|| super::aws::IamSettings {
+                    prefix: "REDIS_PERSECOND",
+                    cache_name: s.redis_persecond_aws_iam_cache_name.clone(),
+                    user_id: s.redis_persecond_aws_iam_user_id.clone(),
+                    serverless: s.redis_persecond_aws_iam_serverless,
+                    region: s.redis_persecond_aws_iam_region.clone(),
+                }),
         })
     }
 
@@ -178,6 +205,8 @@ impl RedisConnection {
             url: p.url.to_string(),
             sentinel_auth: p.sentinel_auth.to_string(),
             sentinel_dial: None,
+            aws_iam: p.aws_iam,
+            iam: None,
         })
     }
 
@@ -270,14 +299,22 @@ impl RedisConnection {
 
     /// The user and password to authenticate with: from `REDIS_AUTH` (or the URL), or from
     /// the auth file, read now, what it leaves empty taken from the URL (radix's `Dial`).
-    fn credentials(&self) -> Result<(String, String), String> {
-        self.file_credentials().credentials()
+    async fn credentials(&self) -> Result<(String, String), String> {
+        self.connection_credentials().credentials().await
     }
 
-    /// What reads the credentials at each connection: the file, and the URL's for what it
-    /// leaves empty (with no file, they are `REDIS_AUTH`'s or the URL's).
-    fn file_credentials(&self) -> FileCredentials {
-        FileCredentials {
+    /// Whether upstream's dialer resolves the credentials at each connection (a
+    /// `CredentialProvider`, which replaces radix's dialer with `CustomConn`).
+    fn has_credential_provider(&self) -> bool {
+        !self.auth_file.is_empty() || self.iam.is_some()
+    }
+
+    /// What reads the credentials at each connection: the ElastiCache IAM token, or the file
+    /// and the URL's for what it leaves empty (with no file, they are `REDIS_AUTH`'s or the
+    /// URL's).
+    fn connection_credentials(&self) -> ConnectionCredentials {
+        ConnectionCredentials {
+            iam: self.iam.clone().map(|Iam(iam)| iam),
             path: self.auth_file.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
@@ -290,11 +327,11 @@ impl RedisConnection {
         // With an auth file, each connection reads it (the provider), as radix's dialer does;
         // fred reads it once connected, where radix reads it before dialling.
         let mut credential_provider = None;
-        let (username, password) = if self.auth_file.is_empty() {
+        let (username, password) = if !self.has_credential_provider() {
             fred_credentials(&(self.username.clone(), self.password.clone()))
         } else {
             let provider: std::sync::Arc<dyn fred::types::config::CredentialProvider> =
-                std::sync::Arc::new(self.file_credentials());
+                std::sync::Arc::new(self.connection_credentials());
             credential_provider = Some(provider);
             (None, None)
         };
@@ -633,7 +670,7 @@ impl RedisConnection {
     /// Redis may refuse. Then the probe, which answers `PING`.
     async fn probe(&self, dial: Dial) -> Result<(ServerConfig, Client), String> {
         // The auth file is read before dialling (radix's `CustomConn`).
-        let credentials = self.credentials()?;
+        let credentials = self.credentials().await?;
         let server = self.server().await?;
         let mut stream = self.dial(&server).await?;
         let mut commands = Vec::new();
@@ -642,7 +679,7 @@ impl RedisConnection {
             commands.push(("SELECT", vec![self.database.clone()]));
         }
         // A cluster's dialer sends READONLY, unless upstream replaced it (`CustomConn`).
-        if dial == Dial::ClusterNode && self.auth_file.is_empty() && !self.close_on_readonly {
+        if dial == Dial::ClusterNode && !self.has_credential_provider() && !self.close_on_readonly {
             commands.push(("READONLY", Vec::new()));
         }
         for (name, arguments) in commands {
@@ -800,6 +837,21 @@ impl RedisConnection {
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<Connected, String> {
         // `newCredentialProviderFromSettings`, before `newClientImpl` starts.
+        if let Some(iam) = &self.aws_iam {
+            if !self.auth.is_empty() || !self.auth_file.is_empty() {
+                return Err(format!(
+                    "{p}_AWS_IAM_AUTH cannot be combined with {p}_AUTH or {p}_AUTH_FILE",
+                    p = self.prefix
+                ));
+            }
+            let credentials = super::aws::IamCredentials::load(iam).await?;
+            let connection = Self {
+                aws_iam: None,
+                iam: Some(Iam(std::sync::Arc::new(credentials))),
+                ..self.clone()
+            };
+            return Box::pin(connection.connect(startup, cancelled)).await;
+        }
         if !self.auth_file.is_empty() && !self.auth.is_empty() {
             return Err(format!(
                 "{p}_AUTH and {p}_AUTH_FILE are mutually exclusive",
@@ -838,7 +890,7 @@ impl RedisConnection {
                 crate::go::format_duration(self.pipeline_window)
             );
         }
-        if !self.auth_file.is_empty() {
+        if self.has_credential_provider() {
             crate::log::warn(&format!(
                 "Redis pool {masked}: resolving credentials on every connection attempt"
             ));
@@ -1099,9 +1151,11 @@ fn read_auth_file(path: &str) -> Result<(String, String), String> {
     })
 }
 
-/// The pool's credentials, read from the auth file at each connection; what it leaves empty
-/// is the URL's.
-struct FileCredentials {
+/// The pool's credentials at each connection: the ElastiCache IAM token, or those of the
+/// auth file, read again, what it leaves empty being the URL's.
+struct ConnectionCredentials {
+    /// The ElastiCache IAM token's, in place of the file.
+    iam: Option<std::sync::Arc<super::aws::IamCredentials>>,
     /// Empty: the URL's credentials (or `REDIS_AUTH`'s) as they are.
     path: String,
     username: String,
@@ -1110,17 +1164,24 @@ struct FileCredentials {
     sentinels: Option<(Vec<Server>, (String, String))>,
 }
 
-impl std::fmt::Debug for FileCredentials {
+impl std::fmt::Debug for ConnectionCredentials {
     /// The path only: the password stays out.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileCredentials")
+        f.debug_struct("ConnectionCredentials")
             .field("path", &self.path)
             .finish()
     }
 }
 
-impl FileCredentials {
-    fn credentials(&self) -> Result<(String, String), String> {
+impl ConnectionCredentials {
+    async fn credentials(&self) -> Result<(String, String), String> {
+        match &self.iam {
+            Some(iam) => iam.credentials().await,
+            None => self.file(),
+        }
+    }
+
+    fn file(&self) -> Result<(String, String), String> {
         if self.path.is_empty() {
             return Ok((self.username.clone(), self.password.clone()));
         }
@@ -1136,7 +1197,7 @@ impl FileCredentials {
 }
 
 #[tonic::async_trait]
-impl fred::types::config::CredentialProvider for FileCredentials {
+impl fred::types::config::CredentialProvider for ConnectionCredentials {
     async fn fetch(
         &self,
         server: Option<&Server>,
@@ -1151,6 +1212,7 @@ impl fred::types::config::CredentialProvider for FileCredentials {
         }
         let credentials = self
             .credentials()
+            .await
             .map_err(|e| fred::error::Error::new(fred::error::ErrorKind::Auth, e))?;
         Ok(fred_credentials(&credentials))
     }
@@ -1539,13 +1601,14 @@ mod auth_file_tests {
         let credentials = |contents: &str| {
             let path = dir.join("auth");
             std::fs::write(&path, contents).unwrap();
-            FileCredentials {
+            ConnectionCredentials {
+                iam: None,
                 path: path.to_string_lossy().into_owned(),
                 username: "url-user".into(),
                 password: "url-pass".into(),
                 sentinels: None,
             }
-            .credentials()
+            .file()
             .unwrap()
         };
         assert_eq!(credentials("me:"), ("me".into(), "url-pass".into()));
