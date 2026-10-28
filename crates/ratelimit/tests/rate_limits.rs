@@ -1,0 +1,447 @@
+//! `rate_limits:`, several named limits per descriptor (docs/design.md D7), with `fixed`
+//! windows of any duration and origin (D8, ADR 0002): how they load and what is refused.
+//! Counting them is in `differential.rs` (which runs a Redis), next to upstream's limits.
+
+use ratelimit::config::window::{FixedWindow, Origin};
+use ratelimit::config::{self, ConfigFile, LimitLookup, LoadOptions, RateLimit};
+use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
+    RateLimitDescriptor, rate_limit_descriptor::Entry,
+};
+use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::rate_limit::Unit;
+
+fn load(yaml: &str) -> Result<config::RateLimitConfig, String> {
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: yaml.into(),
+    };
+    config::load(&[file], &LoadOptions::default()).map_err(|e| e.to_string())
+}
+
+fn descriptor(entries: &[(&str, &str)]) -> RateLimitDescriptor {
+    RateLimitDescriptor {
+        entries: entries
+            .iter()
+            .map(|(key, value)| Entry {
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The limits a descriptor's lookup finds in a `rate_limits:` list.
+fn list(yaml: &str, entries: &[(&str, &str)]) -> Vec<RateLimit> {
+    match load(yaml).unwrap().get_limit("d", &descriptor(entries)) {
+        LimitLookup::List(limits) => limits,
+        other => panic!("not a list: {other:?}"),
+    }
+}
+
+/// A descriptor's list with one limit of this `window`.
+fn with_window(window: &str) -> String {
+    format!(
+        "domain: d\ndescriptors:\n  - key: user\n    rate_limits:\n      - name: w\n        requests_per_unit: 1\n        window: {window}\n"
+    )
+}
+
+#[test]
+fn a_list_gives_each_limit_its_name_window_and_stats_key() {
+    let limits = list(
+        "
+domain: d
+descriptors:
+  - key: user
+    shadow_mode: true
+    quota_mode: true
+    metadata: {tier: free}
+    rate_limits:
+      - name: five_hour
+        requests_per_unit: 500
+        window: {type: fixed, duration: 5h}
+      - name: weekly
+        requests_per_unit: 5000
+        window: {type: fixed, duration: 7d, offset: 4d}
+",
+        &[("user", "alice")],
+    );
+    let shown: Vec<_> = limits
+        .iter()
+        .map(|l| {
+            (
+                l.full_key.as_str(),
+                l.limit.name.as_str(),
+                l.limit.requests_per_unit,
+                l.limit.unit(),
+                l.limit.unit_multiplier,
+                l.window,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                "d.user~five_hour",
+                "five_hour",
+                500,
+                Unit::Hour,
+                Some(5),
+                Some(FixedWindow {
+                    duration: 5 * 3600,
+                    origin: Origin::Epoch
+                })
+            ),
+            (
+                "d.user~weekly",
+                "weekly",
+                5000,
+                Unit::Week,
+                None,
+                Some(FixedWindow {
+                    duration: 7 * 86_400,
+                    origin: Origin::Offset(4 * 86_400)
+                })
+            ),
+        ]
+    );
+    // The descriptor's settings, for every limit of the list (D7).
+    for limit in &limits {
+        assert!(limit.shadow_mode && limit.quota_mode, "{limit:?}");
+        assert!(limit.metadata.is_some(), "{limit:?}");
+    }
+}
+
+/// D13: the largest unit whose length divides the duration, and how many of them.
+#[test]
+fn windows_are_reported_in_the_largest_unit_dividing_them() {
+    let reported = |duration: &str| {
+        let limits = list(
+            &with_window(&format!("{{type: fixed, duration: {duration}}}")),
+            &[("user", "a")],
+        );
+        (limits[0].limit.unit(), limits[0].limit.unit_multiplier)
+    };
+    assert_eq!(reported("1s"), (Unit::Second, None));
+    assert_eq!(reported("90s"), (Unit::Second, Some(90)));
+    assert_eq!(reported("1h30m"), (Unit::Minute, Some(90)));
+    assert_eq!(reported("60m"), (Unit::Hour, None));
+    assert_eq!(reported("48h"), (Unit::Day, Some(2)));
+    assert_eq!(reported("2w"), (Unit::Week, Some(2)));
+    assert_eq!(reported("30d"), (Unit::Month, None));
+    assert_eq!(reported("365d"), (Unit::Year, None));
+    assert_eq!(reported("730d"), (Unit::Year, Some(2)));
+}
+
+/// ADR 0002: `offset: hashed`, with the default rounding (the largest of 1h, 1m, 1s that
+/// divides the duration) or a given one; `offset: 0` is the epoch's.
+#[test]
+fn offsets_are_read_as_adr_0002_writes_them() {
+    let origin = |window: &str| {
+        list(&with_window(window), &[("user", "a")])[0]
+            .window
+            .unwrap()
+            .origin
+    };
+    assert_eq!(
+        origin("{type: fixed, duration: 7d, offset: hashed}"),
+        Origin::Hashed { rounding: 3600 }
+    );
+    assert_eq!(
+        origin("{type: fixed, duration: 90s, offset: hashed}"),
+        Origin::Hashed { rounding: 1 }
+    );
+    assert_eq!(
+        origin("{type: fixed, duration: 1d, offset: hashed, offset_rounding: 6h}"),
+        Origin::Hashed { rounding: 6 * 3600 }
+    );
+    assert_eq!(
+        origin("{type: fixed, duration: 1d, offset: 0}"),
+        Origin::Epoch
+    );
+    assert_eq!(
+        origin("{type: fixed, duration: 1d, offset: 0s}"),
+        Origin::Epoch
+    );
+    assert_eq!(
+        origin("{type: fixed, duration: 1d, offset: 23h59m59s}"),
+        Origin::Offset(86_399)
+    );
+}
+
+/// The hashed phase: FNV-1a 64 over `key=value` joined by NUL, modulo the steps of the
+/// rounding (expected values from an independent implementation).
+#[test]
+fn hashed_phases_follow_the_descriptor() {
+    let window = FixedWindow {
+        duration: 7 * 86_400,
+        origin: Origin::Hashed { rounding: 3600 },
+    };
+    assert_eq!(window.phase([("user", "alice")]), 428_400);
+    assert_eq!(window.phase([("user", "bob")]), 504_000);
+    assert_eq!(window.phase([("org", "acme"), ("user", "alice")]), 475_200);
+    // At 1_000_000_000, alice's week started at 999_558_000 and ends in 162_800 s.
+    let phase = window.phase([("user", "alice")]);
+    assert_eq!(window.start(1_000_000_000, phase), 999_558_000);
+    assert_eq!(window.reset(1_000_000_000, phase), 162_800);
+}
+
+/// Configs a list makes invalid, each with its message.
+#[test]
+fn invalid_lists_are_refused() {
+    let descriptor = |body: &str| format!("domain: d\ndescriptors:\n  - key: user\n{body}");
+    let entry = |fields: &str| descriptor(&format!("    rate_limits:\n      - {{{fields}}}\n"));
+    let fixed = "window: {type: fixed, duration: 1h}";
+    let cases: Vec<(String, &str)> = vec![
+        (
+            descriptor(&format!(
+                "    rate_limit: {{unit: hour, requests_per_unit: 1}}\n    rate_limits:\n      - {{name: a, {fixed}}}\n"
+            )),
+            "config.yaml: d.user: should not specify both rate_limit and rate_limits",
+        ),
+        (
+            descriptor("    rate_limits: []\n"),
+            "config.yaml: d.user: rate_limits should not be empty",
+        ),
+        (
+            entry(&format!("requests_per_unit: 1, {fixed}")),
+            "config.yaml: d.user: invalid rate_limits name '': 1 to 64 letters, digits, '_' or '-', starting with a letter or digit",
+        ),
+        (
+            entry(&format!("name: a.b, {fixed}")),
+            "config.yaml: d.user: invalid rate_limits name 'a.b': 1 to 64 letters, digits, '_' or '-', starting with a letter or digit",
+        ),
+        (
+            entry(&format!("name: _a, {fixed}")),
+            "config.yaml: d.user: invalid rate_limits name '_a': 1 to 64 letters, digits, '_' or '-', starting with a letter or digit",
+        ),
+        (
+            entry(&format!("name: {}, {fixed}", "a".repeat(65))),
+            "config.yaml: d.user: invalid rate_limits name 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': 1 to 64 letters, digits, '_' or '-', starting with a letter or digit",
+        ),
+        (
+            descriptor(&format!(
+                "    rate_limits:\n      - {{name: a, {fixed}}}\n      - {{name: a, {fixed}}}\n"
+            )),
+            "config.yaml: d.user~a: duplicate rate_limits name",
+        ),
+        (
+            entry(&format!("name: a, unit: hour, {fixed}")),
+            "config.yaml: d.user~a: rate_limits entries take a window, not a unit",
+        ),
+        (
+            entry(&format!("name: a, unlimited: true, {fixed}")),
+            "config.yaml: d.user~a: rate_limits entries cannot be unlimited: use rate_limit: {unlimited: true}",
+        ),
+        (
+            descriptor(&format!(
+                "    rate_limits:\n      - {{name: a, {fixed}, replaces: [{{name: b}}]}}\n      - {{name: b, {fixed}}}\n"
+            )),
+            "config.yaml: d.user~a: replaces should not contain a name of the same rate_limits",
+        ),
+        (
+            entry(&format!("name: a, {fixed}, replaces: [{{name: a}}]")),
+            "config.yaml: d.user~a: replaces should not contain a name of the same rate_limits",
+        ),
+        (
+            entry(&format!("name: a, {fixed}, replaces: [{{}}]")),
+            "config.yaml: d.user~a: should not have an empty replaces entry",
+        ),
+        (
+            entry("name: a"),
+            "config.yaml: d.user~a: window is required",
+        ),
+        (
+            entry("name: a, window: {duration: 1h}"),
+            "config.yaml: d.user~a: window type is required",
+        ),
+        (
+            entry("name: a, window: {type: sliding, duration: 1h}"),
+            "config.yaml: d.user~a: window type 'sliding' is not supported yet",
+        ),
+        (
+            entry("name: a, window: {type: rolling, duration: 1h}"),
+            "config.yaml: d.user~a: unknown window type 'rolling'",
+        ),
+        (
+            entry("name: a, window: {type: fixed}"),
+            "config.yaml: d.user~a: window duration is required",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 60}"),
+            "config.yaml: d.user~a: invalid window duration '60'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1.5h}"),
+            "config.yaml: d.user~a: invalid window duration '1.5h'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 500ms}"),
+            "config.yaml: d.user~a: invalid window duration '500ms'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 0s}"),
+            "config.yaml: d.user~a: invalid window duration '0s'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 30m1h}"),
+            "config.yaml: d.user~a: invalid window duration '30m1h'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1h1h}"),
+            "config.yaml: d.user~a: invalid window duration '1h1h'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1d, offset: 1d}"),
+            "config.yaml: d.user~a: offset '1d' must be shorter than the window duration '1d'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1d, offset: soon}"),
+            "config.yaml: d.user~a: invalid offset 'soon'",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1d, offset_rounding: 1h}"),
+            "config.yaml: d.user~a: offset_rounding needs offset: hashed",
+        ),
+        (
+            entry("name: a, window: {type: fixed, duration: 1d, offset: 1h, offset_rounding: 1h}"),
+            "config.yaml: d.user~a: offset_rounding needs offset: hashed",
+        ),
+        (
+            entry(
+                "name: a, window: {type: fixed, duration: 1d, offset: hashed, offset_rounding: 7h}",
+            ),
+            "config.yaml: d.user~a: offset_rounding '7h' must divide the window duration '1d'",
+        ),
+        (
+            entry(
+                "name: a, window: {type: fixed, duration: 1d, offset: hashed, offset_rounding: 2d}",
+            ),
+            "config.yaml: d.user~a: offset_rounding '2d' must divide the window duration '1d'",
+        ),
+        (
+            descriptor(&format!(
+                "    overflow: strict\n    rate_limits:\n      - {{name: a, {fixed}}}\n"
+            )),
+            "config.yaml: d.user: overflow: strict is not supported yet",
+        ),
+        (
+            descriptor("    overflow: lax\n    rate_limit: {unit: hour, requests_per_unit: 1}\n"),
+            "config.yaml: d.user: invalid overflow 'lax': envoy or strict",
+        ),
+    ];
+    for (yaml, expected) in cases {
+        assert_eq!(load(&yaml).err().as_deref(), Some(expected), "{yaml}");
+    }
+}
+
+/// The list's keys are only valid in their place: elsewhere they are unknown, as upstream
+/// says of any key it does not know.
+#[test]
+fn list_keys_elsewhere_are_unknown_keys() {
+    let cases = [
+        ("domain: d\nrate_limits: []\n", "rate_limits"),
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    rate_limit: {unit: hour, requests_per_unit: 1, window: {}}\n",
+            "window",
+        ),
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    duration: 1h\n",
+            "duration",
+        ),
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    rate_limits:\n      - {name: a, shadow_mode: true, window: {type: fixed, duration: 1h}}\n",
+            "shadow_mode",
+        ),
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    rate_limits:\n      - {name: a, window: {type: fixed, duration: 1h, unit: hour}}\n",
+            "unit",
+        ),
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    rate_limit:\n      overflow: envoy\n",
+            "overflow",
+        ),
+        // Under a `descriptors` that is not a descriptor's.
+        (
+            "domain: d\ndescriptors:\n  - key: a\n    rate_limit:\n      descriptors:\n        - {rate_limits: []}\n",
+            "rate_limits",
+        ),
+    ];
+    for (yaml, key) in cases {
+        assert_eq!(
+            load(yaml).err(),
+            Some(format!("config.yaml: config error, unknown key '{key}'")),
+            "{yaml}"
+        );
+    }
+}
+
+/// `overflow: envoy` is the default, on either form of limit.
+#[test]
+fn overflow_envoy_is_accepted() {
+    load("domain: d\ndescriptors:\n  - key: a\n    overflow: envoy\n    rate_limit: {unit: hour, requests_per_unit: 1}\n")
+        .unwrap();
+    list(
+        "domain: d\ndescriptors:\n  - key: user\n    overflow: envoy\n    rate_limits:\n      - {name: a, window: {type: fixed, duration: 1h}}\n",
+        &[("user", "x")],
+    );
+}
+
+/// `/rlconfig`: a line per limit of a list, with its stats key and its window.
+#[test]
+fn lists_are_dumped_limit_by_limit() {
+    let config = load(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: a, requests_per_unit: 1, window: {type: fixed, duration: 5h}}
+      - {name: b, requests_per_unit: 2, window: {type: fixed, duration: 7d, offset: 4d}}
+      - {name: c, requests_per_unit: 3, window: {type: fixed, duration: 1d, offset: hashed}}
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.dump(),
+        "d.user~a: window=fixed 18000s requests_per_unit=1, shadow_mode: false, quota_mode: false
+d.user~b: window=fixed 604800s offset=345600s requests_per_unit=2, shadow_mode: false, quota_mode: false
+d.user~c: window=fixed 86400s offset=hashed/3600s requests_per_unit=3, shadow_mode: false, quota_mode: false
+"
+    );
+}
+
+/// `detailed_metric`, `value_to_metric` and `share_threshold` name the stats as for a
+/// `rate_limit:`, the limit's name last.
+#[test]
+fn list_stats_keys_follow_the_descriptor_settings() {
+    let key = |body: &str, entries: &[(&str, &str)]| {
+        list(&format!("domain: d\ndescriptors:\n{body}"), entries)[0]
+            .full_key
+            .clone()
+    };
+    let limits = "    rate_limits:\n      - {name: n, window: {type: fixed, duration: 1h}}\n";
+    assert_eq!(
+        key(
+            &format!("  - key: user\n    detailed_metric: true\n{limits}"),
+            &[("user", "alice")]
+        ),
+        "d.user_alice~n"
+    );
+    assert_eq!(
+        key(
+            &format!("  - key: user\n    value_to_metric: true\n{limits}"),
+            &[("user", "alice")]
+        ),
+        "d.user_alice~n"
+    );
+    assert_eq!(
+        key(
+            &format!(
+                "  - key: file\n    value: \"a*\"\n    share_threshold: true\n    detailed_metric: true\n{limits}"
+            ),
+            &[("file", "abc")]
+        ),
+        "d.file_a*~n"
+    );
+}

@@ -22,18 +22,19 @@ impl RateLimitCache for OverWhenLimited {
     async fn do_limit(
         &self,
         _request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> Result<Vec<DescriptorStatus>, CacheError> {
+        limits: &[Vec<RateLimit>],
+    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
         Ok(limits
             .iter()
-            .map(|limit| DescriptorStatus {
-                code: if limit.is_some() {
-                    Code::OverLimit
-                } else {
-                    Code::Ok
-                } as i32,
-                current_limit: limit.as_ref().map(|l| l.limit.clone()),
-                ..Default::default()
+            .map(|limits| {
+                limits
+                    .iter()
+                    .map(|limit| DescriptorStatus {
+                        code: Code::OverLimit as i32,
+                        current_limit: Some(limit.limit.clone()),
+                        ..Default::default()
+                    })
+                    .collect()
             })
             .collect())
     }

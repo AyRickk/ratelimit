@@ -35,6 +35,10 @@ pub(crate) struct YamlDescriptor {
     pub key: String,
     pub value: String,
     pub rate_limit: Option<YamlRateLimit>,
+    /// `rate_limits:` (D7), when present.
+    pub rate_limits: Option<Vec<YamlListLimit>>,
+    /// `overflow:` (D14), as written.
+    pub overflow: String,
     pub descriptors: Vec<YamlDescriptor>,
     pub shadow_mode: bool,
     pub quota_mode: bool,
@@ -51,6 +55,27 @@ pub(crate) struct YamlRateLimit {
     pub unlimited: bool,
     pub name: String,
     pub replaces: Vec<String>,
+}
+
+/// An entry of `rate_limits:`.
+#[derive(Debug, Default)]
+pub(crate) struct YamlListLimit {
+    pub name: String,
+    pub requests_per_unit: u32,
+    pub window: Option<YamlWindow>,
+    pub replaces: Vec<String>,
+    /// Whether `unit` or `unlimited` is set, which the list does not allow.
+    pub unit: bool,
+    pub unlimited: bool,
+}
+
+/// A list limit's `window`, its values as written.
+#[derive(Debug, Default)]
+pub(crate) struct YamlWindow {
+    pub kind: String,
+    pub duration: String,
+    pub offset: String,
+    pub offset_rounding: String,
 }
 
 /// Mapping entries with duplicate keys collapsed, the last one winning, like a Go map.
@@ -93,16 +118,66 @@ fn go_format_node(node: &Node) -> String {
     }
 }
 
+/// Where a mapping sits. Upstream's keys are valid anywhere; the keys of `rate_limits:`
+/// (docs/design.md D7) only in their place, so that a config upstream refuses is still refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Root,
+    /// An item of a `descriptors` list, at the root or in a descriptor.
+    Descriptor,
+    /// An item of a descriptor's `rate_limits` list.
+    ListLimit,
+    /// A list limit's `window`.
+    Window,
+    /// An item of a list limit's `replaces`.
+    Replaces,
+    Other,
+}
+
+impl Place {
+    fn allows(self, key: &str) -> bool {
+        match self {
+            Place::Root | Place::Other => VALID_KEYS.contains(&key),
+            Place::Descriptor => {
+                VALID_KEYS.contains(&key) || key == "rate_limits" || key == "overflow"
+            }
+            // `unit` and `unlimited` are refused with their own message when decoded.
+            Place::ListLimit => [
+                "name",
+                "requests_per_unit",
+                "window",
+                "replaces",
+                "unit",
+                "unlimited",
+            ]
+            .contains(&key),
+            Place::Window => ["type", "duration", "offset", "offset_rounding"].contains(&key),
+            Place::Replaces => key == "name",
+        }
+    }
+
+    /// The place of the mappings under `key`.
+    fn under(self, key: &str) -> Place {
+        match (self, key) {
+            (Place::Root | Place::Descriptor, "descriptors") => Place::Descriptor,
+            (Place::Descriptor, "rate_limits") => Place::ListLimit,
+            (Place::ListLimit, "window") => Place::Window,
+            (Place::ListLimit, "replaces") => Place::Replaces,
+            _ => Place::Other,
+        }
+    }
+}
+
 /// `validateYamlKeys`: every key anywhere outside `metadata` must be a known string key,
 /// lists may only contain maps, and leaves may only be strings, ints, bools or null.
 fn validate_keys(root: Option<&Node>) -> Result<(), String> {
     match root {
-        Some(Node::Map { entries, .. }) => validate_map(entries),
+        Some(Node::Map { entries, .. }) => validate_map(entries, Place::Root),
         _ => Ok(()),
     }
 }
 
-fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
+fn validate_map(entries: &[(Node, Node)], place: Place) -> Result<(), String> {
     for (k, v) in dedup_entries(entries) {
         let key = match k {
             Node::Scalar(s) => s.resolve(),
@@ -114,7 +189,7 @@ fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
                 go_format(&key)
             ));
         };
-        if !VALID_KEYS.contains(&key.as_str()) {
+        if !place.allows(&key) {
             return Err(format!("config error, unknown key '{key}'"));
         }
         if key == "metadata" {
@@ -124,7 +199,7 @@ fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
             Node::Seq { items, .. } => {
                 for item in items {
                     match item {
-                        Node::Map { entries, .. } => validate_map(entries)?,
+                        Node::Map { entries, .. } => validate_map(entries, place.under(&key))?,
                         other => {
                             return Err(format!(
                                 "config error, yaml file contains list of type other than map: {}",
@@ -134,7 +209,7 @@ fn validate_map(entries: &[(Node, Node)]) -> Result<(), String> {
                     }
                 }
             }
-            Node::Map { entries, .. } => validate_map(entries)?,
+            Node::Map { entries, .. } => validate_map(entries, place.under(&key))?,
             Node::Scalar(s) => match s.resolve() {
                 Resolved::Str(_) | Resolved::Int(_) | Resolved::Bool(_) | Resolved::Null => {}
                 Resolved::Uint(_) | Resolved::Float(_) => {
@@ -330,6 +405,11 @@ impl Decoder {
                 "key" => d.key = self.string(v),
                 "value" => d.value = self.string(v),
                 "rate_limit" => self.rate_limit(v, &mut d.rate_limit),
+                "overflow" => d.overflow = self.string(v),
+                "rate_limits" => {
+                    let items = self.seq(v, "[]config.YamlListLimit");
+                    d.rate_limits = Some(items.iter().map(|item| self.list_limit(item)).collect());
+                }
                 "descriptors" => d.descriptors = self.descriptors(v),
                 "shadow_mode" => d.shadow_mode = self.boolean(v),
                 "quota_mode" => d.quota_mode = self.boolean(v),
@@ -361,26 +441,58 @@ impl Decoder {
                 "unit" => rl.unit = self.string(v),
                 "unlimited" => rl.unlimited = self.boolean(v),
                 "name" => rl.name = self.string(v),
-                "replaces" => {
-                    rl.replaces = self
-                        .seq(v, "[]config.yamlReplaces")
-                        .iter()
-                        .map(|item| {
-                            let mut replaced = String::new();
-                            for (name, v) in
-                                self.fields(item, "config.yamlReplaces").unwrap_or_default()
-                            {
-                                if name == "name" {
-                                    replaced = self.string(v);
-                                }
-                            }
-                            replaced
-                        })
-                        .collect()
-                }
+                "replaces" => rl.replaces = self.replaces(v),
                 _ => {}
             }
         }
+    }
+
+    fn list_limit(&mut self, node: &Node) -> YamlListLimit {
+        let mut limit = YamlListLimit::default();
+        for (name, v) in self
+            .fields(node, "config.YamlListLimit")
+            .unwrap_or_default()
+        {
+            match name.as_str() {
+                "name" => limit.name = self.string(v),
+                "requests_per_unit" => limit.requests_per_unit = self.uint32(v),
+                "window" => limit.window = Some(self.window(v)),
+                "replaces" => limit.replaces = self.replaces(v),
+                "unit" => limit.unit = true,
+                "unlimited" => limit.unlimited = true,
+                _ => {}
+            }
+        }
+        limit
+    }
+
+    fn window(&mut self, node: &Node) -> YamlWindow {
+        let mut window = YamlWindow::default();
+        for (name, v) in self.fields(node, "config.YamlWindow").unwrap_or_default() {
+            match name.as_str() {
+                "type" => window.kind = self.string(v),
+                "duration" => window.duration = self.string(v),
+                "offset" => window.offset = self.string(v),
+                "offset_rounding" => window.offset_rounding = self.string(v),
+                _ => {}
+            }
+        }
+        window
+    }
+
+    fn replaces(&mut self, node: &Node) -> Vec<String> {
+        self.seq(node, "[]config.yamlReplaces")
+            .iter()
+            .map(|item| {
+                let mut replaced = String::new();
+                for (name, v) in self.fields(item, "config.yamlReplaces").unwrap_or_default() {
+                    if name == "name" {
+                        replaced = self.string(v);
+                    }
+                }
+                replaced
+            })
+            .collect()
     }
 
     /// A `map[string]interface{}` field as a protobuf `Struct`, nil when empty. Decoding into

@@ -2,7 +2,7 @@
 //! `src/service/ratelimit.go`.
 
 use crate::config::{ConfigError, LimitLookup, RateLimit, RateLimitConfig};
-use crate::limiter::{Clock, reset_seconds};
+use crate::limiter::Clock;
 use crate::stats::Stats;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use ratelimit_proto::envoy::config::core::v3::HeaderValue;
@@ -22,21 +22,21 @@ pub struct CacheError(pub String);
 
 /// The counting backend (upstream's `RateLimitCache`).
 pub trait RateLimitCache: Send + Sync + 'static {
-    /// Counts the request against `limits`, one per descriptor (`None`: nothing to check),
-    /// and returns one status per descriptor.
+    /// Counts the request against `limits`, a list per descriptor (empty: nothing to check),
+    /// and returns, per descriptor, a status per limit, before shadow mode.
     fn do_limit(
         &self,
         request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> impl Future<Output = Result<Vec<DescriptorStatus>, CacheError>> + Send;
+        limits: &[Vec<RateLimit>],
+    ) -> impl Future<Output = Result<Vec<Vec<DescriptorStatus>>, CacheError>> + Send;
 }
 
 impl<T: RateLimitCache> RateLimitCache for Arc<T> {
     fn do_limit(
         &self,
         request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> impl Future<Output = Result<Vec<DescriptorStatus>, CacheError>> + Send {
+        limits: &[Vec<RateLimit>],
+    ) -> impl Future<Output = Result<Vec<Vec<DescriptorStatus>>, CacheError>> + Send {
         T::do_limit(self, request, limits)
     }
 }
@@ -208,34 +208,54 @@ impl<C: RateLimitCache> RateLimitService<C> {
             .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
         let checks = descriptor_checks(&config, request, &self.stats);
         let unknown_unit = checks.iter().any(|check| {
-            matches!(check, Check::Limit(Some(limit)) if limit.limit.unit() == Unit::Unknown)
+            matches!(check, Check::Limits(limits) if limits.iter().any(|l| l.limit.unit() == Unit::Unknown))
         });
         if unknown_unit {
             return Err(ServiceError::InvalidArgument(
                 "invalid rate limit unit UNKNOWN".into(),
             ));
         }
-        let limits: Vec<Option<RateLimit>> = checks
+        let limits: Vec<Vec<RateLimit>> = checks
             .iter()
             .map(|check| match check {
-                Check::Limit(limit) => limit.clone(),
-                Check::Unlimited => None,
+                Check::Limits(limits) => limits.clone(),
+                Check::Unlimited => Vec::new(),
             })
             .collect();
-        let mut statuses = self.cache.do_limit(request, &limits).await?;
+        let per_limit = self.cache.do_limit(request, &limits).await?;
+        let lengths_match = per_limit.len() == limits.len()
+            && per_limit
+                .iter()
+                .zip(&limits)
+                .all(|(s, l)| s.len() == l.len());
+        if !lengths_match {
+            // Upstream asserts here and crashes; this is a backend bug, reported as such.
+            return Err(CacheError(format!(
+                "cache returned {} statuses for {} descriptors",
+                per_limit.iter().map(Vec::len).sum::<usize>(),
+                limits.iter().map(Vec::len).sum::<usize>()
+            ))
+            .into());
+        }
+        // Each descriptor's representative status (D17), then its shadow mode.
+        let representatives: Vec<Option<usize>> =
+            per_limit.iter().map(|s| representative(s)).collect();
+        let mut statuses: Vec<DescriptorStatus> = per_limit
+            .iter()
+            .zip(&representatives)
+            .zip(&limits)
+            .map(|((statuses, chosen), limits)| match chosen {
+                Some(i) => shadowed(statuses[*i].clone(), &limits[*i]),
+                None => DescriptorStatus {
+                    code: Code::Ok as i32,
+                    ..Default::default()
+                },
+            })
+            .collect();
         crate::debug!(
             "descriptor statuses: {}",
             crate::prototext::statuses(&statuses)
         );
-        if statuses.len() != checks.len() {
-            // Upstream asserts here and crashes; this is a backend bug, reported as such.
-            return Err(CacheError(format!(
-                "cache returned {} statuses for {} descriptors",
-                statuses.len(),
-                checks.len()
-            ))
-            .into());
-        }
 
         // A regular descriptor over its limit makes the request over. Quota descriptors are
         // grouped by model: a group is over when any of its descriptors is, and the request
@@ -244,16 +264,23 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let mut quota_groups: HashMap<String, bool> = HashMap::new();
         // The descriptor closest to its limit, for the headers: chosen among the backend's
         // statuses (unlimited ones have no limit), the first on a tie, but the last regular
-        // descriptor over its limit wins outright, counting as 0 remaining.
-        let mut closest: Option<DescriptorStatus> = None;
+        // descriptor over its limit wins outright, counting as 0 remaining. With its limit and
+        // descriptor, for the reset.
+        let mut closest: Option<(DescriptorStatus, &RateLimit, &RateLimitDescriptor)> = None;
         let mut min_remaining = u32::MAX;
         // The descriptors that passed (unlimited ones excepted), for the metadata.
         let mut passed: Vec<Passed> = Vec::new();
-        for ((status, check), descriptor) in
-            statuses.iter_mut().zip(&checks).zip(&request.descriptors)
+        for (((status, check), descriptor), (limits, chosen)) in statuses
+            .iter_mut()
+            .zip(&checks)
+            .zip(&request.descriptors)
+            .zip(limits.iter().zip(&representatives))
         {
-            if status.current_limit.is_some() && status.limit_remaining < min_remaining {
-                closest = Some(status.clone());
+            let chosen = chosen.map(|i| &limits[i]);
+            if let Some(limit) = chosen
+                && status.limit_remaining < min_remaining
+            {
+                closest = Some((status.clone(), limit, descriptor));
                 min_remaining = status.limit_remaining;
             }
             let limit = match check {
@@ -265,11 +292,11 @@ impl<C: RateLimitCache> RateLimitService<C> {
                     };
                     continue;
                 }
-                Check::Limit(limit) => limit,
+                // A list shares its descriptor's settings and metadata: its first limit's.
+                Check::Limits(limits) => limits.first(),
             };
             let over = status.code() == Code::OverLimit;
-            let quota_mode =
-                self.settings.global_quota_mode || limit.as_ref().is_some_and(|l| l.quota_mode);
+            let quota_mode = self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode);
             let quota_group = quota_mode.then(|| quota_group_key(descriptor));
             if let Some(group) = &quota_group {
                 *quota_groups.entry(group.clone()).or_default() |= over;
@@ -277,12 +304,14 @@ impl<C: RateLimitCache> RateLimitService<C> {
             if !over {
                 passed.push(Passed {
                     descriptor,
-                    limit: limit.as_ref(),
+                    limit,
                     quota_group,
                 });
             } else if !quota_mode {
                 regular_over = true;
-                closest = Some(status.clone());
+                if let Some(limit) = chosen {
+                    closest = Some((status.clone(), limit, descriptor));
+                }
                 min_remaining = 0;
             }
         }
@@ -294,7 +323,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
         };
         let mut response_headers_to_add = Vec::new();
         if self.settings.per_unit_headers {
-            response_headers_to_add = per_unit_headers(&statuses);
+            response_headers_to_add = per_unit_headers(per_limit.iter().flatten());
         }
         if let (Some(names), Some(closest)) = (&self.settings.response_headers, &closest) {
             response_headers_to_add.extend(self.limit_headers(names, closest)?);
@@ -331,36 +360,74 @@ impl<C: RateLimitCache> RateLimitService<C> {
     fn limit_headers(
         &self,
         names: &LimitHeaders,
-        status: &DescriptorStatus,
+        (status, limit, descriptor): &(DescriptorStatus, &RateLimit, &RateLimitDescriptor),
     ) -> Result<Vec<HeaderValue>, ServiceError> {
-        let limit = status
-            .current_limit
-            .as_ref()
-            .expect("a status with a limit");
         let now = self.clock.unix_now();
-        let reset = reset_seconds(limit.unit(), now, self.settings.use_calendar_month)?;
+        let calendar = self.settings.use_calendar_month;
+        let reset = crate::limiter::reset(limit, descriptor, now, calendar)?;
         Ok(vec![
-            header(&names.limit, limit.requests_per_unit),
+            header(&names.limit, limit.limit.requests_per_unit),
             header(&names.remaining, status.limit_remaining),
             header(&names.reset, reset),
         ])
     }
 }
 
+/// The status standing for a descriptor's limits (D17): of those over their limit, the one
+/// with the longest time until reset; otherwise the one with the fewest remaining hits; the
+/// first on a tie. `None` without limits.
+fn representative(statuses: &[DescriptorStatus]) -> Option<usize> {
+    let reset = |s: &DescriptorStatus| s.duration_until_reset.as_ref().map_or(0, |d| d.seconds);
+    let over = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.code() == Code::OverLimit)
+        .fold(
+            None,
+            |best: Option<(usize, &DescriptorStatus)>, (i, s)| match best {
+                Some((_, b)) if reset(b) >= reset(s) => best,
+                _ => Some((i, s)),
+            },
+        );
+    if let Some((i, _)) = over {
+        return Some(i);
+    }
+    statuses
+        .iter()
+        .enumerate()
+        .fold(
+            None,
+            |best: Option<(usize, &DescriptorStatus)>, (i, s)| match best {
+                Some((_, b)) if b.limit_remaining <= s.limit_remaining => best,
+                _ => Some((i, s)),
+            },
+        )
+        .map(|(i, _)| i)
+}
+
+/// A rule in shadow mode answers OK where it is over its limit, keeping the remaining count
+/// of 0.
+fn shadowed(mut status: DescriptorStatus, limit: &RateLimit) -> DescriptorStatus {
+    if limit.shadow_mode && status.code() == Code::OverLimit {
+        crate::debug!("Limit with key {}, is in shadow_mode", limit.full_key);
+        status.code = Code::Ok as i32;
+    }
+    status
+}
+
 /// `RateLimit-Limit-<Unit>s` and `RateLimit-Remaining-<Unit>s` for each unit, in the order
-/// units first appear, describing the descriptor of that unit with the fewest remaining hits
-/// (the first on a tie). Descriptors without a limit (unlimited ones included) are skipped.
-fn per_unit_headers(statuses: &[DescriptorStatus]) -> Vec<HeaderValue> {
-    let mut closest_by_unit: Vec<(Unit, &DescriptorStatus)> = Vec::new();
+/// units first appear, describing the limit of that unit with the fewest remaining hits (the
+/// first on a tie), over every limit of every descriptor. A window of several units is its
+/// own unit, `<n><Unit>s` (D13).
+fn per_unit_headers<'a>(statuses: impl Iterator<Item = &'a DescriptorStatus>) -> Vec<HeaderValue> {
+    let mut closest_by_unit: Vec<((Unit, Option<u32>), &DescriptorStatus)> = Vec::new();
     for status in statuses {
         let Some(limit) = &status.current_limit else {
             continue;
         };
-        match closest_by_unit
-            .iter_mut()
-            .find(|(unit, _)| *unit == limit.unit())
-        {
-            None => closest_by_unit.push((limit.unit(), status)),
+        let unit = (limit.unit(), limit.unit_multiplier);
+        match closest_by_unit.iter_mut().find(|(u, _)| *u == unit) {
+            None => closest_by_unit.push((unit, status)),
             Some((_, closest)) if status.limit_remaining < closest.limit_remaining => {
                 *closest = status;
             }
@@ -369,9 +436,10 @@ fn per_unit_headers(statuses: &[DescriptorStatus]) -> Vec<HeaderValue> {
     }
     closest_by_unit
         .into_iter()
-        .flat_map(|(unit, status)| {
+        .flat_map(|((unit, multiplier), status)| {
             let name = unit.as_str_name();
-            let suffix = format!("{}{}s", &name[..1], name[1..].to_lowercase());
+            let count = multiplier.map_or(String::new(), |m| m.to_string());
+            let suffix = format!("{count}{}{}s", &name[..1], name[1..].to_lowercase());
             let limit = status.current_limit.as_ref().unwrap().requests_per_unit;
             [
                 header(&format!("RateLimit-Limit-{suffix}"), limit),
@@ -519,8 +587,9 @@ fn header(key: &str, value: impl ToString) -> HeaderValue {
 enum Check {
     /// Its limit is `unlimited`: never counted, always `OK`.
     Unlimited,
-    /// Count it against this limit, if any.
-    Limit(Option<RateLimit>),
+    /// Count it against these limits: its `rate_limit:`, or its `rate_limits:` but those
+    /// replaced; none when nothing applies.
+    Limits(Vec<RateLimit>),
 }
 
 /// `constructLimitsToCheck`: each descriptor's limit, left out when another descriptor's
@@ -565,26 +634,33 @@ fn descriptor_checks(
                     if limit.unlimited {
                         Check::Unlimited
                     } else {
-                        Check::Limit(Some(limit))
+                        Check::Limits(vec![limit])
                     }
+                }
+                LimitLookup::List(limits) => {
+                    for limit in &limits {
+                        replaced.extend(limit.replaces.iter().cloned());
+                    }
+                    Check::Limits(limits)
                 }
                 LimitLookup::UnknownDomain => {
                     // Counted per descriptor, as upstream counts each lookup.
                     stats.domain_not_found(&request.domain).inc();
-                    Check::Limit(None)
+                    Check::Limits(Vec::new())
                 }
-                LimitLookup::NoLimit => Check::Limit(None),
+                LimitLookup::NoLimit => Check::Limits(Vec::new()),
             }
         })
         .collect();
     for check in &mut checks {
-        if let Check::Limit(limit) = check
-            && limit
-                .as_ref()
-                .is_some_and(|l| !l.name.is_empty() && replaced.contains(&l.name))
-        {
-            crate::debug!("replacing {}", limit.as_ref().unwrap().name);
-            *limit = None;
+        if let Check::Limits(limits) = check {
+            limits.retain(|l| {
+                let kept = l.name.is_empty() || !replaced.contains(&l.name);
+                if !kept {
+                    crate::debug!("replacing {}", l.name);
+                }
+                kept
+            });
         }
     }
     checks

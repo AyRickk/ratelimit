@@ -36,7 +36,7 @@ This format is frozen before the first release: any later change is a major vers
 - **Name uniqueness**: within one descriptor's list only. The same name on two descriptors is legal and forms a replacement group (`replaces`), as upstream. A limit cannot `replaces` a name in its own list.
 - **TTL**: every key has one (window duration + margin), `anchored` anchors included.
 - **Memcached** (`fixed` only): the full key must be ≤ 250 bytes and contain no byte ≤ `0x20` or `0x7f`; beyond that, upstream behaviour (error logged, `OK` answered). Warning at load if the static part exceeds 250 − 64 bytes.
-- **`REDIS_PERSECOND`**: a list that contains a per-second limit is routed **entirely** to a single Redis client (documented divergence: upstream never has two limits per descriptor).
+- **`REDIS_PERSECOND`**: a list with a window shorter than a minute is routed **entirely** to the per-second Redis client, so its keys stay together (upstream never has two limits per descriptor).
 
 ## Consequences
 

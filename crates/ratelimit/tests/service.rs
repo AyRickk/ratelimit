@@ -41,13 +41,32 @@ impl RateLimitCache for FakeCache {
     async fn do_limit(
         &self,
         _request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> Result<Vec<DescriptorStatus>, CacheError> {
-        self.received.lock().unwrap().push(limits.to_vec());
+        limits: &[Vec<RateLimit>],
+    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
+        // Each descriptor's `rate_limit:`, if any.
+        let received = limits.iter().map(|l| l.first().cloned()).collect();
+        self.received.lock().unwrap().push(received);
         if let Some(error) = &self.error {
             return Err(CacheError(error.clone()));
         }
-        Ok(self.statuses.lock().unwrap().clone())
+        // A preset status per descriptor with a limit; presets beyond the descriptors are
+        // answers for descriptors the request does not have.
+        let statuses = self.statuses.lock().unwrap().clone();
+        let extra = statuses.len().saturating_sub(limits.len());
+        let mut answer: Vec<Vec<DescriptorStatus>> = limits
+            .iter()
+            .zip(statuses.iter().cloned())
+            .map(|(limits, status)| match limits.is_empty() {
+                true => Vec::new(),
+                false => vec![status],
+            })
+            .collect();
+        answer.extend(
+            statuses[statuses.len() - extra..]
+                .iter()
+                .map(|s| vec![s.clone()]),
+        );
+        Ok(answer)
     }
 }
 
