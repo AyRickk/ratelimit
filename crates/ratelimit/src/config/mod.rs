@@ -2,6 +2,7 @@
 //! to a descriptor. A port of envoyproxy/ratelimit `src/config/config_impl.go`.
 
 mod schema;
+pub mod window;
 mod xds;
 pub(crate) mod yaml;
 
@@ -9,7 +10,8 @@ use rate_limit_response::rate_limit::Unit;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use schema::YamlDescriptor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use window::{FixedWindow, Origin};
 
 /// A config file to load: its name (used in error messages) and its YAML content.
 #[derive(Debug, Clone)]
@@ -56,6 +58,8 @@ pub struct RateLimit {
     /// `share_threshold`, or empty; `None` when no entry matched that way.
     pub share_threshold_key_pattern: Option<Vec<String>>,
     pub metadata: Option<prost_types::Struct>,
+    /// A `rate_limits:` entry's window; `None` for `rate_limit:`, whose window is its unit.
+    pub window: Option<FixedWindow>,
 }
 
 impl RateLimit {
@@ -76,6 +80,7 @@ impl RateLimit {
             replaces: Vec::new(),
             share_threshold_key_pattern: None,
             metadata: None,
+            window: None,
         }
     }
 }
@@ -88,12 +93,16 @@ pub enum LimitLookup {
     /// The domain is configured but no limit applies to the descriptor.
     NoLimit,
     Limit(RateLimit),
+    /// The descriptor's `rate_limits:`, in config order (never empty).
+    List(Vec<RateLimit>),
 }
 
 #[derive(Debug, Default)]
 struct Descriptor {
     descriptors: HashMap<String, Descriptor>,
     limit: Option<RateLimit>,
+    /// `rate_limits:`, in config order; empty without.
+    list: Vec<RateLimit>,
     /// The `key_value` patterns containing `*` among `descriptors`, in config order,
     /// pre-split on `*`.
     wildcards: Vec<(String, Vec<String>)>,
@@ -255,6 +264,175 @@ fn load_limit(
     }))
 }
 
+/// Whether `name` can name a list limit (ADR 0001): it ends its keys and stats names.
+fn valid_limit_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 64
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A list limit's `window`.
+fn load_window(
+    file: &str,
+    at: &str,
+    window: &schema::YamlWindow,
+) -> Result<FixedWindow, ConfigError> {
+    let error = |message: String| ConfigError::new(file, format!("{at}: {message}"));
+    match window.kind.as_str() {
+        "fixed" => {}
+        "" => return Err(error("window type is required".into())),
+        "anchored" | "sliding" | "sliding_approx" | "token_bucket" => {
+            return Err(error(format!(
+                "window type '{}' is not supported yet",
+                window.kind
+            )));
+        }
+        other => return Err(error(format!("unknown window type '{other}'"))),
+    }
+    let duration = match window.duration.as_str() {
+        "" => return Err(error("window duration is required".into())),
+        text => window::parse_duration(text)
+            .filter(|d| *d > 0)
+            .ok_or_else(|| error(format!("invalid window duration '{text}'")))?,
+    };
+    let rounding = (!window.offset_rounding.is_empty())
+        .then(|| {
+            window::parse_duration(&window.offset_rounding).ok_or_else(|| {
+                error(format!(
+                    "invalid offset_rounding '{}'",
+                    window.offset_rounding
+                ))
+            })
+        })
+        .transpose()?;
+    let origin = match window.offset.as_str() {
+        "" if rounding.is_some() => {
+            return Err(error("offset_rounding needs offset: hashed".into()));
+        }
+        "" => Origin::Epoch,
+        "hashed" => {
+            let rounding = rounding.unwrap_or_else(|| window::default_rounding(duration));
+            if rounding <= 0 || rounding > duration || duration % rounding != 0 {
+                return Err(error(format!(
+                    "offset_rounding '{}' must divide the window duration '{}'",
+                    window.offset_rounding, window.duration
+                )));
+            }
+            Origin::Hashed { rounding }
+        }
+        text => {
+            if rounding.is_some() {
+                return Err(error("offset_rounding needs offset: hashed".into()));
+            }
+            // `0` alone is a duration of nothing.
+            let offset = match text {
+                "0" => Some(0),
+                text => window::parse_duration(text),
+            };
+            match offset {
+                Some(0) => Origin::Epoch,
+                Some(offset) if offset < duration => Origin::Offset(offset),
+                Some(_) => {
+                    return Err(error(format!(
+                        "offset '{text}' must be shorter than the window duration '{}'",
+                        window.duration
+                    )));
+                }
+                None => return Err(error(format!("invalid offset '{text}'"))),
+            }
+        }
+    };
+    Ok(FixedWindow { duration, origin })
+}
+
+/// `overflow` (D14): `envoy` counts everything, which is all there is yet.
+fn load_overflow(file: &str, full_key: &str, config: &YamlDescriptor) -> Result<(), ConfigError> {
+    let message = match config.overflow.as_str() {
+        "" | "envoy" => return Ok(()),
+        "strict" => "overflow: strict is not supported yet".to_string(),
+        other => format!("invalid overflow '{other}': envoy or strict"),
+    };
+    Err(ConfigError::new(file, format!("{full_key}: {message}")))
+}
+
+/// A descriptor's `rate_limits:` (D7): named limits, each with its window.
+fn load_list(
+    file: &str,
+    full_key: &str,
+    config: &YamlDescriptor,
+) -> Result<Vec<RateLimit>, ConfigError> {
+    let Some(list) = &config.rate_limits else {
+        return Ok(Vec::new());
+    };
+    let error = |message: String| ConfigError::new(file, format!("{full_key}: {message}"));
+    if config.rate_limit.is_some() {
+        return Err(error(
+            "should not specify both rate_limit and rate_limits".into(),
+        ));
+    }
+    if list.is_empty() {
+        return Err(error("rate_limits should not be empty".into()));
+    }
+    let names: Vec<&str> = list.iter().map(|l| l.name.as_str()).collect();
+    let mut seen = HashSet::new();
+    let mut limits = Vec::new();
+    for entry in list {
+        if !valid_limit_name(&entry.name) {
+            return Err(error(format!(
+                "invalid rate_limits name '{}': 1 to 64 letters, digits, '_' or '-', starting with a letter or digit",
+                entry.name
+            )));
+        }
+        let at = format!("{full_key}~{}", entry.name);
+        let error = |message: &str| ConfigError::new(file, format!("{at}: {message}"));
+        if !seen.insert(entry.name.as_str()) {
+            return Err(error("duplicate rate_limits name"));
+        }
+        if entry.unit {
+            return Err(error("rate_limits entries take a window, not a unit"));
+        }
+        if entry.unlimited {
+            return Err(error(
+                "rate_limits entries cannot be unlimited: use rate_limit: {unlimited: true}",
+            ));
+        }
+        for replaced in &entry.replaces {
+            if replaced.is_empty() {
+                return Err(error("should not have an empty replaces entry"));
+            }
+            if names.contains(&replaced.as_str()) {
+                return Err(error(
+                    "replaces should not contain a name of the same rate_limits",
+                ));
+            }
+        }
+        let Some(window) = &entry.window else {
+            return Err(error("window is required"));
+        };
+        let window = load_window(file, &at, window)?;
+        crate::debug!("Creating stats for key: '{at}'");
+        let (unit, multiplier) = window.unit();
+        let mut limit = RateLimit {
+            detailed_metric: config.detailed_metric,
+            shadow_mode: config.shadow_mode,
+            quota_mode: config.quota_mode,
+            replaces: entry.replaces.clone(),
+            metadata: config.metadata.clone(),
+            window: Some(window),
+            ..RateLimit::new(
+                full_key.to_string(),
+                entry.requests_per_unit,
+                unit as i32,
+                entry.name.clone(),
+            )
+        };
+        limit.limit.unit_multiplier = (multiplier != 1).then_some(multiplier);
+        limits.push(limit);
+    }
+    Ok(limits)
+}
+
 impl Descriptor {
     fn load_descriptors(
         &mut self,
@@ -279,6 +457,8 @@ impl Descriptor {
                 ));
             }
             let limit = load_limit(file, &new_parent_key, config)?;
+            let list = load_list(file, &new_parent_key, config)?;
+            load_overflow(file, &new_parent_key, config)?;
             if config.share_threshold && !final_key.contains('*') {
                 return Err(ConfigError::new(
                     file,
@@ -304,6 +484,7 @@ impl Descriptor {
             );
             let mut descriptor = Descriptor {
                 limit,
+                list,
                 value_to_metric: config.value_to_metric,
                 share_threshold_pattern: config.share_threshold.then(|| final_key.clone()),
                 ..Default::default()
@@ -335,6 +516,19 @@ impl RateLimitConfig {
                 out.push_str(&format!(
                     "{}: unit={unit} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
                     limit.full_key,
+                    limit.limit.requests_per_unit,
+                    limit.shadow_mode,
+                    limit.quota_mode
+                ));
+            }
+            // A list limit: its stats key and its window.
+            for limit in &descriptor.list {
+                let window = limit.window.as_ref().expect("a list limit's window");
+                out.push_str(&format!(
+                    "{}~{}: window={} requests_per_unit={}, shadow_mode: {}, quota_mode: {}\n",
+                    limit.full_key,
+                    limit.name,
+                    window.describe(),
                     limit.limit.requests_per_unit,
                     limit.shadow_mode,
                     limit.quota_mode
@@ -374,7 +568,8 @@ impl RateLimitConfig {
                 String::new(),
             ));
         }
-        let mut found: Option<RateLimit> = None;
+        // The limits found, and whether they are a `rate_limits:` list.
+        let mut found: Option<(Vec<RateLimit>, bool)> = None;
         let mut detailed_key = domain.to_string();
         let mut value_to_metric_key = domain.to_string();
         let mut share_patterns: HashMap<usize, String> = HashMap::new();
@@ -442,14 +637,19 @@ impl RateLimitConfig {
                 stopped_at_leaf = true;
                 break;
             };
-            if let Some(limit) = &next.limit {
+            let limits = match (&next.limit, next.list.is_empty()) {
+                (Some(limit), _) => Some((vec![limit.clone()], false)),
+                (None, false) => Some((next.list.clone(), true)),
+                (None, true) => None,
+            };
+            if let Some(limits) = limits {
                 let final_key = match matched_using_value {
                     true => key_value.as_str(),
                     false => entry.key.as_str(),
                 };
                 crate::debug!("found rate limit: {final_key}");
                 if i == descriptor.entries.len() - 1 {
-                    found = Some(limit.clone());
+                    found = Some(limits);
                     // Upstream walks a Go map, in a random order (docs/parity.md §7).
                     if crate::log::enabled(crate::log::Level::Debug) {
                         let mut patterns: Vec<_> = share_patterns.iter().collect();
@@ -469,15 +669,15 @@ impl RateLimitConfig {
             if next.descriptors.is_empty() {
                 stopped_at_leaf = true;
                 // A detailed limit is rebuilt with its stats.
-                if let Some(limit) = found.as_ref().filter(|l| l.detailed_metric) {
-                    crate::debug!("Creating stats for key: '{}'", limit.full_key);
+                if let Some((limits, _)) = found.as_ref().filter(|(l, _)| l[0].detailed_metric) {
+                    crate::debug!("Creating stats for key: '{}'", limits[0].full_key);
                 }
                 break;
             }
             crate::debug!("iterating to next level");
             current = next;
         }
-        if let Some(limit) = &mut found {
+        for limit in found.iter_mut().flat_map(|(limits, _)| limits.iter_mut()) {
             if !share_patterns.is_empty() {
                 limit.share_threshold_key_pattern = Some(
                     (0..descriptor.entries.len())
@@ -499,8 +699,8 @@ impl RateLimitConfig {
                 Some(patterns) if limit.detailed_metric => {
                     self.share_threshold_key(domain, descriptor, patterns)
                 }
-                _ if limit.detailed_metric => detailed_key,
-                _ => value_to_metric_key,
+                _ if limit.detailed_metric => detailed_key.clone(),
+                _ => value_to_metric_key.clone(),
             };
             if crate::log::enabled(crate::log::Level::Debug)
                 && (limit.detailed_metric || full_key != limit.full_key)
@@ -508,8 +708,16 @@ impl RateLimitConfig {
                 crate::debug!("Creating stats for key: '{full_key}'");
             }
             limit.full_key = full_key;
+            // A list limit's stats are its descriptor's, then its name (D29).
+            if limit.window.is_some() {
+                limit.full_key = format!("{}~{}", limit.full_key, limit.name);
+            }
         }
-        found.map_or(LimitLookup::NoLimit, LimitLookup::Limit)
+        match found {
+            None => LimitLookup::NoLimit,
+            Some((limits, true)) => LimitLookup::List(limits),
+            Some((mut limits, false)) => LimitLookup::Limit(limits.remove(0)),
+        }
     }
 }
 

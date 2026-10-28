@@ -41,7 +41,7 @@ fn descriptor(entries: &[(&str, &str)]) -> RateLimitDescriptor {
 fn limit(config: &RateLimitConfig, domain: &str, entries: &[(&str, &str)]) -> Option<RateLimit> {
     match config.get_limit(domain, &descriptor(entries)) {
         LimitLookup::Limit(limit) => Some(limit),
-        LimitLookup::NoLimit | LimitLookup::UnknownDomain => None,
+        LimitLookup::NoLimit | LimitLookup::UnknownDomain | LimitLookup::List(_) => None,
     }
 }
 

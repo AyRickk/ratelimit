@@ -102,9 +102,26 @@ pub(crate) fn unit_seconds(unit: Unit) -> Result<i64, CacheError> {
     })
 }
 
-/// The storage key of `limit` for `descriptor` in the window containing `now`:
-/// `prefix + domain + "_" + (key "_" value "_")* + windowStart`. With `share_threshold`, an
-/// entry that matched a shared wildcard uses the pattern in place of its value.
+/// A descriptor's entries as its keys are built from them: with `share_threshold`, an entry
+/// that matched a shared wildcard has the pattern in place of its value.
+fn key_entries<'a>(
+    descriptor: &'a RateLimitDescriptor,
+    limit: &'a RateLimit,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    descriptor.entries.iter().enumerate().map(|(i, entry)| {
+        let shared = limit
+            .share_threshold_key_pattern
+            .as_ref()
+            .and_then(|patterns| patterns.get(i))
+            .filter(|pattern| !pattern.is_empty());
+        (entry.key.as_str(), shared.unwrap_or(&entry.value).as_str())
+    })
+}
+
+/// The storage key of `limit` for `descriptor` in the window containing `now`. For
+/// `rate_limit:`, upstream's: `prefix + domain + "_" + (key "_" value "_")* + windowStart`.
+/// For a `rate_limits:` entry, ADR 0001's: that descriptor part, escaped, as the hash tag,
+/// then the window's shape, its start and the limit's name.
 pub fn cache_key(
     prefix: &str,
     domain: &str,
@@ -113,20 +130,71 @@ pub fn cache_key(
     now: i64,
     calendar: bool,
 ) -> Result<String, CacheError> {
-    let mut key = format!("{prefix}{domain}_");
-    for (i, entry) in descriptor.entries.iter().enumerate() {
-        let shared = limit
-            .share_threshold_key_pattern
-            .as_ref()
-            .and_then(|patterns| patterns.get(i))
-            .filter(|pattern| !pattern.is_empty());
-        key += &entry.key;
+    let Some(window) = &limit.window else {
+        let mut key = format!("{prefix}{domain}_");
+        for (k, v) in key_entries(descriptor, limit) {
+            key += k;
+            key += "_";
+            key += v;
+            key += "_";
+        }
+        key += &window_start(limit.limit.unit(), now, calendar)?.to_string();
+        return Ok(key);
+    };
+    let escape = |text: &str| {
+        text.replace('%', "%25")
+            .replace('{', "%7B")
+            .replace('}', "%7D")
+    };
+    let mut key = format!("{{{}{}_", escape(prefix), escape(domain));
+    for (k, v) in key_entries(descriptor, limit) {
+        key += &escape(k);
         key += "_";
-        key += shared.unwrap_or(&entry.value);
+        key += &escape(v);
         key += "_";
     }
-    key += &window_start(limit.limit.unit(), now, calendar)?.to_string();
+    let start = window.start(now, window.phase(key_entries(descriptor, limit)));
+    key += &format!("}}_{}_{start}_{}", window.shape(), limit.name);
     Ok(key)
+}
+
+/// A key's TTL: [`expiration_seconds`], or a list limit's window.
+pub(crate) fn expiration(limit: &RateLimit, now: i64, calendar: bool) -> Result<i64, CacheError> {
+    match &limit.window {
+        Some(window) => Ok(window.duration),
+        None => expiration_seconds(limit.limit.unit(), now, calendar),
+    }
+}
+
+/// The seconds until `limit`'s window containing `now` ends, for `descriptor`.
+pub(crate) fn reset(
+    limit: &RateLimit,
+    descriptor: &RateLimitDescriptor,
+    now: i64,
+    calendar: bool,
+) -> Result<i64, CacheError> {
+    match &limit.window {
+        Some(window) => Ok(window.reset(now, window.phase(key_entries(descriptor, limit)))),
+        None => reset_seconds(limit.limit.unit(), now, calendar),
+    }
+}
+
+/// Every limit of every descriptor: the descriptor's index, the limit's in its list, the limit.
+pub(crate) fn slots(limits: &[Vec<RateLimit>]) -> impl Iterator<Item = (usize, usize, &RateLimit)> {
+    limits.iter().enumerate().flat_map(|(index, list)| {
+        list.iter()
+            .enumerate()
+            .map(move |(slot, limit)| (index, slot, limit))
+    })
+}
+
+/// Whether `limit`'s keys go to the per-second Redis (`REDIS_PERSECOND`): a limit in seconds,
+/// or a list with a window shorter than a minute (D15).
+pub(crate) fn per_second(limits: &[RateLimit]) -> bool {
+    limits.iter().any(|limit| match &limit.window {
+        Some(window) => window.duration < 60,
+        None => limit.limit.unit() == Unit::Second,
+    })
 }
 
 /// How much a descriptor adds to (or, for a refund, removes from) its counter.
@@ -154,6 +222,7 @@ pub(crate) fn hits(request: &RateLimitRequest) -> Vec<Hits> {
 fn status(
     code: Code,
     limit: &RateLimit,
+    descriptor: &RateLimitDescriptor,
     limit_remaining: u32,
     now: i64,
     calendar: bool,
@@ -163,7 +232,7 @@ fn status(
         current_limit: Some(limit.limit.clone()),
         limit_remaining,
         duration_until_reset: Some(prost_types::Duration {
-            seconds: reset_seconds(limit.limit.unit(), now, calendar)?,
+            seconds: reset(limit, descriptor, now, calendar)?,
             nanos: 0,
         }),
         quota: None,
@@ -241,53 +310,36 @@ fn count_outcome(
     }
 }
 
-/// The status of a descriptor, its outcome counted in its limit's `stats`. Without a limit it
-/// is a bare OK. A refund is always OK, with what remains. Otherwise it is over the limit when
-/// the counter exceeds it (or the local cache says so); a rule in shadow mode then answers OK,
-/// keeping the remaining count of 0.
-pub(crate) fn descriptor_status(
-    limit: Option<(&RateLimit, &RateLimitStats, &str)>,
+/// The status of `limit` for `descriptor`, its outcome counted in the limit's `stats`. A
+/// refund is always OK, with what remains. Otherwise it is over the limit when the counter
+/// exceeds it (or the local cache says so); the service then applies shadow mode.
+pub(crate) fn limit_status(
+    (limit, stats, key): (&RateLimit, &RateLimitStats, &str),
+    descriptor: &RateLimitDescriptor,
     near_limit_ratio: f32,
     hits: Hits,
     count: Count,
     now: i64,
     calendar: bool,
 ) -> Result<DescriptorStatus, CacheError> {
-    let Some((limit, stats, key)) = limit else {
-        return Ok(DescriptorStatus {
-            code: Code::Ok as i32,
-            ..Default::default()
-        });
-    };
     if !hits.refund {
         count_outcome(stats, limit, hits.value, count, near_limit_ratio);
     }
     let threshold = u64::from(limit.limit.requests_per_unit);
+    let answer = |code, remaining| status(code, limit, descriptor, remaining, now, calendar);
     match count {
         Count::After(after) if hits.refund => {
-            return status(
-                Code::Ok,
-                limit,
-                threshold.saturating_sub(after) as u32,
-                now,
-                calendar,
-            );
+            return answer(Code::Ok, threshold.saturating_sub(after) as u32);
         }
         Count::After(after) => {
             crate::debug!("cache key: {key} current: {after} limit: {threshold}");
             if !exceeds(limit, after) {
-                return status(Code::Ok, limit, (threshold - after) as u32, now, calendar);
+                return answer(Code::Ok, (threshold - after) as u32);
             }
         }
         Count::OverInLocalCache => {}
     }
-    let code = if limit.shadow_mode {
-        crate::debug!("Limit with key {}, is in shadow_mode", limit.full_key);
-        Code::Ok
-    } else {
-        Code::OverLimit
-    };
-    status(code, limit, 0, now, calendar)
+    answer(Code::OverLimit, 0)
 }
 
 /// What a request's keys look like before counting, for

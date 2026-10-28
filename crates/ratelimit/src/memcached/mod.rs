@@ -151,8 +151,9 @@ impl MemcacheCache {
     }
 }
 
-/// A descriptor with a limit: its key and what it counts.
+/// A descriptor's limit: its key and what it counts.
 struct Check {
+    /// The descriptor's index in the request.
     index: usize,
     key: String,
     limit: RateLimit,
@@ -164,15 +165,14 @@ impl RateLimitCache for MemcacheCache {
     async fn do_limit(
         &self,
         request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> Result<Vec<DescriptorStatus>, CacheError> {
+        limits: &[Vec<RateLimit>],
+    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
         crate::debug!("starting cache lookup");
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
         let mut checks = Vec::new();
         let mut keys_to_get = Vec::new();
-        for (index, limit) in limits.iter().enumerate() {
-            let Some(limit) = limit else { continue };
+        for (index, _, limit) in limiter::slots(limits) {
             let key = limiter::cache_key(
                 &self.settings.cache_key_prefix,
                 &request.domain,
@@ -231,7 +231,7 @@ impl RateLimitCache for MemcacheCache {
             }
         }
 
-        let mut counts = vec![Count::After(0); limits.len()];
+        let mut counts = Vec::with_capacity(checks.len());
         for c in &checks {
             // `ParseInt(value, 10, 32)`, a negative one wrapping into a `uint64`.
             let before = match values.get(&c.key) {
@@ -249,40 +249,39 @@ impl RateLimitCache for MemcacheCache {
                 }
                 None => 0,
             };
-            counts[c.index] = if c.over_in_local_cache {
+            let count = if c.over_in_local_cache {
                 Count::OverInLocalCache
             } else if c.hits.refund {
                 Count::After(before.saturating_sub(c.hits.value))
             } else {
                 Count::After(before.wrapping_add(c.hits.value))
             };
+            counts.push(count);
             if let (false, Count::After(after), Some(cache)) =
-                (c.hits.refund, counts[c.index], &self.local_cache)
+                (c.hits.refund, count, &self.local_cache)
                 && limiter::exceeds(&c.limit, after)
             {
                 // Cached for a whole window, shadow rules included, as upstream.
                 let calendar = self.settings.use_calendar_month;
-                let ttl = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
+                let ttl = limiter::expiration(&c.limit, now, calendar)?;
                 if !cache.insert(&c.key, ttl, now) {
                     crate::log::error(&format!("Failing to set local cache key: {}", c.key));
                 }
             }
         }
 
-        let mut keys = vec![""; limits.len()];
-        for c in &checks {
-            keys[c.index] = &c.key;
-        }
-        let mut statuses = Vec::with_capacity(limits.len());
-        for (index, (limit, hits)) in limits.iter().zip(&hits).enumerate() {
-            let stats = limit.as_ref().map(|l| self.stats.rate_limit(&l.full_key));
-            let key = keys[index];
-            let checked = limit.as_ref().zip(stats.as_ref()).map(|(l, s)| (l, s, key));
-            statuses.push(limiter::descriptor_status(
-                checked,
+        let mut statuses: Vec<Vec<DescriptorStatus>> = limits
+            .iter()
+            .map(|list| Vec::with_capacity(list.len()))
+            .collect();
+        for (c, count) in checks.iter().zip(counts) {
+            let stats = self.stats.rate_limit(&c.limit.full_key);
+            statuses[c.index].push(limiter::limit_status(
+                (&c.limit, &stats, &c.key),
+                &request.descriptors[c.index],
                 self.settings.near_limit_ratio,
-                *hits,
-                counts[index],
+                c.hits,
+                count,
                 now,
                 self.settings.use_calendar_month,
             )?);
@@ -327,9 +326,7 @@ async fn increase(
                 let calendar = settings.use_calendar_month;
                 // It was computed for the key already: it cannot fail now but past the year
                 // 9999, when nothing is counted.
-                let Ok(mut expiration) =
-                    limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)
-                else {
+                let Ok(mut expiration) = limiter::expiration(&c.limit, now, calendar) else {
                     continue;
                 };
                 let jitter = settings.expiration_jitter_max_seconds;

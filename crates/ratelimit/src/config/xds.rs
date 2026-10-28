@@ -25,6 +25,9 @@ fn descriptors(list: &[pb::RateLimitDescriptor]) -> Vec<YamlDescriptor> {
                 name: policy.name.clone(),
                 replaces: policy.replaces.iter().map(|r| r.name.clone()).collect(),
             }),
+            // The extensions are YAML only (D28).
+            rate_limits: None,
+            overflow: String::new(),
             descriptors: descriptors(&d.descriptors),
             shadow_mode: d.shadow_mode,
             quota_mode: d.quota_mode,

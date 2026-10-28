@@ -16,8 +16,7 @@ use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use ratelimit_proto::envoy::service::ratelimit::v3::{
-    RateLimitRequest,
-    rate_limit_response::{DescriptorStatus, rate_limit::Unit},
+    RateLimitRequest, rate_limit_response::DescriptorStatus,
 };
 use std::sync::Arc;
 
@@ -191,9 +190,12 @@ impl Command {
     }
 }
 
-/// A descriptor with a limit, to be checked against Redis or the local cache.
+/// A descriptor's limit, to be checked against Redis or the local cache.
 struct Check<'a> {
+    /// The descriptor's index in the request.
     index: usize,
+    /// The limit's index in the descriptor's limits.
+    slot: usize,
     limit: &'a RateLimit,
     stats: RateLimitStats,
     key: String,
@@ -202,6 +204,9 @@ struct Check<'a> {
     over_in_local_cache: bool,
     /// With `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: these hits will take it over the limit.
     going_over: bool,
+    /// A `rate_limits:` entry, which `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` leaves alone
+    /// (D20).
+    listed: bool,
     /// The pipeline it goes in: 0 the main one, 1 the per-second one (`REDIS_PERSECOND`).
     pipeline: usize,
 }
@@ -210,15 +215,14 @@ impl RateLimitCache for RedisCache {
     async fn do_limit(
         &self,
         request: &RateLimitRequest,
-        limits: &[Option<RateLimit>],
-    ) -> Result<Vec<DescriptorStatus>, CacheError> {
+        limits: &[Vec<RateLimit>],
+    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
         crate::debug!("starting cache lookup");
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
 
         let mut checks = Vec::new();
-        for (index, limit) in limits.iter().enumerate() {
-            let Some(limit) = limit else { continue };
+        for (index, slot, limit) in limiter::slots(limits) {
             let key = limiter::cache_key(
                 &self.settings.cache_key_prefix,
                 &request.domain,
@@ -246,20 +250,22 @@ impl RateLimitCache for RedisCache {
             }
             checks.push(Check {
                 index,
+                slot,
                 limit,
                 stats,
                 key,
                 hits,
                 over_in_local_cache,
                 going_over: false,
-                pipeline: match (&self.per_second, limit.limit.unit()) {
-                    (Some(_), Unit::Second) => 1,
+                listed: limit.window.is_some(),
+                pipeline: match &self.per_second {
+                    Some(_) if limiter::per_second(&limits[index]) => 1,
                     _ => 0,
                 },
             });
         }
 
-        let mut state = if checks.iter().any(|c| c.over_in_local_cache) {
+        let mut state = if checks.iter().any(|c| c.over_in_local_cache && !c.listed) {
             RequestState::OverInLocalCache
         } else {
             RequestState::WithinLimits
@@ -282,7 +288,7 @@ impl RateLimitCache for RedisCache {
             }
             crate::debug!("looking up cache key: {}", c.key);
             let calendar = self.settings.use_calendar_month;
-            let mut expiration = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
+            let mut expiration = limiter::expiration(c.limit, now, calendar)?;
             let jitter = self.settings.expiration_jitter_max_seconds;
             if jitter > 0 {
                 // Go's int64 addition wraps.
@@ -290,7 +296,7 @@ impl RateLimitCache for RedisCache {
             }
             let expiration = expiration.to_string();
             let commands = &mut pipelines[c.pipeline];
-            reply_of.push((c.index, c.pipeline, commands.len()));
+            reply_of.push((c.index, c.slot, c.pipeline, commands.len()));
             if c.hits.refund {
                 let amount = (c.hits.value as i64).to_string();
                 let args = vec![
@@ -302,7 +308,10 @@ impl RateLimitCache for RedisCache {
                 ];
                 commands.push(Command { name: "EVAL", args });
             } else {
-                let counted = limiter::hits_to_count(c.hits, stop_increment, state, c.going_over);
+                let counted = match c.listed {
+                    true => c.hits.value,
+                    false => limiter::hits_to_count(c.hits, stop_increment, state, c.going_over),
+                };
                 let args = vec![c.key.clone(), (counted as i64).to_string()];
                 commands.push(Command {
                     name: "INCRBY",
@@ -333,7 +342,10 @@ impl RateLimitCache for RedisCache {
                 ]
             },
         );
-        let mut counts = vec![Count::After(0); limits.len()];
+        let mut counts: Vec<Vec<Count>> = limits
+            .iter()
+            .map(|list| vec![Count::After(0); list.len()])
+            .collect();
         // The main pipeline, then the per-second one.
         let mut replies: [Vec<_>; 2] = [Vec::new(), Vec::new()];
         for (pipeline, pool) in self.pools().into_iter().enumerate() {
@@ -341,41 +353,42 @@ impl RateLimitCache for RedisCache {
                 replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
             }
         }
-        for (index, pipeline, at) in reply_of {
+        for (index, slot, pipeline, at) in reply_of {
             let reply = replies[pipeline][at].clone();
-            counts[index] = Count::After(pipelines[pipeline][at].counter(reply)?);
+            counts[index][slot] = Count::After(pipelines[pipeline][at].counter(reply)?);
         }
         for c in &checks {
             if c.over_in_local_cache {
-                counts[c.index] = Count::OverInLocalCache;
+                counts[c.index][c.slot] = Count::OverInLocalCache;
             } else if let (false, Count::After(after), Some(cache)) =
-                (c.hits.refund, counts[c.index], &self.local_cache)
+                (c.hits.refund, counts[c.index][c.slot], &self.local_cache)
                 && limiter::exceeds(c.limit, after)
             {
                 // Cached for a whole window, shadow rules included, as upstream.
                 let calendar = self.settings.use_calendar_month;
-                let ttl = limiter::expiration_seconds(c.limit.limit.unit(), now, calendar)?;
+                let ttl = limiter::expiration(c.limit, now, calendar)?;
                 if !cache.insert(&c.key, ttl, now) {
                     crate::log::error(&format!("Failing to set local cache key: {}", c.key));
                 }
             }
         }
 
-        let mut checked: Vec<Option<(&RateLimit, &RateLimitStats, &str)>> =
-            vec![None; limits.len()];
+        let mut statuses: Vec<Vec<DescriptorStatus>> = limits
+            .iter()
+            .map(|list| Vec::with_capacity(list.len()))
+            .collect();
         for c in &checks {
-            checked[c.index] = Some((c.limit, &c.stats, &c.key));
+            statuses[c.index].push(limiter::limit_status(
+                (c.limit, &c.stats, &c.key),
+                &request.descriptors[c.index],
+                self.settings.near_limit_ratio,
+                c.hits,
+                counts[c.index][c.slot],
+                now,
+                self.settings.use_calendar_month,
+            )?);
         }
-        checked
-            .into_iter()
-            .zip(&hits)
-            .zip(counts)
-            .map(|((limit, hits), count)| {
-                let ratio = self.settings.near_limit_ratio;
-                let calendar = self.settings.use_calendar_month;
-                limiter::descriptor_status(limit, ratio, *hits, count, now, calendar)
-            })
-            .collect()
+        Ok(statuses)
     }
 }
 
@@ -388,7 +401,7 @@ impl RedisCache {
             let Some(pool) = pool else { continue };
             let mut reads: Vec<&mut Check> = checks
                 .iter_mut()
-                .filter(|c| !c.hits.refund && c.pipeline == pipeline)
+                .filter(|c| !c.hits.refund && !c.listed && c.pipeline == pipeline)
                 .collect();
             if reads.is_empty() {
                 continue;

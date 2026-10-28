@@ -266,7 +266,6 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | A variable whose value is not valid UTF-8 keeps its bytes (and Go's quoting shows them as `\xNN` in errors) | read with U+FFFD in place of invalid sequences | Rust strings are UTF-8 |
 | `descriptors[].limit` in metadata as Go prototext, one or two spaces between fields depending on the build | the same text, always one space; `unit_multiplier:{value:N}` when set | Go randomises the spacing; `unit_multiplier` is an extension |
 | Merging `metadata` writes into the configuration's own structs: a nested struct merged once keeps the other limit's fields in later responses, and concurrent requests race on it | merged into copies | D1: upstream bug; responses only differ once the configuration has been altered |
-| `unit_multiplier` ignored in overrides and absent from responses | read, applied, echoed; 0 rejected | extension (current Envoy proto) |
 | gostats' Go runtime stats, `ratelimit.go.*` (gauges `alloc`, `sys`, `heapAlloc`, `heapSys`, `heapIdle`, `heapInuse`, `heapReleased`, `heapObjects`, `nextGC`, `lastGC`, `gcCPUPercent`, `numGoroutine`; counters `totalAlloc`, `lookups`, `mallocs`, `frees`, `pauseTotalNs`, `numGC`), which Prometheus gets unmapped (`ratelimit_go_*`) | not sent | No Rust equivalent: process figures under Go's names would mislead |
 | The debug port's `/stats` prints expvar's `cmdline` and `memstats` (Go's `runtime.MemStats`) | `cmdline` only | No Rust equivalent; zeros or other figures under that name would mislead its readers |
 | pprof serves the Go runtime's profiles (`goroutine`, `heap`, `allocs`, `block`, `mutex`, `threadcreate`, `goroutineleak`) and an HTML index at `/debug/pprof/`, CPU profiles and traces at `/debug/pprof/profile` and `/debug/pprof/trace` | `404 Unknown profile` for those names and the index (pprof's answer for any other name); `500 Could not enable CPU profiling: not available` and `500 Could not enable tracing: not available` | No Go runtime to profile; pprof's own error answers |
@@ -376,3 +375,29 @@ Reading them (values, defaults, set-but-empty values, the first error and its te
 | Baggage is extracted and the propagators can inject | neither | nothing reads baggage and the service makes no traced call |
 | The CLI client's tracing | not yet | with the client |
 | On what upstream panics on (D1), the debug lines it writes before the panic (the cache's, for a client limit with an unknown unit) | the request stops at its check, after `caught error during call: <error>` | D1 |
+
+## 8. Extensions
+
+Not upstream's: what `docs/design.md` adds (B and C). Proven by tests of their own, on Redis and Memcached; upstream's behaviour is unchanged (§1–6).
+
+| Item | Status | Test |
+|---|---|---|
+| `rate_limits:` (D7): named limits, exclusive with `rate_limit:`, `window` instead of `unit`, no `unlimited`; names per ADR 0001, unique in their list, `replaces` not aimed at the list itself; the descriptor's `shadow_mode`, `quota_mode`, `detailed_metric`, `metadata` shared; the new keys valid only in their place (unknown elsewhere, as upstream says); YAML only (D28) | ✅ | `tests/rate_limits.rs` |
+| `fixed` windows of any duration (D8): whole numbers of `w` `d` `h` `m` `s`, in that order (`1h30m`); reported as the largest unit dividing them, with `unit_multiplier` when ≠ 1 (D13) | ✅ | `windows_are_reported_in_the_largest_unit_dividing_them`, `list_limits_count_in_their_own_windows` |
+| `offset: <duration>` and `offset: hashed` (FNV-1a 64 of the entries after `share_threshold`, `offset_rounding` and its default) (ADR 0002) | ✅ | `offsets_are_read_as_adr_0002_writes_them`, `hashed_phases_follow_the_descriptor`, `hashed_offsets_and_escaped_keys_are_stored_as_adr_0001_says` |
+| Keys `{descriptor}_shape_start_name`, the hash tag escaped (ADR 0001); TTL = duration + jitter; `duration_until_reset` from the window's origin (D12) | ✅ | `list_limits_count_in_their_own_windows`, `hashed_offsets_and_escaped_keys_are_stored_as_adr_0001_says` |
+| A descriptor's representative status (D17); its shadow mode after the reduction; quota groups exhausted when one limit is | ✅ | `list_limits_count_in_their_own_windows`, `ties_are_won_by_the_first_list_limit`, `shadow_mode_applies_to_a_list_after_its_reduction`, `quota_groups_see_a_list_exhausted_when_one_limit_is` |
+| `replaces` on list limits (D16): replacing and replaced by name, a fully replaced descriptor OK without a limit, out of its quota group but among `passedBackends` | ✅ | `list_limits_replace_and_are_replaced_by_name`, `quota_groups_see_a_list_exhausted_when_one_limit_is` |
+| Refunds on every limit of a list (D21), floored at 0 | ✅ | `refunds_take_hits_back_from_every_list_limit` |
+| Local cache for `fixed` (D18): over-limit keys kept for the window | ✅ | `list_keys_over_their_limit_are_kept_in_the_local_cache` |
+| `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` has no effect on lists (D20) | ✅ | `stopping_increments_over_the_limit_leaves_lists_alone` |
+| `REDIS_PERSECOND` (D15): a list with a window under a minute goes whole to the per-second Redis | ✅ | `lists_with_a_short_window_go_to_the_per_second_redis` |
+| Per-unit headers over every limit, `<n><Unit>s` for a multiplier (D13); `RateLimit-Reset` from the representative's window | ✅ | `headers_describe_list_limits` |
+| Stats `<descriptor>~<name>` (D29); `/rlconfig` a line per limit with its window | ✅ | `list_limits_count_in_their_own_windows`, `lists_are_dumped_limit_by_limit`, `list_stats_keys_follow_the_descriptor_settings` |
+| Memcached: list limits of `fixed` windows (D24) | ✅ | `list_limits_count_on_memcached` |
+| `overflow: envoy` (D14) | ✅ | `overflow_envoy_is_accepted` |
+| `overflow: strict` (D14) | ⬜ | refused at load for now |
+| `anchored` (D9), `sliding` and `sliding_approx` (D10), `token_bucket` (D11) | ⬜ | refused at load for now |
+| The shipped Prometheus mapper's `limit=` label, `total_capped_hits`, `opened_without_hits` (D29) | ⬜ | |
+| Memcached: a warning at load when a list key's static part exceeds 250 − 64 bytes (ADR 0001) | ⬜ | |
+| A client-sent `limit` with `unit_multiplier` (D23): read, applied, echoed, 0 refused | ⬜ | ignored, as upstream |

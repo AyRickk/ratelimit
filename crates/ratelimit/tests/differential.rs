@@ -12993,3 +12993,764 @@ async fn memcached_calls_are_traced_like_upstream() {
     );
     assert_eq!(runs[1], runs[0]);
 }
+
+// `rate_limits:` with `fixed` windows (docs/design.md D7, D8, ADR 0001, ADR 0002): an
+// extension, with no upstream to compare with, counted on a real Redis.
+
+/// The service on its own Redis (and per-second Redis), on a manual clock.
+struct Extended {
+    subject: Subject,
+    redis: Redis,
+    per_second: Option<Redis>,
+}
+
+impl Extended {
+    async fn start(yaml: &str, settings: Settings) -> Self {
+        let redis = Redis::start().await;
+        let per_second = match settings.per_second {
+            true => Some(Redis::start().await),
+            false => None,
+        };
+        let subject =
+            Subject::start(&redis, per_second.as_ref(), &settings, None, None, None).await;
+        let file = ConfigFile {
+            name: "config.yaml".into(),
+            content: yaml.into(),
+        };
+        subject
+            .service
+            .set_config(config::load(&[file], &settings.load).unwrap());
+        Self {
+            subject,
+            redis,
+            per_second,
+        }
+    }
+
+    fn at(&self, now: i64) {
+        self.subject.clock.0.store(now, Ordering::SeqCst);
+    }
+
+    async fn call(&self, request: RateLimitRequest) -> RateLimitResponse {
+        self.subject
+            .service
+            .should_rate_limit(&request)
+            .await
+            .unwrap()
+    }
+
+    /// The code, limit name, remaining hits and reset of each descriptor's status.
+    async fn statuses(&self, request: RateLimitRequest) -> Vec<(String, String, u32, i64)> {
+        self.call(request)
+            .await
+            .statuses
+            .iter()
+            .map(|s| {
+                (
+                    format!("{:?}", s.code()),
+                    s.current_limit
+                        .as_ref()
+                        .map_or(String::new(), |l| l.name.clone()),
+                    s.limit_remaining,
+                    s.duration_until_reset.as_ref().map_or(-1, |d| d.seconds),
+                )
+            })
+            .collect()
+    }
+
+    /// The counters and the seconds left of their TTL (to the nearest minute, the test
+    /// taking some seconds of real time), in `redis`.
+    async fn keys_of(redis: &Redis) -> BTreeMap<String, (String, i64)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        redis
+            .dump()
+            .await
+            .into_iter()
+            .map(|(k, (v, expiry))| (k, (v, (expiry - now + 30) / 60 * 60)))
+            .collect()
+    }
+
+    async fn keys(&self) -> BTreeMap<String, (String, i64)> {
+        Self::keys_of(&self.redis).await
+    }
+
+    /// The counters of the list limits' stats.
+    fn stats(&self) -> BTreeMap<String, u64> {
+        self.subject
+            .stats
+            .snapshot()
+            .into_iter()
+            .filter(|(name, value)| name.contains('~') && *value > 0)
+            .collect()
+    }
+}
+
+/// [`Extended::statuses`] rows, from literals.
+fn owned<const N: usize>(rows: [(&str, &str, u32, i64); N]) -> Vec<(String, String, u32, i64)> {
+    rows.iter()
+        .map(|(c, n, r, t)| (c.to_string(), n.to_string(), *r, *t))
+        .collect()
+}
+
+const WEEK_AND_FIVE_HOURS: &str = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - name: five_hour
+        requests_per_unit: 3
+        window: {type: fixed, duration: 5h}
+      - name: weekly
+        requests_per_unit: 5
+        window: {type: fixed, duration: 7d, offset: 4d}
+";
+
+/// Each limit of a list counts in its own key (ADR 0001), its window from the epoch or its
+/// offset; the descriptor's status is the representative one (D17): of those over, the
+/// longest to reset, else the fewest remaining. Each limit has its stats, named `~name` (D29).
+#[tokio::test]
+async fn list_limits_count_in_their_own_windows() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    let alice = || request("d", &[&[("user", "alice")]]);
+    // 2001-09-09 01:46:40 UTC, a Sunday: the 5 h window started at 00:00, the week (from
+    // Monday 00:00 UTC, the epoch being a Thursday) on 2001-09-03.
+    h.at(1_000_000_000);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.extend(h.statuses(alice()).await);
+    }
+    assert_eq!(
+        seen,
+        owned([
+            ("Ok", "five_hour", 2, 8000),
+            ("Ok", "five_hour", 1, 8000),
+            ("Ok", "five_hour", 0, 8000),
+            ("OverLimit", "five_hour", 0, 8000),
+        ])
+    );
+    // The next 5 h window: the week is the one left with the fewest hits, then over.
+    h.at(1_000_008_000);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.extend(h.statuses(alice()).await);
+    }
+    assert_eq!(
+        seen,
+        owned([
+            ("Ok", "weekly", 0, 72000),
+            ("OverLimit", "weekly", 0, 72000),
+            ("OverLimit", "weekly", 0, 72000),
+            // Both over: the week ends last.
+            ("OverLimit", "weekly", 0, 72000),
+        ])
+    );
+    let current = h.call(alice()).await.statuses[0]
+        .current_limit
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (current.unit(), current.unit_multiplier, current.requests_per_unit),
+        (
+            ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::rate_limit::Unit::Week,
+            None,
+            5
+        )
+    );
+    assert_eq!(
+        h.keys().await,
+        BTreeMap::from([
+            (
+                "{d_user_alice_}_fx18000_999990000_five_hour".to_string(),
+                ("4".to_string(), 18000)
+            ),
+            (
+                "{d_user_alice_}_fx18000_1000008000_five_hour".to_string(),
+                ("5".to_string(), 18000)
+            ),
+            (
+                "{d_user_alice_}_fx604800o345600_999475200_weekly".to_string(),
+                ("9".to_string(), 604800)
+            ),
+        ])
+    );
+    let limit =
+        |name: &str, stat: &str| format!("ratelimit.service.rate_limit.d.user~{name}.{stat}");
+    assert_eq!(
+        h.stats(),
+        BTreeMap::from([
+            (limit("five_hour", "total_hits"), 9),
+            (limit("five_hour", "within_limit"), 6),
+            (limit("five_hour", "near_limit"), 2),
+            (limit("five_hour", "over_limit"), 3),
+            (limit("weekly", "total_hits"), 9),
+            (limit("weekly", "within_limit"), 5),
+            (limit("weekly", "near_limit"), 1),
+            (limit("weekly", "over_limit"), 4),
+        ])
+    );
+}
+
+/// `offset: hashed` (ADR 0002): each descriptor's window starts at its own phase, hashed from
+/// its entries after `share_threshold`; the hash tag escapes `%`, `{` and `}` (ADR 0001).
+/// Expected phases from an independent FNV-1a.
+#[tokio::test]
+async fn hashed_offsets_and_escaped_keys_are_stored_as_adr_0001_says() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(
+        "
+domain: \"d{1}%\"
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: weekly, requests_per_unit: 5, window: {type: fixed, duration: 7d, offset: hashed}}
+  - key: file
+    value: \"a*\"
+    share_threshold: true
+    rate_limits:
+      - {name: daily, requests_per_unit: 5, window: {type: fixed, duration: 1d, offset: hashed, offset_rounding: 6h}}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    let descriptors: &[&[(&str, &str)]] = &[
+        &[("user", "alice")],
+        &[("user", "b}o{b")],
+        &[("file", "abc")],
+        &[("file", "axe")],
+    ];
+    assert_eq!(
+        h.statuses(request("d{1}%", descriptors)).await,
+        owned([
+            // Phase 428 400 s: the week started at 999 558 000.
+            ("Ok", "weekly", 4, 162_800),
+            // Phase 115 200 s.
+            ("Ok", "weekly", 4, 454_400),
+            // Both files share `file=a*`: phase 21 600 s, one counter.
+            ("Ok", "daily", 4, 15_200),
+            ("Ok", "daily", 3, 15_200),
+        ])
+    );
+    let keys: Vec<String> = h.keys().await.into_keys().collect();
+    assert_eq!(
+        keys,
+        [
+            "{d%7B1%7D%25_file_a*_}_fx86400oh21600_999928800_daily",
+            "{d%7B1%7D%25_user_alice_}_fx604800oh3600_999558000_weekly",
+            "{d%7B1%7D%25_user_b%7Do%7Bb_}_fx604800oh3600_999849600_weekly",
+        ]
+    );
+}
+
+/// The descriptor's `shadow_mode` (D17) applies to the representative status: OK where it is
+/// over, its remaining hits 0; each limit counts its `shadow_mode` stat.
+#[tokio::test]
+async fn shadow_mode_applies_to_a_list_after_its_reduction() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    shadow_mode: true
+    rate_limits:
+      - {name: minute, requests_per_unit: 1, window: {type: fixed, duration: 1m}}
+      - {name: hour, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    let call = || h.statuses(request("d", &[&[("user", "a")]]));
+    assert_eq!(call().await, owned([("Ok", "minute", 0, 20)]));
+    // Both over: the hour ends last.
+    assert_eq!(call().await, owned([("Ok", "hour", 0, 800)]));
+    let response = h.call(request("d", &[&[("user", "a")]])).await;
+    assert_eq!(
+        response.overall_code(),
+        ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code::Ok
+    );
+    let stats = h.stats();
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.user~minute.shadow_mode"],
+        2
+    );
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.user~hour.shadow_mode"],
+        2
+    );
+}
+
+/// `replaces` (D16) on list limits: a list limit replaces another descriptor's limit by name,
+/// and is replaced by name; a descriptor whose limits are all replaced is OK, with no limit.
+#[tokio::test]
+async fn list_limits_replace_and_are_replaced_by_name() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: hourly, requests_per_unit: 10, window: {type: fixed, duration: 1h}}
+      - {name: daily, requests_per_unit: 100, window: {type: fixed, duration: 1d}, replaces: [{name: legacy}]}
+  - key: org
+    rate_limit: {unit: minute, requests_per_unit: 1, name: legacy}
+  - key: team
+    rate_limit: {unit: minute, requests_per_unit: 50, replaces: [{name: hourly}]}
+  - key: all
+    rate_limit: {unit: minute, requests_per_unit: 50, replaces: [{name: hourly}, {name: daily}]}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    assert_eq!(
+        h.statuses(request("d", &[&[("user", "a")], &[("org", "x")]]))
+            .await,
+        owned([("Ok", "hourly", 9, 800), ("Ok", "", 0, -1)])
+    );
+    assert_eq!(
+        h.statuses(request("d", &[&[("user", "a")], &[("team", "x")]]))
+            .await,
+        owned([("Ok", "daily", 98, 80000), ("Ok", "", 49, 20)])
+    );
+    assert_eq!(
+        h.statuses(request("d", &[&[("user", "a")], &[("all", "x")]]))
+            .await,
+        owned([("Ok", "", 0, -1), ("Ok", "", 49, 20)])
+    );
+}
+
+/// Refunds (`is_negative_hits`, D21) take hits back from every limit of the list, floored
+/// at 0, and answer OK with what remains.
+#[tokio::test]
+async fn refunds_take_hits_back_from_every_list_limit() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, Settings::default()).await;
+    h.at(1_000_000_000);
+    let hits = |n: u64, refund: bool| {
+        let mut r = request("d", &[&[("user", "alice")]]);
+        r.descriptors[0].hits_addend = Some(n);
+        r.descriptors[0].is_negative_hits = refund;
+        r
+    };
+    assert_eq!(
+        h.statuses(hits(4, false)).await,
+        owned([("OverLimit", "five_hour", 0, 8000)])
+    );
+    assert_eq!(
+        h.statuses(hits(2, true)).await,
+        owned([("Ok", "five_hour", 1, 8000)])
+    );
+    assert_eq!(
+        h.statuses(hits(9, true)).await,
+        owned([("Ok", "five_hour", 3, 8000)])
+    );
+    let values: Vec<String> = h.keys().await.into_values().map(|(v, _)| v).collect();
+    assert_eq!(values, ["0", "0"]);
+}
+
+/// The local cache (D18) keeps a list key over its limit for its window: the next requests
+/// are answered without Redis, and counted in `over_limit_with_local_cache`.
+#[tokio::test]
+async fn list_keys_over_their_limit_are_kept_in_the_local_cache() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            local_cache_size_in_bytes: 1 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(WEEK_AND_FIVE_HOURS, settings).await;
+    h.at(1_000_000_000);
+    let alice = || request("d", &[&[("user", "alice")]]);
+    for _ in 0..6 {
+        h.call(alice()).await;
+    }
+    assert_eq!(
+        h.statuses(alice()).await,
+        owned([("OverLimit", "weekly", 0, 80000)])
+    );
+    // The 5 h key stopped at 4, the week's at 6: Redis was not asked again.
+    let values: BTreeMap<String, String> = h
+        .keys()
+        .await
+        .into_iter()
+        .map(|(k, (v, _))| (k, v))
+        .collect();
+    assert_eq!(
+        values,
+        BTreeMap::from([
+            (
+                "{d_user_alice_}_fx18000_999990000_five_hour".to_string(),
+                "4".to_string()
+            ),
+            (
+                "{d_user_alice_}_fx604800o345600_999475200_weekly".to_string(),
+                "6".to_string()
+            ),
+        ])
+    );
+    let stats = h.stats();
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.user~five_hour.over_limit_with_local_cache"],
+        3
+    );
+    assert_eq!(
+        stats["ratelimit.service.rate_limit.d.user~weekly.over_limit_with_local_cache"],
+        1
+    );
+}
+
+/// `LIMIT_PER_UNIT_HEADERS_ENABLED` describes every limit of every list, a window of several
+/// units under its own name (D13); `RateLimit-Reset` is the representative's window's,
+/// offset included, re-read from the clock.
+#[tokio::test]
+async fn headers_describe_list_limits() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            response_headers: Some(LimitHeaders::default()),
+            per_unit_headers: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: five_hour, requests_per_unit: 3, window: {type: fixed, duration: 5h}}
+      - {name: weekly, requests_per_unit: 5, window: {type: fixed, duration: 7d, offset: 4d}}
+  - key: org
+    rate_limit: {unit: hour, requests_per_unit: 9}
+",
+        settings,
+    )
+    .await;
+    h.at(1_000_000_000);
+    let headers: Vec<(String, String)> = h
+        .call(request("d", &[&[("user", "a")], &[("org", "x")]]))
+        .await
+        .response_headers_to_add
+        .into_iter()
+        .map(|h| (h.key, h.value))
+        .collect();
+    let pairs = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        headers,
+        pairs(&[
+            ("RateLimit-Limit-5Hours", "3"),
+            ("RateLimit-Remaining-5Hours", "2"),
+            ("RateLimit-Limit-Weeks", "5"),
+            ("RateLimit-Remaining-Weeks", "4"),
+            ("RateLimit-Limit-Hours", "9"),
+            ("RateLimit-Remaining-Hours", "8"),
+            ("RateLimit-Limit", "3"),
+            ("RateLimit-Remaining", "2"),
+            ("RateLimit-Reset", "8000"),
+        ])
+    );
+}
+
+/// `REDIS_PERSECOND` (D15): a list with a window shorter than a minute goes, whole, to the
+/// per-second Redis; others stay on the main one.
+#[tokio::test]
+async fn lists_with_a_short_window_go_to_the_per_second_redis() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        per_second: true,
+        ..Default::default()
+    };
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: burst
+    rate_limits:
+      - {name: ten_seconds, requests_per_unit: 5, window: {type: fixed, duration: 10s}}
+      - {name: daily, requests_per_unit: 50, window: {type: fixed, duration: 1d}}
+  - key: steady
+    rate_limits:
+      - {name: minute, requests_per_unit: 5, window: {type: fixed, duration: 1m}}
+",
+        settings,
+    )
+    .await;
+    h.at(1_000_000_000);
+    h.call(request("d", &[&[("burst", "a")], &[("steady", "a")]]))
+        .await;
+    let main: Vec<String> = h.keys().await.into_keys().collect();
+    let per_second: Vec<String> = Extended::keys_of(h.per_second.as_ref().unwrap())
+        .await
+        .into_keys()
+        .collect();
+    assert_eq!(main, ["{d_steady_a_}_fx60_999999960_minute"]);
+    assert_eq!(
+        per_second,
+        [
+            "{d_burst_a_}_fx10_1000000000_ten_seconds",
+            "{d_burst_a_}_fx86400_999993600_daily",
+        ]
+    );
+}
+
+/// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` leaves lists alone (D20): their hits are always
+/// counted, whatever the request's other keys, and a list going over does not stop them.
+#[tokio::test]
+async fn stopping_increments_over_the_limit_leaves_lists_alone() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        cache: CacheSettings {
+            stop_cache_key_increment_when_overlimit: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: hourly, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+  - key: org
+    rate_limit: {unit: hour, requests_per_unit: 1}
+",
+        settings,
+    )
+    .await;
+    h.at(1_000_000_000);
+    // From the second request on, `org` is about to go over: only keys going over count,
+    // but the list's always does.
+    for _ in 0..3 {
+        h.call(request("d", &[&[("user", "a")], &[("org", "x")]]))
+            .await;
+    }
+    let values: BTreeMap<String, String> = h
+        .keys()
+        .await
+        .into_iter()
+        .map(|(k, (v, _))| (k, v))
+        .collect();
+    assert_eq!(
+        values,
+        BTreeMap::from([
+            ("d_org_x_999997200".to_string(), "3".to_string()),
+            (
+                "{d_user_a_}_fx3600_999997200_hourly".to_string(),
+                "3".to_string()
+            ),
+        ])
+    );
+}
+
+/// On Memcached (D24), list limits count in ADR 0001's keys too, decided on what `GET` reads
+/// and increased after the answer.
+#[tokio::test]
+async fn list_limits_count_on_memcached() {
+    if !memcached_available() {
+        return;
+    }
+    let memcached = Memcached::start().await;
+    let servers = ratelimit::memcached::client::resolve(std::slice::from_ref(&memcached.address))
+        .await
+        .unwrap();
+    let client = Arc::new(ratelimit::memcached::client::Client::new(servers, 2, None));
+    let clock = Arc::new(ManualClock::default());
+    let stats = Arc::new(Stats::default());
+    let cache = ratelimit::memcached::MemcacheCache::new(
+        client,
+        clock.clone(),
+        stats.clone(),
+        &stats.scope_with_tags("ratelimit"),
+        CacheSettings::default(),
+        None,
+    );
+    let service = RateLimitService::new(cache, clock.clone(), stats, ServiceSettings::default());
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: WEEK_AND_FIVE_HOURS.into(),
+    };
+    service.set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    clock.0.store(1_000_000_000, Ordering::SeqCst);
+    let five_hour = "{d_user_alice_}_fx18000_999990000_five_hour";
+    let weekly = "{d_user_alice_}_fx604800o345600_999475200_weekly";
+    let value = async |key: &str| {
+        let answer = memcached.ask(&format!("get {key}\r\n")).await;
+        answer
+            .lines()
+            .nth(1)
+            .filter(|_| answer.starts_with("VALUE"))
+            .map(str::to_string)
+    };
+    let mut seen = Vec::new();
+    for n in 1..=4 {
+        let response = service
+            .should_rate_limit(&request("d", &[&[("user", "alice")]]))
+            .await
+            .unwrap();
+        let s = &response.statuses[0];
+        seen.push((
+            format!("{:?}", s.code()),
+            s.current_limit.as_ref().unwrap().name.clone(),
+            s.limit_remaining,
+            s.duration_until_reset.as_ref().unwrap().seconds,
+        ));
+        // The increments are sent after the answer.
+        for _ in 0..100 {
+            if value(weekly).await == Some(n.to_string()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        seen,
+        owned([
+            ("Ok", "five_hour", 2, 8000),
+            ("Ok", "five_hour", 1, 8000),
+            ("Ok", "five_hour", 0, 8000),
+            ("OverLimit", "five_hour", 0, 8000),
+        ])
+    );
+    assert_eq!(value(five_hour).await.as_deref(), Some("4"));
+    assert_eq!(value(weekly).await.as_deref(), Some("4"));
+}
+
+/// On a tie (D17), the first limit of the list stands for it: among those with the fewest
+/// remaining hits, and among those over with the same reset.
+#[tokio::test]
+async fn ties_are_won_by_the_first_list_limit() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: a, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+      - {name: b, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+      - {name: c, requests_per_unit: 9, window: {type: fixed, duration: 1d}}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    let call = || h.statuses(request("d", &[&[("user", "x")]]));
+    assert_eq!(call().await, owned([("Ok", "a", 0, 800)]));
+    // `a` and `b` over with the same reset; `c` has the longest reset but is not over.
+    assert_eq!(call().await, owned([("OverLimit", "a", 0, 800)]));
+}
+
+/// `quota_mode` (D17): a list's descriptor is exhausted when one of its limits is, and the
+/// request over only when every group is; a descriptor whose limits are all replaced leaves
+/// its group but is still among `passedBackends`.
+#[tokio::test]
+async fn quota_groups_see_a_list_exhausted_when_one_limit_is() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            response_dynamic_metadata: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: model_name_override
+    quota_mode: true
+    rate_limits:
+      - {name: minute, requests_per_unit: 1, window: {type: fixed, duration: 1m}}
+      - {name: day, requests_per_unit: 100, window: {type: fixed, duration: 1d}}
+  - key: backend_name
+    quota_mode: true
+    rate_limits:
+      - {name: backend_hour, requests_per_unit: 1, window: {type: fixed, duration: 1h}}
+  - key: override
+    rate_limit: {unit: hour, requests_per_unit: 100, replaces: [{name: backend_hour}]}
+",
+        settings,
+    )
+    .await;
+    h.at(1_000_000_000);
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
+    let models: &[&[(&str, &str)]] = &[
+        &[("model_name_override", "a")],
+        &[("model_name_override", "b")],
+    ];
+    h.call(request("d", &models[..1])).await;
+    // `a`'s minute is over, `b` is not: the request passes, through `b`.
+    let response = h.call(request("d", models)).await;
+    assert_eq!(response.overall_code(), Code::Ok);
+    let backends = |response: &RateLimitResponse| {
+        let metadata = response.dynamic_metadata.as_ref().unwrap();
+        format!("{:?}", metadata.fields.get("passedBackends"))
+    };
+    assert!(
+        backends(&response).contains("\"b\""),
+        "{}",
+        backends(&response)
+    );
+    assert!(
+        !backends(&response).contains("\"a\""),
+        "{}",
+        backends(&response)
+    );
+    // Both exhausted.
+    let response = h.call(request("d", models)).await;
+    assert_eq!(response.overall_code(), Code::OverLimit);
+    // `backend_name`'s only limit is replaced: out of the groups, but a passed backend
+    // (listed when the request has a quota group, here `c`'s).
+    let replaced: &[&[(&str, &str)]] = &[
+        &[("backend_name", "x")],
+        &[("override", "y")],
+        &[("model_name_override", "c")],
+    ];
+    for _ in 0..2 {
+        let response = h.call(request("d", replaced)).await;
+        assert_eq!(response.overall_code(), Code::Ok);
+        let passed = backends(&response);
+        assert!(
+            passed.contains("\"x\"") && passed.contains("\"c\""),
+            "{passed}"
+        );
+        h.at(1_000_000_000 + 60);
+    }
+}

@@ -26,7 +26,7 @@ With a phase φ, the window starts at `now − (now − φ).rem_euclid(D)` and `
 ### `offset: <duration>`
 
 - Constant, **UTC only**.
-- Rule: `0 ≤ offset < duration`, otherwise a config error (no silent normalisation).
+- Rule: `0 ≤ offset < duration`, otherwise a config error (no silent normalisation). `offset: 0` is the epoch's origin: the same windows, so the same keys.
 - Local time cannot be held with a constant offset (daylight saving changes: a local week of 167 h or 169 h). An IANA `timezone:` option is explicitly deferred.
 
 ### `offset: hashed`
@@ -38,7 +38,7 @@ With a phase φ, the window starts at `now − (now − φ).rem_euclid(D)` and `
 
 ### Common rules
 
-- `offset` is not allowed with `unit: month` when `USE_CALENDAR_MONTH_RATE_LIMIT=true` (variable duration).
+- A list window always lasts exactly its duration: `USE_CALENDAR_MONTH_RATE_LIMIT` does not apply to it, so `offset` never meets a calendar month.
 - `offset` is part of the key's shape (ADR 0001): `fixed 7d` and `fixed 7d offset 4d` on the same descriptor are two distinct limits.
 - For a duration that does not divide 24 h (e.g. 5 h), no offset aligns the windows on the day; to be said in the documentation.
 
