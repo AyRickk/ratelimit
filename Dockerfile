@@ -1,6 +1,7 @@
 # The service's image (docs/design.md D33): a static binary at /bin/ratelimit on distroless,
 # as upstream's, for linux/amd64 and linux/arm64. Cross-compiled with cargo-zigbuild on the
-# build platform.
+# build platform. LICENSE, NOTICE and the crates' licenses (cargo-about, D34) are shipped in
+# /usr/share/doc/ratelimit.
 FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
@@ -10,9 +11,10 @@ RUN apt-get update \
         > /tmp/zig.txt \
     && pip3 install --break-system-packages --no-cache-dir --require-hashes -r /tmp/zig.txt \
     && cargo install --locked cargo-zigbuild@0.24.0 \
+    && cargo install --locked --features cli cargo-about@0.9.3 \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock about.toml about.hbs LICENSE NOTICE ./
 COPY crates crates
 ARG TARGETARCH
 # The registry's cache is locked, both platforms' builds running at once. No cache of the
@@ -24,8 +26,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
     && cargo zigbuild --release --locked -p ratelimit --bin ratelimit --target "$target" \
-    && cp "target/$target/release/ratelimit" /ratelimit
+    && cp "target/$target/release/ratelimit" /ratelimit \
+    && mkdir /doc \
+    && cp LICENSE NOTICE /doc \
+    && cargo fetch --locked \
+    && cargo about generate --frozen --fail about.hbs -o /doc/THIRD-PARTY-LICENSES.txt
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /ratelimit /bin/ratelimit
+COPY --from=build /doc /usr/share/doc/ratelimit
 ENTRYPOINT ["/bin/ratelimit"]
