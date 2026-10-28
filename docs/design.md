@@ -11,7 +11,7 @@ Compatibility progress is tracked in [`docs/parity.md`](parity.md).
 
 ## Goal
 
-A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit) (reference: commit `f4e7669`), **100% compatible** and extended: free window durations, new window types, several limits per descriptor, counting modes. Replacing envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway only takes changing the image. The first version is released only at **full parity**.
+A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit) (reference: commit `f4e7669`), **100% compatible** and extended: free window durations, new window types, several limits per descriptor, counting modes. Replacing envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway only takes changing the image. Version 1 is released only at **full parity** (D2).
 
 ---
 
@@ -19,7 +19,7 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 
 **D1. Strict superset** *(amended)*. Every behaviour of the reference is reproduced exactly for any input it handles **without panicking**. Its panics (e.g. a client `limit` with `unit: UNKNOWN`, `utilities.go:38`; an invalid environment variable re-read on reload) become proper errors, listed as deliberate divergences in `docs/parity.md`. Additions never change the behaviour of an existing Envoy config.
 
-**D2. Full parity before v1.** Every feature of the reference is included: Memcached, xDS config, `quota_mode`, `share_threshold`, local cache, `REDIS_PERSECOND`, Redis sentinel / cluster / TLS / AWS IAM, DogStatsD, OTLP, `LIMIT_*` headers, dynamic metadata, `/json`, debug port, `grpc.health.v1`, `GRPC_UDS`, certificate hot reload, etc. The exhaustive list is `docs/parity.md`.
+**D2. Full parity before v1** *(amended)*. `0.x` releases come before it: `v0.1.0` has the reference's behaviour, without the new window types. Every feature of the reference is included: Memcached, xDS config, `quota_mode`, `share_threshold`, local cache, `REDIS_PERSECOND`, Redis sentinel / cluster / TLS / AWS IAM, DogStatsD, OTLP, `LIMIT_*` headers, dynamic metadata, `/json`, debug port, `grpc.health.v1`, `GRPC_UDS`, certificate hot reload, etc. The exhaustive list is `docs/parity.md`.
 
 **D3. Parity inventory** *(amended)*. `docs/parity.md`, whose environment variable section is **generated** from `src/settings/settings.go` (134 variables). It also covers YAML keys, the API, metric names, logs, traces and the image. v1 ships when every line is proven by a test or marked as a justified divergence. Logs: the format (logrus' text and JSON) and every line at info, warning, error and fatal level are exact, since alerts and log pipelines match on them; debug lines are best effort: written at the same points as upstream's, but free to differ in text and order, and to describe the extensions. A debug line never justifies keeping code shaped like upstream's.
 
