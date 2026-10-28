@@ -214,6 +214,12 @@ impl AnchoredWindow {
         }
     }
 
+    /// The stored window, if it is still open at `now`: until `now ≥ anchor + duration`, a
+    /// clock behind the anchor counting as no time elapsed.
+    pub fn open(&self, stored: Option<Anchored>, now: i64) -> Option<Anchored> {
+        stored.filter(|w| now - w.anchor < self.duration)
+    }
+
     /// The seconds until the window ends: the open one's, else one opened now's (D12); a
     /// clock behind the anchor counts as no time elapsed (D27).
     pub fn reset(&self, window: Option<Anchored>, now: i64) -> i64 {
@@ -226,7 +232,7 @@ impl AnchoredWindow {
     /// is (with `first_hit`, only if it has hits); a refund never opens or closes one, and
     /// floors the count at 0. The Redis script ([`crate::redis`]) does the same.
     pub fn step(&self, state: Option<Anchored>, op: AnchoredOp) -> AnchoredResult {
-        let open = state.filter(|w| op.now - w.anchor < self.duration);
+        let open = self.open(state, op.now);
         let hits = op.hits.min(MAX_ANCHORED_COUNT);
         let changed = |window: Anchored, opened| AnchoredResult {
             state: Some(window),

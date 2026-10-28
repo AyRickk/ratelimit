@@ -10,7 +10,7 @@ pub mod srv;
 use crate::config::RateLimit;
 use crate::limiter::{self, CacheSettings, Clock, Count};
 use crate::local_cache::LocalCache;
-use crate::service::{CacheError, LimitOutcome, RateLimitCache};
+use crate::service::{CacheError, LimitOutcome, LimitReading, RateLimitCache};
 use crate::stats::{Counter, Scope, Stats};
 use client::{Client, Error};
 use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
@@ -150,7 +150,7 @@ impl MemcacheCache {
 }
 
 /// A descriptor's limit: its key and what it counts.
-struct Check {
+struct Counted {
     /// The descriptor's index in the request.
     index: usize,
     key: String,
@@ -160,6 +160,53 @@ struct Check {
 }
 
 impl RateLimitCache for MemcacheCache {
+    /// The quota lookup (ADR 0003): one `GetMulti` of the keys, on the client itself so that
+    /// nothing is counted in `memcache.*`.
+    async fn lookup(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+    ) -> Result<(i64, Vec<Vec<LimitReading>>), CacheError> {
+        let now = self.clock.unix_now();
+        let calendar = self.settings.use_calendar_month;
+        let mut keys = Vec::new();
+        for (index, _, limit) in limiter::slots(limits) {
+            let descriptor = &request.descriptors[index];
+            let prefix = &self.settings.cache_key_prefix;
+            keys.push(limiter::cache_key(
+                prefix,
+                &request.domain,
+                descriptor,
+                limit,
+                now,
+                calendar,
+            )?);
+        }
+        let (values, error) = match keys.is_empty() {
+            true => Default::default(),
+            false => self.client.client.get_multi(&keys).await,
+        };
+        if let Some(e) = error {
+            return Err(CacheError(format!(
+                "Error multi-getting memcache keys: {e}"
+            )));
+        }
+        let mut readings: Vec<Vec<LimitReading>> = limits
+            .iter()
+            .map(|list| Vec::with_capacity(list.len()))
+            .collect();
+        for ((index, _, limit), key) in limiter::slots(limits).zip(&keys) {
+            // As a decision reads it: not a 32-bit number counts as 0.
+            let used = values.get(key).map_or(0, |item| counter(item).unwrap_or(0));
+            let reset = limiter::reset(limit, &request.descriptors[index], now, calendar)?;
+            readings[index].push(LimitReading {
+                used,
+                reset: Some(reset),
+            });
+        }
+        Ok((now, readings))
+    }
+
     async fn do_limit(
         &self,
         request: &RateLimitRequest,
@@ -195,7 +242,7 @@ impl RateLimitCache for MemcacheCache {
                 }
                 keys_to_get.push(key.clone());
             }
-            checks.push(Check {
+            checks.push(Counted {
                 index,
                 key,
                 limit: limit.clone(),
@@ -231,20 +278,17 @@ impl RateLimitCache for MemcacheCache {
 
         let mut counts = Vec::with_capacity(checks.len());
         for c in &checks {
-            // `ParseInt(value, 10, 32)`, a negative one wrapping into a `uint64`.
             let before = match values.get(&c.key) {
-                Some(item) => {
-                    match crate::go::parse_int10(&String::from_utf8_lossy(&item.value), 32) {
-                        Ok(decoded) => decoded as u64,
-                        Err(_) => {
-                            crate::log::error(&format!(
-                                "Unexpected non-numeric value in memcached: {}",
-                                item.go_format()
-                            ));
-                            0
-                        }
+                Some(item) => match counter(item) {
+                    Ok(decoded) => decoded,
+                    Err(_) => {
+                        crate::log::error(&format!(
+                            "Unexpected non-numeric value in memcached: {}",
+                            item.go_format()
+                        ));
+                        0
                     }
-                }
+                },
                 None => 0,
             };
             let count = if c.over_in_local_cache {
@@ -302,7 +346,7 @@ async fn increase(
     client: &CountedClient,
     clock: &dyn Clock,
     settings: &CacheSettings,
-    checks: Vec<Check>,
+    checks: Vec<Counted>,
 ) {
     for c in checks {
         if c.over_in_local_cache {
@@ -352,6 +396,13 @@ async fn increase(
             Err(e) => crate::log::error(&format!("Failed to increment key {key}: {e}")),
         }
     }
+}
+
+/// A counter's value: `ParseInt(value, 10, 32)`, a negative one wrapping into a `uint64`.
+fn counter(item: &client::Item) -> Result<u64, ()> {
+    crate::go::parse_int10(&String::from_utf8_lossy(&item.value), 32)
+        .map(|n| n as u64)
+        .map_err(|_| ())
 }
 
 /// `memcacheExpiration`: past 30 days, the Unix time it ends (as an `int32`).

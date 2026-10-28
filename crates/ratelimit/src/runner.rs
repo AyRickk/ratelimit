@@ -629,6 +629,17 @@ impl crate::service::RateLimitCache for Backend {
             Backend::Memcache(cache) => cache.do_limit(request, limits).await,
         }
     }
+
+    async fn lookup(
+        &self,
+        request: &ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest,
+        limits: &[Vec<crate::config::RateLimit>],
+    ) -> Result<(i64, Vec<Vec<crate::service::LimitReading>>), crate::service::CacheError> {
+        match self {
+            Backend::Redis(cache) => cache.lookup(request, limits).await,
+            Backend::Memcache(cache) => cache.lookup(request, limits).await,
+        }
+    }
 }
 
 /// `newMemcacheFromSettings`: the servers of `MEMCACHE_HOST_PORT`, or of `MEMCACHE_SRV`
