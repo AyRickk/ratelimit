@@ -1,6 +1,7 @@
 //! The rate limit decision for a `ShouldRateLimit` request. A port of envoyproxy/ratelimit
 //! `src/service/ratelimit.go`.
 
+use crate::config::window::Window;
 use crate::config::{ConfigError, LimitLookup, RateLimit, RateLimitConfig};
 use crate::limiter::Clock;
 use crate::stats::Stats;
@@ -20,15 +21,33 @@ use std::sync::{Arc, RwLock};
 #[error("{0}")]
 pub struct CacheError(pub String);
 
+/// What the backend found for a limit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LimitOutcome {
+    /// Its status, before shadow mode.
+    pub status: DescriptorStatus,
+    /// An anchored window this request opened without counting hits (D9).
+    pub opened_without_hits: bool,
+}
+
+impl From<DescriptorStatus> for LimitOutcome {
+    fn from(status: DescriptorStatus) -> Self {
+        Self {
+            status,
+            opened_without_hits: false,
+        }
+    }
+}
+
 /// The counting backend (upstream's `RateLimitCache`).
 pub trait RateLimitCache: Send + Sync + 'static {
     /// Counts the request against `limits`, a list per descriptor (empty: nothing to check),
-    /// and returns, per descriptor, a status per limit, before shadow mode.
+    /// and returns, per descriptor, an outcome per limit.
     fn do_limit(
         &self,
         request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> impl Future<Output = Result<Vec<Vec<DescriptorStatus>>, CacheError>> + Send;
+    ) -> impl Future<Output = Result<Vec<Vec<LimitOutcome>>, CacheError>> + Send;
 }
 
 impl<T: RateLimitCache> RateLimitCache for Arc<T> {
@@ -36,7 +55,7 @@ impl<T: RateLimitCache> RateLimitCache for Arc<T> {
         &self,
         request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> impl Future<Output = Result<Vec<Vec<DescriptorStatus>>, CacheError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Vec<LimitOutcome>>, CacheError>> + Send {
         T::do_limit(self, request, limits)
     }
 }
@@ -222,7 +241,11 @@ impl<C: RateLimitCache> RateLimitService<C> {
                 Check::Unlimited => Vec::new(),
             })
             .collect();
-        let per_limit = self.cache.do_limit(request, &limits).await?;
+        let outcomes = self.cache.do_limit(request, &limits).await?;
+        let per_limit: Vec<Vec<DescriptorStatus>> = outcomes
+            .iter()
+            .map(|list| list.iter().map(|o| o.status.clone()).collect())
+            .collect();
         let lengths_match = per_limit.len() == limits.len()
             && per_limit
                 .iter()
@@ -336,6 +359,20 @@ impl<C: RateLimitCache> RateLimitService<C> {
             overall_code = Code::Ok;
             self.stats.global_shadow_mode().inc();
         }
+        // A window a denied request opened without hits stays open with all its budget: the
+        // hits it waited for will not come (D9).
+        if overall_code == Code::OverLimit {
+            let opened = outcomes
+                .iter()
+                .zip(&limits)
+                .flat_map(|(o, l)| o.iter().zip(l));
+            for (_, limit) in opened.filter(|(o, _)| o.opened_without_hits) {
+                let key = &limit.full_key;
+                self.stats
+                    .rate_limit_counter(key, "opened_without_hits")
+                    .inc();
+            }
+        }
         let dynamic_metadata = self.settings.response_dynamic_metadata.then(|| {
             // A descriptor that passed is not available when its quota group is exhausted.
             passed.retain(|p| {
@@ -356,15 +393,25 @@ impl<C: RateLimitCache> RateLimitService<C> {
     }
 
     /// The limit, remaining hits and seconds until reset of `status`, under `names`. The reset
-    /// re-reads the clock rather than using the status's `duration_until_reset`, as upstream.
+    /// re-reads the clock rather than using the status's `duration_until_reset`, as upstream,
+    /// except for an anchored window, whose reset only its state knows.
     fn limit_headers(
         &self,
         names: &LimitHeaders,
         (status, limit, descriptor): &(DescriptorStatus, &RateLimit, &RateLimitDescriptor),
     ) -> Result<Vec<HeaderValue>, ServiceError> {
-        let now = self.clock.unix_now();
-        let calendar = self.settings.use_calendar_month;
-        let reset = crate::limiter::reset(limit, descriptor, now, calendar)?;
+        let reset = match &limit.window {
+            // Only its state knows when an anchored window ends.
+            Some(Window::Anchored(_)) => status
+                .duration_until_reset
+                .as_ref()
+                .map_or(0, |d| d.seconds),
+            _ => {
+                let now = self.clock.unix_now();
+                let calendar = self.settings.use_calendar_month;
+                crate::limiter::reset(limit, descriptor, now, calendar)?
+            }
+        };
         Ok(vec![
             header(&names.limit, limit.limit.requests_per_unit),
             header(&names.remaining, status.limit_remaining),

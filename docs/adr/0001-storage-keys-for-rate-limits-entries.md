@@ -26,7 +26,7 @@ This format is frozen before the first release: any later change is a major vers
 
 1. **Hash tag `{…}`**: the descriptor part, built like the legacy key (prefix, domain, `key_value_` pairs, the `share_threshold` pattern replacing the value), without `bucketStart`. It alone determines the slot, so all of a descriptor's limits and windows share the slot.
 2. **Escaping inside `{…}`**: `%` → `%25`, `{` → `%7B`, `}` → `%7D`, applied to the prefix, domain, keys and values. Since the escape character is itself escaped, splitting is unambiguous: the descriptor part ends at the first unescaped `}`. `_` is **not** escaped, as upstream (the legacy collision `a_b`/`c` ↔ `a`/`b_c` is reproduced, not fixed).
-3. **`<shape>`**: `[a-z]{2}[a-z0-9]*`, a readable encoding of the window's identity: type, duration in seconds, then depending on the type rounding, `buckets`, `offset`, opening mode. Examples: `fx604800`, `fx604800o345600`, `fx604800oh3600` (hashed offset, 1 h rounding), `an18000r3600`, `sl3600b12`, `tb60`. `requests_per_unit`, `burst` and `max_debt` are **not** part of it: changing them keeps the counters.
+3. **`<shape>`**: `[a-z]{2}[a-z0-9]*`, a readable encoding of the window's identity: type, duration in seconds, then depending on the type rounding, `buckets`, `offset`, opening mode. Examples: `fx604800`, `fx604800o345600`, `fx604800oh3600` (hashed offset, 1 h rounding), `an18000r3600` (anchored, its start rounded to the hour, opened by a check), `an3600f` (opened by the first hit), `sl3600b12`, `tb60`. `requests_per_unit`, `burst` and `max_debt` are **not** part of it: changing them keeps the counters.
 4. **`<bucketStart>`**: for `fixed` only (start of the window, offset included). Other types have a stable key whose state holds the time.
 5. **`<name>`**: required in `rate_limits:`, always **last** because it may contain `_`. Character set `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (forbidden: `:` `|` space `.` `~` `*` `=`, because of the statsd format and the `~` metric separator).
 
@@ -34,7 +34,7 @@ This format is frozen before the first release: any later change is a major vers
 
 - **Identity of a limit** = type + duration + rounding + opening mode + `buckets` + `offset` + name. Changing any of them starts from zero; renaming a limit therefore resets its counters (an explicit act).
 - **Name uniqueness**: within one descriptor's list only. The same name on two descriptors is legal and forms a replacement group (`replaces`), as upstream. A limit cannot `replaces` a name in its own list.
-- **TTL**: every key has one (window duration + margin), `anchored` anchors included.
+- **TTL**: every key has one (window duration + margin), `anchored` anchors included: an anchored key, a hash of its anchor `a` and count `c`, expires 60 s after its window ends.
 - **Memcached** (`fixed` only): the full key must be ≤ 250 bytes and contain no byte ≤ `0x20` or `0x7f`; beyond that, upstream behaviour (error logged, `OK` answered). Warning at load if the static part exceeds 250 − 64 bytes.
 - **`REDIS_PERSECOND`**: a list with a window shorter than a minute is routed **entirely** to the per-second Redis client, so its keys stay together (upstream never has two limits per descriptor).
 

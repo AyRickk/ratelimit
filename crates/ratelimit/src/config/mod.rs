@@ -11,7 +11,7 @@ use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescript
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response;
 use schema::YamlDescriptor;
 use std::collections::{HashMap, HashSet};
-use window::{FixedWindow, Origin};
+use window::{AnchoredWindow, FixedWindow, OpenOn, Origin, Window};
 
 /// A config file to load: its name (used in error messages) and its YAML content.
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ pub struct LoadOptions {
     /// `SANITIZE_DESCRIPTOR_METRIC_DOTS`: `.` in descriptor keys and values becomes `_` in
     /// stats keys (never in matching).
     pub sanitize_descriptor_metric_dots: bool,
+    /// `BACKEND_TYPE=memcache`: only `fixed` windows can be counted (D24).
+    pub memcached: bool,
 }
 
 /// A config error, formatted like envoyproxy/ratelimit's `RateLimitConfigError`: `<file>: <message>`.
@@ -59,7 +61,7 @@ pub struct RateLimit {
     pub share_threshold_key_pattern: Option<Vec<String>>,
     pub metadata: Option<prost_types::Struct>,
     /// A `rate_limits:` entry's window; `None` for `rate_limit:`, whose window is its unit.
-    pub window: Option<FixedWindow>,
+    pub window: Option<Window>,
 }
 
 impl RateLimit {
@@ -192,7 +194,12 @@ fn load_roots(
             false => crate::debug!("loading domain: {}", root.domain),
         }
         let domain = config.domains.entry(root.domain.clone()).or_default();
-        domain.load_descriptors(name, &format!("{}.", root.domain), &root.descriptors)?;
+        domain.load_descriptors(
+            name,
+            &format!("{}.", root.domain),
+            &root.descriptors,
+            options,
+        )?;
     }
     Ok(config)
 }
@@ -273,29 +280,37 @@ fn valid_limit_name(name: &str) -> bool {
 }
 
 /// A list limit's `window`.
-fn load_window(
-    file: &str,
-    at: &str,
-    window: &schema::YamlWindow,
-) -> Result<FixedWindow, ConfigError> {
+fn load_window(file: &str, at: &str, window: &schema::YamlWindow) -> Result<Window, ConfigError> {
     let error = |message: String| ConfigError::new(file, format!("{at}: {message}"));
-    match window.kind.as_str() {
-        "fixed" => {}
+    let anchored = match window.kind.as_str() {
+        "fixed" => false,
+        "anchored" => true,
         "" => return Err(error("window type is required".into())),
-        "anchored" | "sliding" | "sliding_approx" | "token_bucket" => {
+        "sliding" | "sliding_approx" | "token_bucket" => {
             return Err(error(format!(
                 "window type '{}' is not supported yet",
                 window.kind
             )));
         }
         other => return Err(error(format!("unknown window type '{other}'"))),
-    }
+    };
     let duration = match window.duration.as_str() {
         "" => return Err(error("window duration is required".into())),
         text => window::parse_duration(text)
             .filter(|d| *d > 0)
             .ok_or_else(|| error(format!("invalid window duration '{text}'")))?,
     };
+    if anchored {
+        return load_anchored(window, duration, &error).map(Window::Anchored);
+    }
+    for (key, value) in [
+        ("start_rounding", &window.start_rounding),
+        ("open_on", &window.open_on),
+    ] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is for anchored windows")));
+        }
+    }
     let rounding = (!window.offset_rounding.is_empty())
         .then(|| {
             window::parse_duration(&window.offset_rounding).ok_or_else(|| {
@@ -343,7 +358,50 @@ fn load_window(
             }
         }
     };
-    Ok(FixedWindow { duration, origin })
+    Ok(Window::Fixed(FixedWindow { duration, origin }))
+}
+
+/// An `anchored` window's `start_rounding` and `open_on` (D9).
+fn load_anchored(
+    window: &schema::YamlWindow,
+    duration: i64,
+    error: &impl Fn(String) -> ConfigError,
+) -> Result<AnchoredWindow, ConfigError> {
+    for (key, value) in [
+        ("offset", &window.offset),
+        ("offset_rounding", &window.offset_rounding),
+    ] {
+        if !value.is_empty() {
+            return Err(error(format!("{key} is for fixed windows")));
+        }
+    }
+    let rounding = match window.start_rounding.as_str() {
+        "" => None,
+        text => match window::parse_duration(text) {
+            Some(r) if r > 0 && r <= duration => Some(r),
+            Some(_) => {
+                return Err(error(format!(
+                    "start_rounding '{text}' must not be longer than the window duration '{}'",
+                    window.duration
+                )));
+            }
+            None => return Err(error(format!("invalid start_rounding '{text}'"))),
+        },
+    };
+    let open_on = match window.open_on.as_str() {
+        "" | "check" => OpenOn::Check,
+        "first_hit" => OpenOn::FirstHit,
+        other => {
+            return Err(error(format!(
+                "invalid open_on '{other}': check or first_hit"
+            )));
+        }
+    };
+    Ok(AnchoredWindow {
+        duration,
+        rounding,
+        open_on,
+    })
 }
 
 /// `overflow` (D14): `envoy` counts everything, which is all there is yet.
@@ -361,6 +419,7 @@ fn load_list(
     file: &str,
     full_key: &str,
     config: &YamlDescriptor,
+    options: &LoadOptions,
 ) -> Result<Vec<RateLimit>, ConfigError> {
     let Some(list) = &config.rate_limits else {
         return Ok(Vec::new());
@@ -411,6 +470,9 @@ fn load_list(
             return Err(error("window is required"));
         };
         let window = load_window(file, &at, window)?;
+        if options.memcached && !matches!(window, Window::Fixed(_)) {
+            return Err(error("only fixed windows can be counted on Memcached"));
+        }
         crate::debug!("Creating stats for key: '{at}'");
         let (unit, multiplier) = window.unit();
         let mut limit = RateLimit {
@@ -439,6 +501,7 @@ impl Descriptor {
         file: &str,
         parent_key: &str,
         descriptors: &[YamlDescriptor],
+        options: &LoadOptions,
     ) -> Result<(), ConfigError> {
         for config in descriptors {
             if config.key.is_empty() {
@@ -457,7 +520,7 @@ impl Descriptor {
                 ));
             }
             let limit = load_limit(file, &new_parent_key, config)?;
-            let list = load_list(file, &new_parent_key, config)?;
+            let list = load_list(file, &new_parent_key, config, options)?;
             load_overflow(file, &new_parent_key, config)?;
             if config.share_threshold && !final_key.contains('*') {
                 return Err(ConfigError::new(
@@ -493,6 +556,7 @@ impl Descriptor {
                 file,
                 &format!("{new_parent_key}."),
                 &config.descriptors,
+                options,
             )?;
             self.descriptors.insert(final_key, descriptor);
         }

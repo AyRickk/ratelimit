@@ -397,7 +397,11 @@ Not upstream's: what `docs/design.md` adds (B and C). Proven by tests of their o
 | Memcached: list limits of `fixed` windows (D24) | ✅ | `list_limits_count_on_memcached` |
 | `overflow: envoy` (D14) | ✅ | `overflow_envoy_is_accepted` |
 | `overflow: strict` (D14) | ⬜ | refused at load for now |
-| `anchored` (D9), `sliding` and `sliding_approx` (D10), `token_bucket` (D11) | ⬜ | refused at load for now |
+| `anchored` (D9), `overflow: envoy`: opened by a request presented while none is (`open_on: check`) or by its first counted hit (`first_hit`), its anchor rounded down (`start_rounding`), never moved; closed at `anchor + duration`, a clock behind the anchor counting as none elapsed; the next request opens the next; refunds never open or close it (D21); `duration_until_reset` and `RateLimit-Reset` from its anchor; `opened_without_hits` for windows a denied request opened without hits; hits and counts saturated at 2^53 | ✅ | `anchored_windows_open_count_and_close_as_d9_says`, `anchored_windows_open_on_a_request_and_last_their_duration`, `first_hit_windows_wait_for_counted_hits`, `windows_opened_without_hits_are_counted` |
+| `anchored` in one Redis script, the same decisions as the Rust window over random sequences (D31, D32.4) | ✅ | `the_anchored_script_steps_like_the_rust_window` |
+| `anchored` refused on Memcached (D24) | ✅ | `invalid_anchored_windows_are_refused` |
+| `anchored` in the local cache (D18: until the decision can change, cleared by a refund) | ⬜ | never cached for now: Redis is asked every time |
+| `sliding` and `sliding_approx` (D10), `token_bucket` (D11) | ⬜ | refused at load for now |
 | The shipped Prometheus mapper's `limit=` label, `total_capped_hits`, `opened_without_hits` (D29) | ⬜ | |
 | Memcached: a warning at load when a list key's static part exceeds 250 − 64 bytes (ADR 0001) | ⬜ | |
 | A client-sent `limit` with `unit_multiplier` (D23): read, applied, echoed, 0 refused | ⬜ | ignored, as upstream |

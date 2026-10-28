@@ -3,7 +3,9 @@
 use ratelimit::config::{self, ConfigFile, LoadOptions, RateLimit};
 use ratelimit::grpc;
 use ratelimit::limiter::SystemClock;
-use ratelimit::service::{CacheError, RateLimitCache, RateLimitService, ServiceSettings};
+use ratelimit::service::{
+    CacheError, LimitOutcome, RateLimitCache, RateLimitService, ServiceSettings,
+};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
 };
@@ -23,16 +25,19 @@ impl RateLimitCache for OverWhenLimited {
         &self,
         _request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
+    ) -> Result<Vec<Vec<LimitOutcome>>, CacheError> {
         Ok(limits
             .iter()
             .map(|limits| {
                 limits
                     .iter()
-                    .map(|limit| DescriptorStatus {
-                        code: Code::OverLimit as i32,
-                        current_limit: Some(limit.limit.clone()),
-                        ..Default::default()
+                    .map(|limit| {
+                        DescriptorStatus {
+                            code: Code::OverLimit as i32,
+                            current_limit: Some(limit.limit.clone()),
+                            ..Default::default()
+                        }
+                        .into()
                     })
                     .collect()
             })

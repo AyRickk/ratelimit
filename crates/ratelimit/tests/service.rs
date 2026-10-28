@@ -4,7 +4,7 @@
 use ratelimit::config::{self, ConfigFile, LoadOptions, RateLimit};
 use ratelimit::limiter::SystemClock;
 use ratelimit::service::{
-    CacheError, RateLimitCache, RateLimitService, ServiceError, ServiceSettings,
+    CacheError, LimitOutcome, RateLimitCache, RateLimitService, ServiceError, ServiceSettings,
 };
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor,
@@ -42,7 +42,7 @@ impl RateLimitCache for FakeCache {
         &self,
         _request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
+    ) -> Result<Vec<Vec<LimitOutcome>>, CacheError> {
         // Each descriptor's `rate_limit:`, if any.
         let received = limits.iter().map(|l| l.first().cloned()).collect();
         self.received.lock().unwrap().push(received);
@@ -53,18 +53,18 @@ impl RateLimitCache for FakeCache {
         // answers for descriptors the request does not have.
         let statuses = self.statuses.lock().unwrap().clone();
         let extra = statuses.len().saturating_sub(limits.len());
-        let mut answer: Vec<Vec<DescriptorStatus>> = limits
+        let mut answer: Vec<Vec<LimitOutcome>> = limits
             .iter()
             .zip(statuses.iter().cloned())
             .map(|(limits, status)| match limits.is_empty() {
                 true => Vec::new(),
-                false => vec![status],
+                false => vec![status.into()],
             })
             .collect();
         answer.extend(
             statuses[statuses.len() - extra..]
                 .iter()
-                .map(|s| vec![s.clone()]),
+                .map(|s| vec![s.clone().into()]),
         );
         Ok(answer)
     }

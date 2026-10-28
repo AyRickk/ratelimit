@@ -10,12 +10,10 @@ pub mod srv;
 use crate::config::RateLimit;
 use crate::limiter::{self, CacheSettings, Clock, Count};
 use crate::local_cache::LocalCache;
-use crate::service::{CacheError, RateLimitCache};
+use crate::service::{CacheError, LimitOutcome, RateLimitCache};
 use crate::stats::{Counter, Scope, Stats};
 use client::{Client, Error};
-use ratelimit_proto::envoy::service::ratelimit::v3::{
-    RateLimitRequest, rate_limit_response::DescriptorStatus,
-};
+use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
 use std::sync::Arc;
 
 /// `memcachedMaxRelativeExpirationSeconds`: past 30 days, memcached reads an expiration as a
@@ -166,7 +164,7 @@ impl RateLimitCache for MemcacheCache {
         &self,
         request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
+    ) -> Result<Vec<Vec<LimitOutcome>>, CacheError> {
         crate::debug!("starting cache lookup");
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
@@ -270,21 +268,21 @@ impl RateLimitCache for MemcacheCache {
             }
         }
 
-        let mut statuses: Vec<Vec<DescriptorStatus>> = limits
+        let mut statuses: Vec<Vec<LimitOutcome>> = limits
             .iter()
             .map(|list| Vec::with_capacity(list.len()))
             .collect();
         for (c, count) in checks.iter().zip(counts) {
             let stats = self.stats.rate_limit(&c.limit.full_key);
-            statuses[c.index].push(limiter::limit_status(
-                (&c.limit, &stats, &c.key),
-                &request.descriptors[c.index],
-                self.settings.near_limit_ratio,
-                c.hits,
-                count,
-                now,
-                self.settings.use_calendar_month,
-            )?);
+            let calendar = self.settings.use_calendar_month;
+            let reset = limiter::reset(&c.limit, &request.descriptors[c.index], now, calendar)?;
+            let ratio = self.settings.near_limit_ratio;
+            let status =
+                limiter::limit_status((&c.limit, &stats, &c.key), ratio, c.hits, count, reset);
+            statuses[c.index].push(LimitOutcome {
+                status,
+                opened_without_hits: false,
+            });
         }
 
         // `increaseAsync`, after the answer.

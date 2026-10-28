@@ -2,7 +2,9 @@
 //! windows of any duration and origin (D8, ADR 0002): how they load and what is refused.
 //! Counting them is in `differential.rs` (which runs a Redis), next to upstream's limits.
 
-use ratelimit::config::window::{FixedWindow, Origin};
+use ratelimit::config::window::{
+    Anchored, AnchoredOp, AnchoredResult, AnchoredWindow, FixedWindow, OpenOn, Origin, Window,
+};
 use ratelimit::config::{self, ConfigFile, LimitLookup, LoadOptions, RateLimit};
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor::Entry,
@@ -87,10 +89,10 @@ descriptors:
                 500,
                 Unit::Hour,
                 Some(5),
-                Some(FixedWindow {
+                Some(Window::Fixed(FixedWindow {
                     duration: 5 * 3600,
                     origin: Origin::Epoch
-                })
+                }))
             ),
             (
                 "d.user~weekly",
@@ -98,10 +100,10 @@ descriptors:
                 5000,
                 Unit::Week,
                 None,
-                Some(FixedWindow {
+                Some(Window::Fixed(FixedWindow {
                     duration: 7 * 86_400,
                     origin: Origin::Offset(4 * 86_400)
-                })
+                }))
             ),
         ]
     );
@@ -137,11 +139,9 @@ fn windows_are_reported_in_the_largest_unit_dividing_them() {
 /// divides the duration) or a given one; `offset: 0` is the epoch's.
 #[test]
 fn offsets_are_read_as_adr_0002_writes_them() {
-    let origin = |window: &str| {
-        list(&with_window(window), &[("user", "a")])[0]
-            .window
-            .unwrap()
-            .origin
+    let origin = |window: &str| match list(&with_window(window), &[("user", "a")])[0].window {
+        Some(Window::Fixed(fixed)) => fixed.origin,
+        other => panic!("not a fixed window: {other:?}"),
     };
     assert_eq!(
         origin("{type: fixed, duration: 7d, offset: hashed}"),
@@ -443,5 +443,171 @@ fn list_stats_keys_follow_the_descriptor_settings() {
             &[("file", "abc")]
         ),
         "d.file_a*~n"
+    );
+}
+
+/// `anchored` windows (D9): their duration, `start_rounding` and `open_on`.
+#[test]
+fn anchored_windows_load_with_their_rounding_and_opening() {
+    let window = |w: &str| list(&with_window(w), &[("user", "a")])[0].window;
+    assert_eq!(
+        window("{type: anchored, duration: 5h}"),
+        Some(Window::Anchored(AnchoredWindow {
+            duration: 18_000,
+            rounding: None,
+            open_on: OpenOn::Check
+        }))
+    );
+    assert_eq!(
+        window("{type: anchored, duration: 5h, start_rounding: 1h, open_on: first_hit}"),
+        Some(Window::Anchored(AnchoredWindow {
+            duration: 18_000,
+            rounding: Some(3_600),
+            open_on: OpenOn::FirstHit
+        }))
+    );
+    let limits = list(
+        &with_window("{type: anchored, duration: 5h, start_rounding: 1h}"),
+        &[("user", "a")],
+    );
+    assert_eq!(
+        (limits[0].limit.unit(), limits[0].limit.unit_multiplier),
+        (Unit::Hour, Some(5))
+    );
+}
+
+#[test]
+fn invalid_anchored_windows_are_refused() {
+    let refused = |w: &str| load(&with_window(w)).err();
+    let error = |message: &str| Some(format!("config.yaml: d.user~w: {message}"));
+    assert_eq!(
+        refused("{type: anchored, duration: 5h, offset: 1h}"),
+        error("offset is for fixed windows")
+    );
+    assert_eq!(
+        refused("{type: anchored, duration: 5h, offset_rounding: 1h}"),
+        error("offset_rounding is for fixed windows")
+    );
+    assert_eq!(
+        refused("{type: anchored, duration: 5h, start_rounding: 6h}"),
+        error("start_rounding '6h' must not be longer than the window duration '5h'")
+    );
+    assert_eq!(
+        refused("{type: anchored, duration: 5h, start_rounding: soon}"),
+        error("invalid start_rounding 'soon'")
+    );
+    assert_eq!(
+        refused("{type: anchored, duration: 5h, open_on: request}"),
+        error("invalid open_on 'request': check or first_hit")
+    );
+    assert_eq!(
+        refused("{type: fixed, duration: 5h, start_rounding: 1h}"),
+        error("start_rounding is for anchored windows")
+    );
+    assert_eq!(
+        refused("{type: fixed, duration: 5h, open_on: check}"),
+        error("open_on is for anchored windows")
+    );
+    // D24: Memcached counts fixed windows only.
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: with_window("{type: anchored, duration: 5h}"),
+    };
+    let memcached = LoadOptions {
+        memcached: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        config::load(&[file], &memcached)
+            .err()
+            .map(|e| e.to_string()),
+        error("only fixed windows can be counted on Memcached")
+    );
+}
+
+/// D9's opening and counting, in `envoy` mode: what [`AnchoredWindow::step`] does to a state.
+#[test]
+fn anchored_windows_open_count_and_close_as_d9_says() {
+    let five_hours = AnchoredWindow {
+        duration: 18_000,
+        rounding: Some(3_600),
+        open_on: OpenOn::Check,
+    };
+    let op = |now, hits, refund| AnchoredOp { now, hits, refund };
+    let window = |anchor, count| Some(Anchored { anchor, count });
+    let opened = |anchor, count| AnchoredResult {
+        state: window(anchor, count),
+        window: window(anchor, count),
+        opened: true,
+    };
+    let kept = |w| AnchoredResult {
+        state: w,
+        window: w,
+        opened: false,
+    };
+    // No window open after the request; what is stored stays.
+    let closed = |stored| AnchoredResult {
+        state: stored,
+        window: None,
+        opened: false,
+    };
+    // A 0-hit check opens it, at the hour (2001-09-09 01:00 UTC).
+    let now = 1_000_000_000;
+    assert_eq!(
+        five_hours.step(None, op(now, 0, false)),
+        opened(999_997_200, 0)
+    );
+    assert_eq!(five_hours.reset(window(999_997_200, 0), now), 15_200);
+    // Counted while open; the anchor never moves, a clock behind it counting as no time.
+    let open = window(999_997_200, 3);
+    assert_eq!(
+        five_hours.step(open, op(now, 4, false)),
+        kept(window(999_997_200, 7))
+    );
+    assert_eq!(
+        five_hours.step(open, op(999_997_200 + 17_999, 1, false)),
+        kept(window(999_997_200, 4))
+    );
+    assert_eq!(
+        five_hours.step(open, op(999_990_000, 1, false)),
+        kept(window(999_997_200, 4))
+    );
+    // Its reset then is the whole window, not more (D27).
+    assert_eq!(five_hours.reset(open, 999_990_000), 18_000);
+    // Closed at anchor + duration: the next request opens the next one, counted in it.
+    assert_eq!(
+        five_hours.step(open, op(999_997_200 + 18_000, 2, false)),
+        opened(1_000_015_200, 2)
+    );
+    // Refunds (D21) floor at 0, and never open or close a window.
+    assert_eq!(
+        five_hours.step(open, op(now, 5, true)),
+        kept(window(999_997_200, 0))
+    );
+    assert_eq!(five_hours.step(None, op(now, 5, true)), closed(None));
+    assert_eq!(
+        five_hours.step(open, op(999_997_200 + 18_000, 1, true)),
+        closed(open)
+    );
+    // `first_hit`: only counted hits open it.
+    let first_hit = AnchoredWindow {
+        open_on: OpenOn::FirstHit,
+        rounding: None,
+        ..five_hours
+    };
+    assert_eq!(first_hit.step(None, op(now, 0, false)), closed(None));
+    let old = window(now - 18_000, 2);
+    assert_eq!(first_hit.step(old, op(now, 0, false)), closed(old));
+    assert_eq!(first_hit.reset(None, now), 18_000);
+    assert_eq!(first_hit.step(None, op(now, 2, false)), opened(now, 2));
+    // Hits and counts saturate at 2^53, the script's exact integers.
+    let most = 1u64 << 53;
+    assert_eq!(
+        first_hit.step(None, op(now, u64::MAX, false)),
+        opened(now, most)
+    );
+    assert_eq!(
+        first_hit.step(window(now, most - 1), op(now, 2, false)),
+        kept(window(now, most))
     );
 }
