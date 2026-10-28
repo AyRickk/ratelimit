@@ -5634,6 +5634,17 @@ descriptors:
                 format!("\"durationUntilReset\":\"{}s\"", times.next().unwrap())
             })
             .into_owned();
+        // The same for the `RateLimit-Reset` header.
+        let header_reset = |headers: &[String]| -> Option<(usize, i64)> {
+            headers.iter().enumerate().find_map(|(i, h)| {
+                let seconds = h.strip_prefix("ratelimit-reset: ")?;
+                Some((i, seconds.parse().unwrap()))
+            })
+        };
+        if let (Some((_, e)), Some((i, a))) = (header_reset(&upstream.1), header_reset(&ours.1)) {
+            assert!((e - a).abs() <= 1, "{e} {a}");
+            ours.1[i] = format!("ratelimit-reset: {e}");
+        }
         assert_eq!(ours, upstream, "{method} {target} {body}");
     }
     // A client limit with an unknown unit makes upstream panic, which closes the connection
@@ -9372,7 +9383,16 @@ async fn grpc_over_tls_is_served_like_upstream() {
                 .collect();
             runs.push((outcomes, stats, lines));
         }
-        let (ours, upstream) = (&runs[1], &runs[0]);
+        let (ours, upstream) = (&mut runs[1].clone(), &runs[0]);
+        // Upstream's process may exit before its debug server logs that it stops: that line,
+        // when upstream has it, ours has, but it is compared no further.
+        let stopping = |l: &String| l.contains("Failed to start debug server");
+        for line in upstream.2.iter().filter(|l| stopping(l)) {
+            assert!(ours.2.contains(line), "{line} only upstream's");
+        }
+        if !upstream.2.iter().any(stopping) {
+            ours.2.retain(|l| !stopping(l));
+        }
         assert_eq!(
             ours.0, upstream.0,
             "outcomes with {client_ca:?} {san:?} {enforce_alpn:?}"
@@ -10575,6 +10595,16 @@ impl RedisCluster {
     }
 }
 
+/// Waits for the start of the next second of the system's clock.
+async fn at_a_new_second() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let left = std::time::Duration::from_secs(1)
+        - std::time::Duration::from_nanos(now.subsec_nanos().into());
+    tokio::time::sleep(left + std::time::Duration::from_millis(5)).await;
+}
+
 /// What a run of `binary` on `cluster` shows: three requests' answers (for keys spread over the
 /// nodes), the hour's counters on each node, the pools' stats and the log lines (`masked` and
 /// the ports masked).
@@ -10633,6 +10663,9 @@ async fn cluster_run(
         .flat_map(|u| [[("user", *u)], [("burst", *u)]])
         .collect();
     let descriptors: Vec<&[(&str, &str)]> = descriptors.iter().map(|d| d.as_slice()).collect();
+    // The three requests within one second, so that each side counts the per-second limit
+    // in a single window.
+    at_a_new_second().await;
     let mut answers = Vec::new();
     for _ in 0..3 {
         let mut response = client
