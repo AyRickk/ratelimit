@@ -563,7 +563,9 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let mut content = content;
-    // One more parse per quoted scalar to indent: config files have few.
+    // The lines of flow collections indented already, so that one is never indented twice.
+    let mut indented_lines = Vec::new();
+    // One more parse per quoted scalar or flow line to indent: config files have few.
     loop {
         let mut builder = Builder {
             stack: Vec::new(),
@@ -572,11 +574,24 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
             documents: 0,
             error: None,
         };
-        match Parser::new_from_str(&content).load(&mut builder, true) {
+        match Parser::new_from_str(&content).load(&mut builder, false) {
             Ok(()) => {
                 return match builder.error {
                     Some(e) => Err(e),
-                    None => Ok(builder.root),
+                    None => match libyaml_checks(&content) {
+                        Checked::Ok => Ok(builder.root),
+                        Checked::Refused(e) => Err(e),
+                        // libyaml ends the name there: so does yaml-rust2 once a space is.
+                        Checked::EndName(at) => {
+                            content = content
+                                .chars()
+                                .take(at)
+                                .chain(std::iter::once(' '))
+                                .chain(content.chars().skip(at))
+                                .collect();
+                            continue;
+                        }
+                    },
                 };
             }
             Err(e) => {
@@ -586,6 +601,15 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
                 let indented = match e.info() {
                     "invalid indentation in quoted scalar" => at(&['"', '\''])
                         .and_then(|start| indent_quoted_continuations(&content, start)),
+                    // libyaml does not check the indentation within a flow collection, the only
+                    // place yaml-rust2 reports these (out of one, it unrolls the indentation
+                    // first). One more parse per line: config files have few such lines.
+                    "invalid indentation in flow construct" | "invalid indentation"
+                        if !indented_lines.contains(&e.marker().line()) =>
+                    {
+                        indented_lines.push(e.marker().line());
+                        indent_line(&content, e.marker().line())
+                    }
                     // A tab in a continuation line's leading blanks, which are folded away.
                     "tab cannot be used as indentation" => at(&['\t']).map(|tab| {
                         content
@@ -598,6 +622,15 @@ pub(crate) fn parse(content: &str) -> Result<Option<Node>, String> {
                 };
                 match indented {
                     Some(indented) => content = indented,
+                    // A quoted key over several lines, in a block: libyaml's words.
+                    None if e.info() == "invalid trailing content after double-quoted scalar"
+                        && at(&[':']).is_some() =>
+                    {
+                        return Err(format!(
+                            "yaml: line {}: mapping values are not allowed in this context",
+                            e.marker().line()
+                        ));
+                    }
                     None => {
                         return Err(format!("yaml: line {}: {}", e.marker().line(), e.info()));
                     }
@@ -653,6 +686,113 @@ fn char_at(content: &str, line: usize, col: usize, accept: &[char]) -> Option<us
         .chars()
         .nth(col)?;
     accept.contains(&c).then_some(line_start + col)
+}
+
+/// `content` with line `line` (from 1) indented further: within a flow collection, leading
+/// whitespace is folded away, so the value and line numbers stay the same. (A document marker
+/// stays where it is: yaml-rust2 reads one before it checks a line's indentation.)
+fn indent_line(content: &str, line: usize) -> Option<String> {
+    let start: usize = content
+        .split_inclusive('\n')
+        .take(line.checked_sub(1)?)
+        .map(str::len)
+        .sum();
+    if start > content.len() {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        &content[..start],
+        " ".repeat(256),
+        &content[start..]
+    ))
+}
+
+/// What [`libyaml_checks`] finds.
+enum Checked {
+    Ok,
+    /// Refused, in libyaml's words.
+    Refused(String),
+    /// An anchor or alias name libyaml ends before the char at this index, where the rest is
+    /// read as what follows it.
+    EndName(usize),
+}
+
+/// What libyaml refuses and yaml-rust2 reads in the first document (the one yaml.v2 decodes):
+/// an implicit key over several lines, and anchor or alias names: libyaml's end at the first
+/// char out of `[A-Za-z0-9_-]`, which must be a blank or one of `?:,]}%@` and a backquote,
+/// where yaml-rust2's run to a blank.
+fn libyaml_checks(content: &str) -> Checked {
+    use yaml_rust2::scanner::{Scanner, TokenType};
+    let chars: Vec<char> = content.chars().collect();
+    // The flow collections open: `]` or `}` closes each.
+    let mut flows: Vec<char> = Vec::new();
+    // The keys whose value is awaited: their line, implicit or not, and the flow they are in.
+    let mut keys: Vec<(usize, bool, Option<char>)> = Vec::new();
+    let mut in_document = false;
+    for token in Scanner::new(content.chars()) {
+        let line = token.0.line();
+        match token.1 {
+            // The first document ends there: at the next one's `---`, or at `...`.
+            TokenType::DocumentStart if in_document => break,
+            TokenType::DocumentEnd => break,
+            TokenType::StreamStart(_)
+            | TokenType::VersionDirective(..)
+            | TokenType::TagDirective(..) => {}
+            // `---`, or its first node.
+            _ => in_document = true,
+        }
+        match token.1 {
+            TokenType::FlowSequenceStart => flows.push(']'),
+            TokenType::FlowMappingStart => flows.push('}'),
+            TokenType::FlowSequenceEnd | TokenType::FlowMappingEnd => {
+                flows.pop();
+            }
+            TokenType::Key => {
+                let implicit = chars.get(token.0.index()) != Some(&'?');
+                keys.push((line, implicit, flows.last().copied()));
+            }
+            TokenType::Value => match keys.pop() {
+                Some((key_line, true, Some(close))) if line != key_line => {
+                    return Checked::Refused(format!(
+                        "yaml: line {key_line}: did not find expected ',' or '{close}'"
+                    ));
+                }
+                Some((key_line, true, None)) if line != key_line => {
+                    return Checked::Refused(format!(
+                        "yaml: line {line}: mapping values are not allowed in this context"
+                    ));
+                }
+                _ => {}
+            },
+            TokenType::Anchor(name) | TokenType::Alias(name) => {
+                let valid = |c: &char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+                let length = name.chars().take_while(valid).count();
+                // After the `&` or `*`.
+                let at = token.0.index() + 1 + length;
+                let alphanumeric = "yaml: did not find expected alphabetic or numeric character";
+                match name.chars().nth(length) {
+                    None if length > 0 => {}
+                    None => return Checked::Refused(alphanumeric.into()),
+                    Some(_) if length == 0 => return Checked::Refused(alphanumeric.into()),
+                    Some('%' | '@' | '`') => {
+                        return Checked::Refused(
+                            "yaml: found character that cannot start any token".into(),
+                        );
+                    }
+                    Some(':') if chars.get(at + 1).is_none_or(|c| c.is_whitespace()) => {
+                        return Checked::Refused(
+                            "yaml: mapping values are not allowed in this context".into(),
+                        );
+                    }
+                    Some('?' | ':' | ',' | ']' | '}') => return Checked::EndName(at),
+                    Some(_) => return Checked::Refused(alphanumeric.into()),
+                }
+            }
+            _ => {}
+        }
+    }
+    Checked::Ok
 }
 
 /// `---` or `...` alone or before a blank.
@@ -973,6 +1113,236 @@ mod continuation_tests {
             ),
             ("m:\n  k: \"a\n--- b\"\n", None),
             ("m:\n  k: 'a\n... b'\n", None),
+        ] {
+            let got = parse(input).ok().flatten().map(|n| render(&n));
+            assert_eq!(got.as_deref(), expected, "{input:?}");
+        }
+    }
+
+    /// Flow collections continued on less indented lines, read as yaml.v2 v2.4.0 reads them
+    /// (its `%#v`; `None` where it refuses the input).
+    #[test]
+    fn flow_collections_continue_as_yaml_v2_reads_them() {
+        for (input, expected) in [
+            (
+                "a: [b,\nc]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"c\"}}"),
+            ),
+            (
+                "a: {b: c,\nd: e}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":map[interface {}]interface {}{\"b\":\"c\", \"d\":\"e\"}}",
+                ),
+            ),
+            (
+                "x:\n  a: [b,\nc]\n",
+                Some(
+                    "map[interface {}]interface {}{\"x\":map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"c\"}}}",
+                ),
+            ),
+            (
+                "- [a,\nb]\n",
+                Some("[]interface {}{[]interface {}{\"a\", \"b\"}}"),
+            ),
+            (
+                "a:\n  - {b: c,\n d: e}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":[]interface {}{map[interface {}]interface {}{\"b\":\"c\", \"d\":\"e\"}}}",
+                ),
+            ),
+            (
+                "a: [b, [c,\nd]]\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":[]interface {}{\"b\", []interface {}{\"c\", \"d\"}}}",
+                ),
+            ),
+            (
+                "a: [\nb]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\"}}"),
+            ),
+            ("a: [b,\n---\n]\n", None),
+            (
+                "a: [b, # c\nd]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"d\"}}"),
+            ),
+            (
+                "a: {\nb: c}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":map[interface {}]interface {}{\"b\":\"c\"}}",
+                ),
+            ),
+            (
+                "x:\n  m:\n    a: [b,\n  c,\nd]\nz: q\n",
+                Some(
+                    "map[interface {}]interface {}{\"x\":map[interface {}]interface {}{\"m\":map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"c\", \"d\"}}}, \"z\":\"q\"}",
+                ),
+            ),
+            ("a: [b,\n...\n]\n", None),
+            (
+                "a: {b: [c,\nd], e: f}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":map[interface {}]interface {}{\"b\":[]interface {}{\"c\", \"d\"}, \"e\":\"f\"}}",
+                ),
+            ),
+            (
+                "a: {b:\nc}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":map[interface {}]interface {}{\"b\":\"c\"}}",
+                ),
+            ),
+            (
+                "a: [b: c,\nd]\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":[]interface {}{map[interface {}]interface {}{\"b\":\"c\"}, \"d\"}}",
+                ),
+            ),
+            (
+                "a: [b,\n  'c\nd']\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"c d\"}}"),
+            ),
+            (
+                "k: |\n  [x\nm: [a,\nb]\n",
+                Some(
+                    "map[interface {}]interface {}{\"k\":\"[x\\n\", \"m\":[]interface {}{\"a\", \"b\"}}",
+                ),
+            ),
+            // A bracket in a block scalar, a quoted scalar or a comment opens no flow: the
+            // line after is not indented, and refused as yaml.v2 refuses it; nor does a quote
+            // in a block scalar hide a flow after it.
+            (
+                "k: |\n  'x\nm: [a,\nb]\n",
+                Some(
+                    "map[interface {}]interface {}{\"k\":\"'x\\n\", \"m\":[]interface {}{\"a\", \"b\"}}",
+                ),
+            ),
+            ("k: |\n  [x\nm:\n  a: b\n c: d\n", None),
+            ("k: >\n  {x\nm:\n  a: b\n c: d\n", None),
+            ("a: '[x'\nm:\n  a: b\n c: d\n", None),
+            ("a: b # [x\nm:\n  a: b\n c: d\n", None),
+            // A document marker at a line's start within a flow, refused; other dashes read.
+            ("x:\n  a: [b,\n--- c]\n", None),
+            (
+                "a: [b,\n---c]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"---c\"}}"),
+            ),
+            (
+                "a: [b,\n ---\n]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"---\"}}"),
+            ),
+        ] {
+            let got = parse(input).ok().flatten().map(|n| render(&n));
+            assert_eq!(got.as_deref(), expected, "{input:?}");
+        }
+    }
+
+    /// Implicit keys over several lines, and anchors or aliases with other characters than
+    /// `[A-Za-z0-9_-]`, refused as yaml.v2 v2.4.0 refuses them; what it accepts beside them.
+    #[test]
+    fn keys_and_anchors_are_refused_as_yaml_v2_refuses_them() {
+        for (input, expected) in [
+            ("{\"a\nb\": c}\n", None),
+            ("{'a\nb': c}\n", None),
+            ("a: {\"x\n y\": q}\n", None),
+            ("{a\nb: c}\n", None),
+            ("[\"a\nb\": c]\n", None),
+            ("{\"a\" : c,\n\"b\nc\" : d}\n", None),
+            ("\"a\nb\": c\n", None),
+            ("x:\n  'a\n  b': c\n", None),
+            ("a: &é b\n", None),
+            ("a: &a.b c\nd: *a.b\n", None),
+            ("a: &x: b\n", None),
+            ("a: & b\n", None),
+            ("a: &xéy b\n", None),
+            ("a: &x,b\n", None),
+            (
+                "{? \"a\nb\" : c}\n",
+                Some("map[interface {}]interface {}{\"a b\":\"c\"}"),
+            ),
+            (
+                "a: [\"x\ny\"]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"x y\"}}"),
+            ),
+            (
+                "a: &a-b_c c\nd: *a-b_c\n",
+                Some("map[interface {}]interface {}{\"a\":\"c\", \"d\":\"c\"}"),
+            ),
+            (
+                "a: [&x b, *x]\n",
+                Some("map[interface {}]interface {}{\"a\":[]interface {}{\"b\", \"b\"}}"),
+            ),
+            (
+                "a: {&x b: c}\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":map[interface {}]interface {}{\"b\":\"c\"}}",
+                ),
+            ),
+            (
+                "a: &x-1 b\n",
+                Some("map[interface {}]interface {}{\"a\":\"b\"}"),
+            ),
+            // yaml.v2 decodes the first document only: what follows it is not checked.
+            (
+                "a: b\n---\n\"c\nd\": e\n",
+                Some("map[interface {}]interface {}{\"a\":\"b\"}"),
+            ),
+            (
+                "a: b\n---\nx: &a.b c\n",
+                Some("map[interface {}]interface {}{\"a\":\"b\"}"),
+            ),
+            (
+                "a: b\n---\n{c\n: d}\n",
+                Some("map[interface {}]interface {}{\"a\":\"b\"}"),
+            ),
+            (
+                "a: b\n...\n---\nx: &a.b c\n",
+                Some("map[interface {}]interface {}{\"a\":\"b\"}"),
+            ),
+            // libyaml ends a name at its first char out of `[A-Za-z0-9_-]`: what follows is
+            // read, or refused.
+            (
+                "a: &an:chor b\n",
+                Some("map[interface {}]interface {}{\"a\":\":chor b\"}"),
+            ),
+            ("- &a:b c\n", Some("[]interface {}{\":b c\"}")),
+            (
+                "a: &a?b c\n",
+                Some("map[interface {}]interface {}{\"a\":\"?b c\"}"),
+            ),
+            ("a: &a%b c\n", None),
+            ("a: &a@b c\n", None),
+            ("a: &a`b c\n", None),
+            ("a: &a,b c\n", None),
+            ("a: &a]b\n", None),
+            ("a: &a}b\n", None),
+            ("b: &a x\nc: *a:y\n", None),
+            ("b: &a x\nc: *a?\n", None),
+            ("a: &a: b\n", None),
+            ("a: &a:\n", None),
+            // A quote within a plain scalar opens nothing: the flow after it is read.
+            (
+                "a: x \"y\nb: [c,\nd]\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":\"x \\\"y\", \"b\":[]interface {}{\"c\", \"d\"}}",
+                ),
+            ),
+            (
+                "a: x 'y\nb: [c,\nd]\n",
+                Some(
+                    "map[interface {}]interface {}{\"a\":\"x 'y\", \"b\":[]interface {}{\"c\", \"d\"}}",
+                ),
+            ),
+            (
+                "k: x\n  'y\nm: [a,\nb]\n",
+                Some(
+                    "map[interface {}]interface {}{\"k\":\"x 'y\", \"m\":[]interface {}{\"a\", \"b\"}}",
+                ),
+            ),
+            (
+                "k: x\n  \"y\nm: [a,\nb]\n",
+                Some(
+                    "map[interface {}]interface {}{\"k\":\"x \\\"y\", \"m\":[]interface {}{\"a\", \"b\"}}",
+                ),
+            ),
         ] {
             let got = parse(input).ok().flatten().map(|n| render(&n));
             assert_eq!(got.as_deref(), expected, "{input:?}");
