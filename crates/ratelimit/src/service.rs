@@ -41,13 +41,32 @@ impl From<DescriptorStatus> for LimitOutcome {
 
 /// The counting backend (upstream's `RateLimitCache`).
 pub trait RateLimitCache: Send + Sync + 'static {
-    /// Counts the request against `limits`, a list per descriptor (empty: nothing to check),
+    /// Counts the request against `limits`, a list per descriptor (empty: nothing to plan),
     /// and returns, per descriptor, an outcome per limit.
     fn do_limit(
         &self,
         request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
     ) -> impl Future<Output = Result<Vec<Vec<LimitOutcome>>, CacheError>> + Send;
+
+    /// Reads `limits`, a list per descriptor, as a decision at the clock's now would, changing
+    /// nothing (ADR 0003); a reading per limit.
+    fn lookup(
+        &self,
+        _request: &RateLimitRequest,
+        _limits: &[Vec<RateLimit>],
+    ) -> impl Future<Output = Result<(i64, Vec<Vec<LimitReading>>), CacheError>> + Send {
+        async { Err(CacheError("this backend has no quota lookup".into())) }
+    }
+}
+
+/// What a quota lookup reads of a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitReading {
+    /// The hits counted in its current window: 0 for an anchored window not open.
+    pub used: u64,
+    /// The seconds until that window ends; `None` for an anchored window not open.
+    pub reset: Option<i64>,
 }
 
 impl<T: RateLimitCache> RateLimitCache for Arc<T> {
@@ -57,6 +76,14 @@ impl<T: RateLimitCache> RateLimitCache for Arc<T> {
         limits: &[Vec<RateLimit>],
     ) -> impl Future<Output = Result<Vec<Vec<LimitOutcome>>, CacheError>> + Send {
         T::do_limit(self, request, limits)
+    }
+
+    fn lookup(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+    ) -> impl Future<Output = Result<(i64, Vec<Vec<LimitReading>>), CacheError>> + Send {
+        T::lookup(self, request, limits)
     }
 }
 
@@ -96,6 +123,50 @@ impl Default for LimitHeaders {
             limit: "RateLimit-Limit".into(),
             remaining: "RateLimit-Remaining".into(),
             reset: "RateLimit-Reset".into(),
+        }
+    }
+}
+
+/// A quota lookup's answer (ADR 0003): when it read, and each descriptor's limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaLookup {
+    /// When it read, in Unix seconds.
+    pub now: i64,
+    /// Each descriptor's limits, in request order.
+    pub descriptors: Vec<Vec<LimitQuota>>,
+}
+
+/// A limit, as a quota lookup shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitQuota {
+    /// `unlimited`: nothing to read.
+    Unlimited(RateLimit),
+    /// A limit and what was read of it.
+    Limited(RateLimit, LimitReading),
+}
+
+/// Why a quota lookup could not be answered, by cause (ADR 0003).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LookupError {
+    /// A body that is no request, a request without a domain or descriptors, or no
+    /// configuration loaded yet.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// A domain the configuration does not have.
+    #[error("unknown domain '{0}'")]
+    UnknownDomain(String),
+    /// The backend failed to read.
+    #[error("{0}")]
+    Backend(String),
+}
+
+impl LookupError {
+    /// Its HTTP status and its cause, as `ratelimit.quota_lookup.error.<cause>` counts it.
+    pub fn status_and_cause(&self) -> (u16, &'static str) {
+        match self {
+            LookupError::InvalidRequest(_) => (400, "invalid_request"),
+            LookupError::UnknownDomain(_) => (404, "unknown_domain"),
+            LookupError::Backend(_) => (500, "backend"),
         }
     }
 }
@@ -144,6 +215,11 @@ impl<C: RateLimitCache> RateLimitService<C> {
             config: RwLock::new(None),
             settings,
         }
+    }
+
+    /// The stats the service counts in.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     /// Replaces the configuration used by subsequent requests.
@@ -213,7 +289,8 @@ impl<C: RateLimitCache> RateLimitService<C> {
         response
     }
 
-    async fn decide(&self, request: &RateLimitRequest) -> Result<RateLimitResponse, ServiceError> {
+    /// The configuration a request is resolved against, once it has a domain and descriptors.
+    fn config_for(&self, request: &RateLimitRequest) -> Result<Arc<RateLimitConfig>, ServiceError> {
         require(
             !request.domain.is_empty(),
             "rate limit domain must not be empty",
@@ -222,25 +299,38 @@ impl<C: RateLimitCache> RateLimitService<C> {
             !request.descriptors.is_empty(),
             "rate limit descriptor list must not be empty",
         )?;
-        let config = self.current_config();
-        let config = config
-            .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))?;
-        let checks = descriptor_checks(&config, request, &self.stats);
-        let unknown_unit = checks.iter().any(|check| {
-            matches!(check, Check::Limits(limits) if limits.iter().any(|l| l.limit.unit() == Unit::Unknown))
+        self.current_config()
+            .ok_or_else(|| ServiceError::Service("no rate limit configuration loaded".into()))
+    }
+
+    /// Each descriptor's plan, and the limits to read or count for it.
+    fn plans(
+        &self,
+        config: &RateLimitConfig,
+        request: &RateLimitRequest,
+    ) -> Result<(Vec<Plan>, Vec<Vec<RateLimit>>), ServiceError> {
+        let plans = descriptor_plans(config, request, &self.stats);
+        let unknown_unit = plans.iter().any(|plan| {
+            matches!(plan, Plan::Limits(limits) if limits.iter().any(|l| l.limit.unit() == Unit::Unknown))
         });
         if unknown_unit {
             return Err(ServiceError::InvalidArgument(
                 "invalid rate limit unit UNKNOWN".into(),
             ));
         }
-        let limits: Vec<Vec<RateLimit>> = checks
+        let limits = plans
             .iter()
-            .map(|check| match check {
-                Check::Limits(limits) => limits.clone(),
-                Check::Unlimited => Vec::new(),
+            .map(|plan| match plan {
+                Plan::Limits(limits) => limits.clone(),
+                Plan::Unlimited(_) => Vec::new(),
             })
             .collect();
+        Ok((plans, limits))
+    }
+
+    async fn decide(&self, request: &RateLimitRequest) -> Result<RateLimitResponse, ServiceError> {
+        let config = self.config_for(request)?;
+        let (plans, limits) = self.plans(&config, request)?;
         let outcomes = self.cache.do_limit(request, &limits).await?;
         let per_limit: Vec<Vec<DescriptorStatus>> = outcomes
             .iter()
@@ -293,9 +383,9 @@ impl<C: RateLimitCache> RateLimitService<C> {
         let mut min_remaining = u32::MAX;
         // The descriptors that passed (unlimited ones excepted), for the metadata.
         let mut passed: Vec<Passed> = Vec::new();
-        for (((status, check), descriptor), (limits, chosen)) in statuses
+        for (((status, plan), descriptor), (limits, chosen)) in statuses
             .iter_mut()
-            .zip(&checks)
+            .zip(&plans)
             .zip(&request.descriptors)
             .zip(limits.iter().zip(&representatives))
         {
@@ -306,8 +396,8 @@ impl<C: RateLimitCache> RateLimitService<C> {
                 closest = Some((status.clone(), limit, descriptor));
                 min_remaining = status.limit_remaining;
             }
-            let limit = match check {
-                Check::Unlimited => {
+            let limit = match plan {
+                Plan::Unlimited(_) => {
                     *status = DescriptorStatus {
                         code: Code::Ok as i32,
                         limit_remaining: u32::MAX,
@@ -316,7 +406,7 @@ impl<C: RateLimitCache> RateLimitService<C> {
                     continue;
                 }
                 // A list shares its descriptor's settings and metadata: its first limit's.
-                Check::Limits(limits) => limits.first(),
+                Plan::Limits(limits) => limits.first(),
             };
             let over = status.code() == Code::OverLimit;
             let quota_mode = self.settings.global_quota_mode || limit.is_some_and(|l| l.quota_mode);
@@ -390,6 +480,37 @@ impl<C: RateLimitCache> RateLimitService<C> {
             dynamic_metadata,
             ..Default::default()
         })
+    }
+
+    /// The quota lookup (ADR 0003): every limit applying to the request's descriptors, as the
+    /// decision resolves them, read without counting or changing anything.
+    pub async fn lookup(&self, request: &RateLimitRequest) -> Result<QuotaLookup, LookupError> {
+        let invalid = |e: ServiceError| LookupError::InvalidRequest(e.to_string());
+        let config = self.config_for(request).map_err(invalid)?;
+        // Before the plans: an unknown domain would count `domain_not_found`.
+        if !config.has_domain(&request.domain) {
+            return Err(LookupError::UnknownDomain(request.domain.clone()));
+        }
+        let (plans, limits) = self.plans(&config, request).map_err(invalid)?;
+        let (now, readings) = self
+            .cache
+            .lookup(request, &limits)
+            .await
+            .map_err(|e| LookupError::Backend(e.0))?;
+        let descriptors = plans
+            .into_iter()
+            .zip(limits)
+            .zip(readings)
+            .map(|((plan, limits), readings)| match plan {
+                Plan::Unlimited(limit) => vec![LimitQuota::Unlimited(limit)],
+                Plan::Limits(_) => limits
+                    .into_iter()
+                    .zip(readings)
+                    .map(|(limit, reading)| LimitQuota::Limited(limit, reading))
+                    .collect(),
+            })
+            .collect();
+        Ok(QuotaLookup { now, descriptors })
     }
 
     /// The limit, remaining hits and seconds until reset of `status`, under `names`. The reset
@@ -631,9 +752,9 @@ fn header(key: &str, value: impl ToString) -> HeaderValue {
 }
 
 /// What to do with one descriptor of a request.
-enum Check {
+enum Plan {
     /// Its limit is `unlimited`: never counted, always `OK`.
-    Unlimited,
+    Unlimited(RateLimit),
     /// Count it against these limits: its `rate_limit:`, or its `rate_limits:` but those
     /// replaced; none when nothing applies.
     Limits(Vec<RateLimit>),
@@ -642,13 +763,13 @@ enum Check {
 /// `constructLimitsToCheck`: each descriptor's limit, left out when another descriptor's
 /// limit replaces it by name (`replaces`). Replacements are collected from every matched
 /// limit first, unlimited and replaced ones included, so they are not transitive.
-fn descriptor_checks(
+fn descriptor_plans(
     config: &RateLimitConfig,
     request: &RateLimitRequest,
     stats: &Stats,
-) -> Vec<Check> {
+) -> Vec<Plan> {
     let mut replaced = HashSet::new();
-    let mut checks: Vec<Check> = request
+    let mut plans: Vec<Plan> = request
         .descriptors
         .iter()
         .map(|descriptor| {
@@ -679,28 +800,28 @@ fn descriptor_checks(
                 LimitLookup::Limit(limit) => {
                     replaced.extend(limit.replaces.iter().cloned());
                     if limit.unlimited {
-                        Check::Unlimited
+                        Plan::Unlimited(limit)
                     } else {
-                        Check::Limits(vec![limit])
+                        Plan::Limits(vec![limit])
                     }
                 }
                 LimitLookup::List(limits) => {
                     for limit in &limits {
                         replaced.extend(limit.replaces.iter().cloned());
                     }
-                    Check::Limits(limits)
+                    Plan::Limits(limits)
                 }
                 LimitLookup::UnknownDomain => {
                     // Counted per descriptor, as upstream counts each lookup.
                     stats.domain_not_found(&request.domain).inc();
-                    Check::Limits(Vec::new())
+                    Plan::Limits(Vec::new())
                 }
-                LimitLookup::NoLimit => Check::Limits(Vec::new()),
+                LimitLookup::NoLimit => Plan::Limits(Vec::new()),
             }
         })
         .collect();
-    for check in &mut checks {
-        if let Check::Limits(limits) = check {
+    for plan in &mut plans {
+        if let Plan::Limits(limits) = plan {
             limits.retain(|l| {
                 let kept = l.name.is_empty() || !replaced.contains(&l.name);
                 if !kept {
@@ -710,7 +831,7 @@ fn descriptor_checks(
             });
         }
     }
-    checks
+    plans
 }
 
 /// The quota group of a descriptor: its model, from the `backend_name` and

@@ -73,7 +73,8 @@ impl Default for PrometheusSettings {
 pub fn load_mapper(settings: &PrometheusSettings) -> Result<Mapper, String> {
     let content = if settings.mapper_yaml.is_empty() {
         if settings.response_time_as_milliseconds {
-            DEFAULT_MAPPER.replacen("    scale: 0.001\n", "", 1)
+            // Upstream drops its one `scale`; the quota lookup's timer goes with it.
+            DEFAULT_MAPPER.replace("    scale: 0.001\n", "")
         } else {
             DEFAULT_MAPPER.to_string()
         }

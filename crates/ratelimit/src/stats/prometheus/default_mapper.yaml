@@ -96,3 +96,14 @@ mappings:
   - match: "ratelimit.service.config_load_error"
     name: "ratelimit_service_config_load_error"
     match_metric_type: counter
+
+  # The quota lookup (ADR 0003): not upstream's.
+  - match: "ratelimit.quota_lookup.error.*"
+    name: "ratelimit_quota_lookup_errors"
+    match_metric_type: counter
+    labels:
+      cause: "$1"
+  - match: "ratelimit.quota_lookup.response_time"
+    name: "ratelimit_quota_lookup_response_time_seconds"
+    timer_type: histogram
+    scale: 0.001

@@ -107,3 +107,33 @@ async fn the_listener_binds_like_go() {
         }
     }
 }
+
+/// The shipped mapper puts the quota lookup's error cause in a label (ADR 0003), and its
+/// response time in seconds, unless `PROMETHEUS_RESPONSE_TIME_AS_MILLISECONDS`.
+#[test]
+fn the_default_mapper_maps_quota_lookup_stats() {
+    use ratelimit::stats::prometheus::MetricType;
+    let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
+    let errors = mapper
+        .get_mapping("ratelimit.quota_lookup.error.backend", MetricType::Counter)
+        .unwrap();
+    assert_eq!(errors.name, "ratelimit_quota_lookup_errors");
+    assert_eq!(
+        errors.labels,
+        [("cause".to_string(), "backend".to_string())].into()
+    );
+    let time = mapper
+        .get_mapping("ratelimit.quota_lookup.response_time", MetricType::Observer)
+        .unwrap();
+    assert_eq!(time.name, "ratelimit_quota_lookup_response_time_seconds");
+    assert_eq!(time.scale, Some(0.001));
+    let milliseconds = prometheus::load_mapper(&PrometheusSettings {
+        response_time_as_milliseconds: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let time = milliseconds
+        .get_mapping("ratelimit.quota_lookup.response_time", MetricType::Observer)
+        .unwrap();
+    assert_eq!(time.scale, None);
+}

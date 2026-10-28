@@ -14019,3 +14019,586 @@ async fn the_anchored_script_steps_like_the_rust_window() {
         }
     }
 }
+
+// The quota lookup (ADR 0003): every limit's usage and reset, read without changing anything.
+
+const QUOTAS: &str = "
+domain: llm-quota
+descriptors:
+  - key: workspace
+    descriptors:
+      - key: user
+        rate_limits:
+          - name: five_hour
+            requests_per_unit: 100
+            window: {type: anchored, duration: 5h, start_rounding: 1h}
+          - name: weekly
+            requests_per_unit: 1000
+            window: {type: fixed, duration: 7d, offset: hashed}
+  - key: workspace_total
+    rate_limits:
+      - name: weekly
+        requests_per_unit: 10000
+        window: {type: fixed, duration: 7d, offset: 4d}
+  - key: legacy
+    rate_limit: {unit: hour, requests_per_unit: 10, name: hourly}
+  - key: free
+    rate_limit: {unlimited: true, name: free}
+";
+
+/// Every key with its value (a hash's fields, for an anchored window) and expiry time.
+async fn snapshot(redis: &Redis) -> BTreeMap<String, (String, i64)> {
+    let custom = |name| CustomCommand::new_static(name, ClusterHash::FirstKey, false);
+    let keys: Vec<String> = redis
+        .client
+        .custom(
+            CustomCommand::new_static("KEYS", ClusterHash::Random, false),
+            vec!["*"],
+        )
+        .await
+        .unwrap();
+    let mut all = BTreeMap::new();
+    for key in keys {
+        let kind: String = redis
+            .client
+            .custom(custom("TYPE"), vec![key.as_str()])
+            .await
+            .unwrap();
+        let value = match kind.as_str() {
+            "hash" => format!("{:?}", hash_fields(redis, &key).await),
+            _ => redis
+                .client
+                .custom(custom("GET"), vec![key.as_str()])
+                .await
+                .unwrap(),
+        };
+        let expiry: i64 = redis
+            .client
+            .custom(custom("EXPIRETIME"), vec![key.as_str()])
+            .await
+            .unwrap();
+        all.insert(key, (value, expiry));
+    }
+    all
+}
+
+/// The lookup's answer, as JSON.
+async fn quota_json(h: &Extended, request: RateLimitRequest) -> serde_json::Value {
+    let lookup = h.subject.service.lookup(&request).await.unwrap();
+    serde_json::from_str(&ratelimit::quota::render(&lookup)).unwrap()
+}
+
+/// Every limit of every descriptor: an anchored session closed until a request opens it (no
+/// reset), then open from its anchor; fixed windows from their phase; a `rate_limit:` by
+/// its unit; an unlimited one; none for a descriptor no rule matches. Expected times from an
+/// independent computation (alice's weekly phase: 100 800 s).
+#[tokio::test]
+async fn quota_lookups_show_every_limit() {
+    if !tools_available() {
+        return;
+    }
+    use serde_json::json;
+    let h = Extended::start(QUOTAS, Settings::default()).await;
+    let descriptors: &[&[(&str, &str)]] = &[
+        &[("workspace", "w"), ("user", "alice")],
+        &[("workspace_total", "w")],
+        &[("legacy", "x")],
+        &[("free", "y")],
+        &[("nothing", "z")],
+    ];
+    let request = || {
+        let mut r = request("llm-quota", descriptors);
+        // Ignored by a lookup.
+        r.descriptors[0].hits_addend = Some(7);
+        r
+    };
+    let flags = json!({"shadow_mode": false, "quota_mode": false});
+    let entry = |fields: serde_json::Value| {
+        let mut entry = flags.clone();
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        entry
+    };
+    let expected = |five_hour: serde_json::Value, used: u64, now: &str, at: [(&str, i64); 3]| {
+        json!({
+            "now": now,
+            "descriptors": [
+                {"limits": [
+                    entry(five_hour),
+                    entry(json!({"name": "weekly", "window": {"type": "fixed", "duration_s": 604800},
+                        "limit": 1000, "used": used, "remaining": 1000 - used,
+                        "used_pct": used as f64 / 10.0,
+                        "resets_at": at[0].0, "resets_in_s": at[0].1})),
+                ]},
+                {"limits": [
+                    entry(json!({"name": "weekly", "window": {"type": "fixed", "duration_s": 604800},
+                        "limit": 10000, "used": used, "remaining": 10000 - used,
+                        "used_pct": used as f64 / 100.0,
+                        "resets_at": at[1].0, "resets_in_s": at[1].1})),
+                ]},
+                {"limits": [
+                    entry(json!({"name": "hourly", "window": {"type": "unit", "unit": "HOUR"},
+                        "limit": 10, "used": used, "remaining": 10u64.saturating_sub(used),
+                        "used_pct": used as f64 * 10.0,
+                        "resets_at": at[2].0, "resets_in_s": at[2].1})),
+                ]},
+                {"limits": [{"name": "free", "unlimited": true}]},
+                {"limits": []},
+            ]
+        })
+    };
+    let closed = json!({"name": "five_hour", "window": {"type": "anchored", "duration_s": 18000},
+        "limit": 100, "used": 0, "remaining": 100, "used_pct": 0.0, "open": false,
+        "resets_at": null, "resets_in_s": null});
+    h.at(1_000_000_000);
+    assert_eq!(
+        quota_json(&h, request()).await,
+        expected(
+            closed.clone(),
+            0,
+            "2001-09-09T01:46:40Z",
+            [
+                ("2001-09-14T04:00:00Z", 440_000),
+                ("2001-09-10T00:00:00Z", 80_000),
+                ("2001-09-09T02:00:00Z", 800),
+            ]
+        )
+    );
+    let mut counted = hits(descriptors, 40);
+    counted.domain = "llm-quota".into();
+    h.call(counted).await;
+    h.at(1_000_000_100);
+    assert_eq!(
+        quota_json(&h, request()).await,
+        expected(
+            json!({"name": "five_hour", "window": {"type": "anchored", "duration_s": 18000},
+                "limit": 100, "used": 40, "remaining": 60, "used_pct": 40.0, "open": true,
+                "resets_at": "2001-09-09T06:00:00Z", "resets_in_s": 15_100}),
+            40,
+            "2001-09-09T01:48:20Z",
+            [
+                ("2001-09-14T04:00:00Z", 439_900),
+                ("2001-09-10T00:00:00Z", 79_900),
+                ("2001-09-09T02:00:00Z", 700),
+            ]
+        )
+    );
+    // 06:00:05: the session is over (its key outlives it a minute), the hour is a new one.
+    h.at(1_000_015_205);
+    let after = quota_json(&h, request()).await;
+    assert_eq!(after["descriptors"][0]["limits"][0], entry(closed));
+    assert_eq!(after["descriptors"][2]["limits"][0]["used"], 0);
+    assert_eq!(after["descriptors"][0]["limits"][1]["used"], 40);
+}
+
+/// A lookup changes nothing: it only reads (`GET`, `HMGET`), and leaves the keys, their TTLs
+/// and the stats as they were.
+#[tokio::test]
+async fn quota_lookups_change_nothing() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(QUOTAS, Settings::default()).await;
+    let descriptors: &[&[(&str, &str)]] = &[
+        &[("workspace", "w"), ("user", "alice")],
+        &[("workspace", "w"), ("user", "bob")],
+        &[("workspace_total", "w")],
+        &[("legacy", "x")],
+        &[("unknown", "u")],
+    ];
+    h.at(1_000_000_000);
+    let mut counted = hits(&descriptors[..1], 5);
+    counted.domain = "llm-quota".into();
+    h.call(counted).await;
+    let keys = snapshot(&h.redis).await;
+    let stats = h.subject.stats.snapshot();
+    let before = h.redis.commands().await.len();
+    for now in [1_000_000_000, 1_000_020_000] {
+        h.at(now);
+        h.subject
+            .service
+            .lookup(&request("llm-quota", descriptors))
+            .await
+            .unwrap();
+    }
+    let commands = h.redis.commands().await[before..].to_vec();
+    assert!(
+        commands
+            .iter()
+            .all(|c| c.starts_with("\"GET\"") || c.starts_with("\"HMGET\"")),
+        "{commands:?}"
+    );
+    // A read per limit: two each for alice and bob, one for the workspace and the legacy.
+    assert_eq!(commands.len(), 2 * 6, "{commands:?}");
+    assert_eq!(snapshot(&h.redis).await, keys);
+    assert_eq!(h.subject.stats.snapshot(), stats);
+}
+
+/// The rules resolve as for a decision: `replaces` across the request's descriptors, a
+/// client-sent `limit`; an unknown domain or an invalid request is an error.
+#[tokio::test]
+async fn quota_lookups_resolve_rules_as_decisions_do() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::service::LookupError;
+    use ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: hourly, requests_per_unit: 10, window: {type: fixed, duration: 1h}}
+      - {name: daily, requests_per_unit: 100, window: {type: fixed, duration: 1d}}
+  - key: plan
+    rate_limit: {unit: minute, requests_per_unit: 5, replaces: [{name: hourly}]}
+",
+        Settings::default(),
+    )
+    .await;
+    h.at(1_000_000_000);
+    let names = |value: &serde_json::Value, i: usize| -> Vec<String> {
+        value["descriptors"][i]["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let alone = quota_json(&h, request("d", &[&[("user", "a")]])).await;
+    assert_eq!(names(&alone, 0), ["hourly", "daily"]);
+    let with_plan = quota_json(&h, request("d", &[&[("user", "a")], &[("plan", "p")]])).await;
+    assert_eq!(names(&with_plan, 0), ["daily"]);
+    let mut client = request("d", &[&[("user", "a")]]);
+    client.descriptors[0].limit = Some(RateLimitOverride {
+        requests_per_unit: 3,
+        unit: ratelimit_proto::envoy::r#type::v3::RateLimitUnit::Second as i32,
+        ..Default::default()
+    });
+    let overridden = quota_json(&h, client).await;
+    assert_eq!(
+        overridden["descriptors"][0]["limits"][0]["window"],
+        serde_json::json!({"type": "unit", "unit": "SECOND"})
+    );
+    assert_eq!(overridden["descriptors"][0]["limits"][0]["limit"], 3);
+    assert_eq!(
+        h.subject
+            .service
+            .lookup(&request("other", &[&[("user", "a")]]))
+            .await,
+        Err(LookupError::UnknownDomain("other".into()))
+    );
+    assert_eq!(
+        h.subject.service.lookup(&request("d", &[])).await,
+        Err(LookupError::InvalidRequest(
+            "rate limit descriptor list must not be empty".into()
+        ))
+    );
+    // Before any configuration.
+    let fresh = RateLimitService::new(
+        RedisCache::new(
+            h.redis.connect().await,
+            h.subject.clock.clone(),
+            Arc::new(Stats::default()),
+            CacheSettings::default(),
+        ),
+        h.subject.clock.clone(),
+        Arc::new(Stats::default()),
+        ServiceSettings::default(),
+    );
+    assert_eq!(
+        fresh.lookup(&request("d", &[&[("user", "a")]])).await,
+        Err(LookupError::InvalidRequest(
+            "no rate limit configuration loaded".into()
+        ))
+    );
+}
+
+/// ADR 0003's consistency property: at any `now`, a lookup then a decision with N hits per
+/// descriptor; each descriptor's status is OK ⇔ `used + N ≤ limit` for each of its limits.
+/// Over random sequences of fixed windows (with and without an offset), an anchored one, a
+/// `rate_limit:`, `replaces` and a client `limit`; no shadow mode, quota mode or local cache.
+#[tokio::test]
+async fn quota_lookups_announce_what_the_next_decision_applies() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::service::LimitQuota;
+    use ratelimit_proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - {name: minute, requests_per_unit: 5, window: {type: fixed, duration: 1m}}
+      - {name: hour, requests_per_unit: 9, window: {type: fixed, duration: 1h, offset: 15m}}
+      - {name: session, requests_per_unit: 7, window: {type: anchored, duration: 10m, start_rounding: 1m}}
+  - key: legacy
+    rate_limit: {unit: minute, requests_per_unit: 4}
+  - key: plan
+    rate_limit: {unit: hour, requests_per_unit: 50, replaces: [{name: minute}]}
+  - key: client
+    rate_limit: {unit: hour, requests_per_unit: 50}
+",
+        Settings::default(),
+    )
+    .await;
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut now: i64 = 1_000_000_000;
+    let mut over = 0;
+    for step in 0..300 {
+        now += match next(8) {
+            0 => 600 + next(1_200) as i64,
+            _ => next(40) as i64,
+        };
+        h.at(now);
+        let mut descriptors: Vec<&[(&str, &str)]> =
+            vec![&[("user", "u")], &[("legacy", "l")], &[("client", "c")]];
+        if next(2) == 0 {
+            descriptors.push(&[("plan", "p")]);
+        }
+        let n = next(4);
+        let mut request = request("d", &descriptors);
+        for descriptor in &mut request.descriptors {
+            descriptor.hits_addend = Some(n);
+        }
+        request.descriptors[2].limit = Some(RateLimitOverride {
+            requests_per_unit: 6,
+            unit: ratelimit_proto::envoy::r#type::v3::RateLimitUnit::Minute as i32,
+            ..Default::default()
+        });
+        let lookup = h.subject.service.lookup(&request).await.unwrap();
+        let expected: Vec<Code> = lookup
+            .descriptors
+            .iter()
+            .map(|limits| {
+                let fits = limits.iter().all(|quota| match quota {
+                    LimitQuota::Limited(limit, reading) => {
+                        reading.used + n <= u64::from(limit.limit.requests_per_unit)
+                    }
+                    LimitQuota::Unlimited(_) => true,
+                });
+                if fits { Code::Ok } else { Code::OverLimit }
+            })
+            .collect();
+        let decided: Vec<Code> = h
+            .call(request)
+            .await
+            .statuses
+            .iter()
+            .map(|s| s.code())
+            .collect();
+        assert_eq!(
+            decided, expected,
+            "step {step} at {now}, {n} hits: {lookup:?}"
+        );
+        over += decided.iter().filter(|c| **c == Code::OverLimit).count();
+    }
+    // The sequence goes over the limits as well as under them.
+    assert!(over > 50, "{over}");
+}
+
+/// `POST /quota` on the HTTP port (ADR 0003): JSON answers, `{"error": …}` with the cause's
+/// status, other methods refused; `ratelimit.quota_lookup.*` counts them.
+#[tokio::test]
+async fn quota_lookups_are_served_over_http() {
+    if !tools_available() {
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h = Extended::start(QUOTAS, Settings::default()).await;
+    h.at(1_000_000_000);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let health = Arc::new(ratelimit::health::HealthChecker::new(
+        ratelimit::health::HealthService::default(),
+        false,
+    ));
+    tokio::spawn(ratelimit::http::serve(
+        listener,
+        health,
+        h.subject.service.clone(),
+        std::future::pending(),
+    ));
+    let send = async |method: &str, body: &str| {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "{method} /quota HTTP/1.0\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head[9..12].parse().unwrap();
+        let headers = head.to_ascii_lowercase();
+        (status, headers, body.to_string())
+    };
+    let (status, headers, body) = send(
+        "POST",
+        r#"{"domain":"llm-quota","descriptors":[{"entries":[{"key":"legacy","value":"x"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers.contains("content-type: application/json"),
+        "{headers}"
+    );
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["descriptors"][0]["limits"][0]["name"], "hourly");
+    let (status, headers, _) = send("GET", "").await;
+    assert_eq!(status, 405);
+    assert!(headers.contains("allow: post"), "{headers}");
+    let error =
+        |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap()["error"].clone();
+    let (status, _, body) = send("POST", "not json").await;
+    assert_eq!(status, 400);
+    assert!(error(&body).is_string(), "{body}");
+    let (status, _, body) = send(
+        "POST",
+        r#"{"domain":"nope","descriptors":[{"entries":[{"key":"a","value":"b"}]}]}"#,
+    )
+    .await;
+    assert_eq!(
+        (status, error(&body)),
+        (404, "unknown domain 'nope'".into())
+    );
+    // A key a decision cannot read either (an anchored window's, not a hash): the backend's.
+    let key = "{llm-quota_workspace_w_user_alice_}_an18000r3600_five_hour";
+    let () = h
+        .redis
+        .client
+        .set(key, "x", None, None, false)
+        .await
+        .unwrap();
+    let (status, _, body) = send(
+        "POST",
+        r#"{"domain":"llm-quota","descriptors":[{"entries":[{"key":"workspace","value":"w"},{"key":"user","value":"alice"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        error(&body).as_str().unwrap().contains("WRONGTYPE"),
+        "{body}"
+    );
+    let stats: BTreeMap<String, u64> = h
+        .subject
+        .stats
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("ratelimit.quota_lookup"))
+        .collect();
+    assert_eq!(
+        stats,
+        BTreeMap::from([
+            ("ratelimit.quota_lookup.total_requests".to_string(), 4),
+            ("ratelimit.quota_lookup.error.backend".to_string(), 1),
+            (
+                "ratelimit.quota_lookup.error.invalid_request".to_string(),
+                1
+            ),
+            ("ratelimit.quota_lookup.error.unknown_domain".to_string(), 1),
+        ])
+    );
+}
+
+/// On Memcached (D24), a lookup reads the fixed windows' keys with one `GetMulti`, and
+/// counts nothing in `memcache.*`.
+#[tokio::test]
+async fn quota_lookups_read_memcached() {
+    if !memcached_available() {
+        return;
+    }
+    let memcached = Memcached::start().await;
+    let servers = ratelimit::memcached::client::resolve(std::slice::from_ref(&memcached.address))
+        .await
+        .unwrap();
+    let client = Arc::new(ratelimit::memcached::client::Client::new(servers, 2, None));
+    let clock = Arc::new(ManualClock::default());
+    let stats = Arc::new(Stats::default());
+    let cache = ratelimit::memcached::MemcacheCache::new(
+        client,
+        clock.clone(),
+        stats.clone(),
+        &stats.scope_with_tags("ratelimit"),
+        CacheSettings::default(),
+        None,
+    );
+    let service = RateLimitService::new(
+        cache,
+        clock.clone(),
+        stats.clone(),
+        ServiceSettings::default(),
+    );
+    let file = ConfigFile {
+        name: "config.yaml".into(),
+        content: WEEK_AND_FIVE_HOURS.into(),
+    };
+    service.set_config(config::load(&[file], &LoadOptions::default()).unwrap());
+    clock.0.store(1_000_000_000, Ordering::SeqCst);
+    let alice = || request("d", &[&[("user", "alice")]]);
+    service.should_rate_limit(&alice()).await.unwrap();
+    // The increment goes after the answer.
+    let weekly = "{d_user_alice_}_fx604800o345600_999475200_weekly";
+    for _ in 0..100 {
+        if memcached
+            .ask(&format!("get {weekly}\r\n"))
+            .await
+            .starts_with("VALUE")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let counted = stats.snapshot();
+    let lookup = service.lookup(&alice()).await.unwrap();
+    let used: Vec<u64> = lookup.descriptors[0]
+        .iter()
+        .map(|quota| match quota {
+            ratelimit::service::LimitQuota::Limited(_, reading) => reading.used,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(used, [1, 1]);
+    assert_eq!(stats.snapshot(), counted);
+}
+
+/// With `REDIS_PERSECOND`, a lookup reads a list with a short window where decisions count
+/// it: on the per-second Redis.
+#[tokio::test]
+async fn quota_lookups_read_the_per_second_redis() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        per_second: true,
+        ..Default::default()
+    };
+    let h = Extended::start(
+        "
+domain: d
+descriptors:
+  - key: burst
+    rate_limits:
+      - {name: ten_seconds, requests_per_unit: 5, window: {type: fixed, duration: 10s}}
+",
+        settings,
+    )
+    .await;
+    h.at(1_000_000_000);
+    let burst = || request("d", &[&[("burst", "a")]]);
+    h.call(hits(&[&[("burst", "a")]], 2)).await;
+    let lookup = quota_json(&h, burst()).await;
+    assert_eq!(lookup["descriptors"][0]["limits"][0]["used"], 2);
+}

@@ -12,7 +12,7 @@ use crate::config::RateLimit;
 use crate::config::window::{Anchored, AnchoredWindow, MAX_ANCHORED_COUNT, OpenOn, Window};
 use crate::limiter::{self, CacheSettings, Clock, Count, Hits, RequestState};
 use crate::local_cache::LocalCache;
-use crate::service::{CacheError, LimitOutcome, RateLimitCache};
+use crate::service::{CacheError, LimitOutcome, LimitReading, RateLimitCache};
 use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
@@ -108,6 +108,14 @@ impl RedisCache {
     pub fn with_per_second(mut self, pool: Pool) -> Self {
         self.per_second = Some(pool);
         self
+    }
+
+    /// The pipeline a descriptor's `limits` go in: 0 the main one, 1 the per-second one.
+    fn pipeline_of(&self, limits: &[RateLimit]) -> usize {
+        match &self.per_second {
+            Some(_) if limiter::per_second(limits) => 1,
+            _ => 0,
+        }
     }
 
     /// The pipelines' pools: the main one, then the per-second one if any.
@@ -224,7 +232,7 @@ impl Command {
 }
 
 /// A descriptor's limit, to be checked against Redis or the local cache.
-struct Check<'a> {
+struct Counted<'a> {
     /// The descriptor's index in the request.
     index: usize,
     /// The limit's index in the descriptor's limits.
@@ -245,6 +253,15 @@ struct Check<'a> {
 }
 
 impl RateLimitCache for RedisCache {
+    async fn lookup(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+    ) -> Result<(i64, Vec<Vec<LimitReading>>), CacheError> {
+        let now = self.clock.unix_now();
+        Ok((now, self.read_limits(request, limits, now).await?))
+    }
+
     async fn do_limit(
         &self,
         request: &RateLimitRequest,
@@ -283,7 +300,7 @@ impl RateLimitCache for RedisCache {
                     false => crate::debug!("cache key is over the limit: {key}"),
                 }
             }
-            checks.push(Check {
+            checks.push(Counted {
                 index,
                 slot,
                 limit,
@@ -293,10 +310,7 @@ impl RateLimitCache for RedisCache {
                 over_in_local_cache,
                 going_over: false,
                 listed: limit.window.is_some(),
-                pipeline: match &self.per_second {
-                    Some(_) if limiter::per_second(&limits[index]) => 1,
-                    _ => 0,
-                },
+                pipeline: self.pipeline_of(&limits[index]),
             });
         }
 
@@ -453,6 +467,78 @@ impl RateLimitCache for RedisCache {
     }
 }
 
+impl RedisCache {
+    /// The quota lookup's reads (ADR 0003): each limit's key at `now`, as a decision would
+    /// find it, with `GET` or, for an anchored window, `HMGET` of its anchor and count; on
+    /// the pool the decision would use. Nothing is written.
+    async fn read_limits(
+        &self,
+        request: &RateLimitRequest,
+        limits: &[Vec<RateLimit>],
+        now: i64,
+    ) -> Result<Vec<Vec<LimitReading>>, CacheError> {
+        let mut pipelines: [Vec<Command>; 2] = [Vec::new(), Vec::new()];
+        let mut reply_of = Vec::new();
+        for (index, slot, limit) in limiter::slots(limits) {
+            let key = limiter::cache_key(
+                &self.settings.cache_key_prefix,
+                &request.domain,
+                &request.descriptors[index],
+                limit,
+                now,
+                self.settings.use_calendar_month,
+            )?;
+            let pipeline = self.pipeline_of(&limits[index]);
+            let command = match &limit.window {
+                Some(Window::Anchored(_)) => Command {
+                    name: "HMGET",
+                    args: vec![key, "a".into(), "c".into()],
+                },
+                _ => Command {
+                    name: "GET",
+                    args: vec![key],
+                },
+            };
+            reply_of.push((index, slot, pipeline, pipelines[pipeline].len()));
+            pipelines[pipeline].push(command);
+        }
+        let mut replies: [Vec<_>; 2] = [Vec::new(), Vec::new()];
+        for (pipeline, pool) in self.pools().into_iter().enumerate() {
+            if let (Some(pool), false) = (pool, pipelines[pipeline].is_empty()) {
+                replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
+            }
+        }
+        let mut readings: Vec<Vec<LimitReading>> = limits
+            .iter()
+            .map(|list| Vec::with_capacity(list.len()))
+            .collect();
+        for (index, slot, pipeline, at) in reply_of {
+            let (command, reply) = (&pipelines[pipeline][at], replies[pipeline][at].clone());
+            let limit = &limits[index][slot];
+            let reading = match &limit.window {
+                Some(Window::Anchored(window)) => {
+                    // Closed as a decision closes it, whether or not the key expired yet.
+                    let open = window.open(command.stored_anchored(reply)?, now);
+                    LimitReading {
+                        used: open.map_or(0, |w| w.count),
+                        reset: open.map(|w| window.reset(Some(w), now)),
+                    }
+                }
+                _ => {
+                    let calendar = self.settings.use_calendar_month;
+                    let descriptor = &request.descriptors[index];
+                    LimitReading {
+                        used: command.counter(reply)?,
+                        reset: Some(limiter::reset(limit, descriptor, now, calendar)?),
+                    }
+                }
+            };
+            readings[index].push(reading);
+        }
+        Ok(readings)
+    }
+}
+
 /// The script call counting `hits` in an anchored window's `key` at `now`.
 fn anchored_command(window: &AnchoredWindow, key: &str, hits: Hits, now: i64) -> Command {
     let flag = |on: bool| if on { "1" } else { "0" }.to_string();
@@ -474,6 +560,37 @@ fn anchored_command(window: &AnchoredWindow, key: &str, hits: Hits, now: i64) ->
 }
 
 impl Command {
+    /// An anchored window's stored state, from `HMGET key a c`: none without an anchor.
+    fn stored_anchored(&self, reply: Value) -> Result<Option<Anchored>, CacheError> {
+        let malformed = || self.failed("an anchored window's state is not 2 integers");
+        let Value::Array(values) = reply else {
+            return Err(malformed());
+        };
+        let [anchor, count] = &values[..] else {
+            return Err(malformed());
+        };
+        let number = |value: &Value| match value {
+            Value::Null => Ok(None),
+            other => other
+                .as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(Some)
+                .ok_or_else(malformed),
+        };
+        let Some(anchor) = number(anchor)? else {
+            return Ok(None);
+        };
+        // A count the script cannot read, it reads as 0.
+        let count = number(count)
+            .ok()
+            .flatten()
+            .and_then(|c| u64::try_from(c).ok());
+        Ok(Some(Anchored {
+            anchor,
+            count: count.unwrap_or(0),
+        }))
+    }
+
     /// The anchored script's reply: the open window, if any, and whether it just opened.
     fn anchored(&self, reply: Value) -> Result<(Option<Anchored>, bool), CacheError> {
         let malformed = || self.failed("an anchored window's reply is not 3 integers");
@@ -494,11 +611,11 @@ impl Command {
 impl RedisCache {
     /// `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT`: reads the counters first to mark the keys
     /// these hits will take over the limit.
-    async fn find_keys_going_over(&self, checks: &mut [Check<'_>]) -> Result<(), CacheError> {
+    async fn find_keys_going_over(&self, checks: &mut [Counted<'_>]) -> Result<(), CacheError> {
         // The main pipeline's reads, then the per-second one's.
         for (pipeline, pool) in self.pools().into_iter().enumerate() {
             let Some(pool) = pool else { continue };
-            let mut reads: Vec<&mut Check> = checks
+            let mut reads: Vec<&mut Counted> = checks
                 .iter_mut()
                 .filter(|c| !c.hits.refund && !c.listed && c.pipeline == pipeline)
                 .collect();

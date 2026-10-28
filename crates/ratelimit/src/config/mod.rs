@@ -565,6 +565,11 @@ impl Descriptor {
 }
 
 impl RateLimitConfig {
+    /// Whether `domain` is configured.
+    pub fn has_domain(&self, domain: &str) -> bool {
+        self.domains.contains_key(domain)
+    }
+
     /// `IsEmptyDomains`: whether the config has no domain.
     pub fn is_empty_domains(&self) -> bool {
         self.domains.is_empty()

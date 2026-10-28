@@ -405,3 +405,8 @@ Not upstream's: what `docs/design.md` adds (B and C). Proven by tests of their o
 | The shipped Prometheus mapper's `limit=` label, `total_capped_hits`, `opened_without_hits` (D29) | ⬜ | |
 | Memcached: a warning at load when a list key's static part exceeds 250 − 64 bytes (ADR 0001) | ⬜ | |
 | A client-sent `limit` with `unit_multiplier` (D23): read, applied, echoed, 0 refused | ⬜ | ignored, as upstream |
+| Quota lookup (ADR 0003): `POST /quota` on the HTTP port; every limit of every descriptor (`replaces` and a client `limit` resolved as in a decision, unlimited ones, none for an unmatched descriptor), its window, `used`, `remaining`, `used_pct`, `resets_at`, `resets_in_s`, an anchored session's `open` (closed: no reset); 400, 404, 405, 500 | ✅ | `quota_lookups_show_every_limit`, `quota_lookups_resolve_rules_as_decisions_do`, `quota_lookups_are_served_over_http` |
+| Quota lookup changes nothing: reads only (`GET`, `HMGET`), keys, TTLs and rate-limit stats untouched, no local cache access | ✅ | `quota_lookups_change_nothing` |
+| Quota lookup announces what the next decision applies (OK ⇔ `used + N ≤ limit`) | ✅ | `quota_lookups_announce_what_the_next_decision_applies` |
+| Quota lookup on Memcached: one `GetMulti`, nothing counted in `memcache.*` | ✅ | `quota_lookups_read_memcached` |
+| `ratelimit.quota_lookup.*` stats; the shipped mapper's `ratelimit_quota_lookup_errors{cause}` and `ratelimit_quota_lookup_response_time_seconds` | ✅ | `quota_lookups_are_served_over_http`, `the_default_mapper_maps_quota_lookup_stats` |

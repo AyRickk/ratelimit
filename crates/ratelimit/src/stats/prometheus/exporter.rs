@@ -1066,6 +1066,16 @@ pub(super) fn escape_metric_name(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The quota lookup's counter the shipped mapper leaves alone gets the exporter's name
+    /// (ADR 0003).
+    #[test]
+    fn unmapped_quota_lookup_counters_are_escaped() {
+        assert_eq!(
+            escape_metric_name("ratelimit.quota_lookup.total_requests"),
+            "ratelimit_quota_lookup_total_requests"
+        );
+    }
+
     /// `GetSummary`: a mapping's options replace the defaults' in full, then client_golang's
     /// defaults fill what is 0; its quantiles only when it has some.
     #[test]

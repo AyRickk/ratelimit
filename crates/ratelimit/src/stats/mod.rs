@@ -348,6 +348,20 @@ impl Stats {
         self.service_counter(&format!("rate_limit.{domain}.domain_not_found"))
     }
 
+    /// The quota lookup's counter `name` (`ratelimit.quota_lookup.*`, ADR 0003), made when
+    /// first counted.
+    pub fn quota_lookup_counter(&self, name: &str) -> Counter {
+        self.counter(&format!("ratelimit.quota_lookup.{name}{}", self.tags))
+    }
+
+    /// The quota lookup's `response_time`, in milliseconds.
+    pub fn quota_lookup_timer(&self) -> Timer {
+        let scope = Scope {
+            name: "ratelimit.quota_lookup".into(),
+        };
+        self.scope_timer(&scope, "response_time")
+    }
+
     /// A counter of a limit's beyond upstream's, made only when counted, so that limits which
     /// never count it do not show it.
     pub fn rate_limit_counter(&self, key: &str, name: &str) -> Counter {
