@@ -9,15 +9,14 @@ pub mod tls;
 pub use connection::{Connected, RedisConnection, StartupBackoff, Tls, mask_credentials_in_url};
 
 use crate::config::RateLimit;
+use crate::config::window::{Anchored, AnchoredWindow, MAX_ANCHORED_COUNT, OpenOn, Window};
 use crate::limiter::{self, CacheSettings, Clock, Count, Hits, RequestState};
 use crate::local_cache::LocalCache;
-use crate::service::{CacheError, RateLimitCache};
+use crate::service::{CacheError, LimitOutcome, RateLimitCache};
 use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
-use ratelimit_proto::envoy::service::ratelimit::v3::{
-    RateLimitRequest, rate_limit_response::DescriptorStatus,
-};
+use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
 use std::sync::Arc;
 
 /// Upstream's `DecrementScript`, byte for byte: subtract, floor at 0, reset the TTL.
@@ -29,6 +28,40 @@ redis.call('SET', KEYS[1], tostring(new_val))                -- persist new valu
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))             -- reset TTL
 return new_val                                               -- return count after decrement
 ";
+
+/// An `anchored` window (docs/design.md D9), as [`AnchoredWindow::step`] decides it: the
+/// anchor and the count in one hash, the window closed once `now ≥ anchor + duration`, never
+/// by the key's absence. ARGV: now, duration, rounding (0: none), hits, opened by a check
+/// (1) or a first hit (0), refund (1) or not (0), TTL margin, the largest count (2^53, which
+/// hits are capped at too). Returns the anchor (-1: no window), the count, and whether this
+/// request opened it.
+const ANCHORED_SCRIPT: &str = "
+local now, duration, rounding = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local hits, on_check, refund = tonumber(ARGV[4]), ARGV[5] == '1', ARGV[6] == '1'
+local anchor = tonumber(redis.call('HGET', KEYS[1], 'a'))
+local count = tonumber(redis.call('HGET', KEYS[1], 'c')) or 0
+if anchor ~= nil and now - anchor >= duration then anchor = nil end
+if refund then
+  if anchor == nil then return {-1, 0, 0} end
+  count = math.max(0, count - hits)
+  redis.call('HSET', KEYS[1], 'c', string.format('%d', count))
+  return {anchor, count, 0}
+end
+if anchor == nil then
+  if not on_check and hits == 0 then return {-1, 0, 0} end
+  anchor = now
+  if rounding > 0 then anchor = now - now % rounding end
+  redis.call('HSET', KEYS[1], 'a', string.format('%d', anchor), 'c', string.format('%d', hits))
+  redis.call('EXPIRE', KEYS[1], anchor + duration - now + tonumber(ARGV[7]))
+  return {anchor, hits, 1}
+end
+count = math.min(count + hits, tonumber(ARGV[8]))
+redis.call('HSET', KEYS[1], 'c', string.format('%d', count))
+return {anchor, count, 0}
+";
+
+/// How long an anchored window's key outlives it, for replicas whose clocks are behind.
+const ANCHORED_MARGIN_SECONDS: i64 = 60;
 
 pub struct RedisCache {
     /// Connections, each request's pipeline on one of them (radix's pool).
@@ -216,7 +249,7 @@ impl RateLimitCache for RedisCache {
         &self,
         request: &RateLimitRequest,
         limits: &[Vec<RateLimit>],
-    ) -> Result<Vec<Vec<DescriptorStatus>>, CacheError> {
+    ) -> Result<Vec<Vec<LimitOutcome>>, CacheError> {
         crate::debug!("starting cache lookup");
         let now = self.clock.unix_now();
         let hits = limiter::hits(request);
@@ -234,8 +267,10 @@ impl RateLimitCache for RedisCache {
             let hits = hits[index];
             let stats = self.stats.rate_limit(&limit.full_key);
             limiter::count_hits(&stats, hits);
-            // Refunds always reach Redis.
+            // Refunds always reach Redis; the local cache does not hold anchored windows.
+            let anchored = matches!(limit.window, Some(Window::Anchored(_)));
             let over_in_local_cache = !hits.refund
+                && !anchored
                 && self
                     .local_cache
                     .as_ref()
@@ -287,6 +322,13 @@ impl RateLimitCache for RedisCache {
                 continue;
             }
             crate::debug!("looking up cache key: {}", c.key);
+            let commands = &mut pipelines[c.pipeline];
+            reply_of.push((c.index, c.slot, c.pipeline, commands.len()));
+            // An anchored window's key expires with the window, which the script knows.
+            if let Some(Window::Anchored(window)) = &c.limit.window {
+                commands.push(anchored_command(window, &c.key, c.hits, now));
+                continue;
+            }
             let calendar = self.settings.use_calendar_month;
             let mut expiration = limiter::expiration(c.limit, now, calendar)?;
             let jitter = self.settings.expiration_jitter_max_seconds;
@@ -295,8 +337,6 @@ impl RateLimitCache for RedisCache {
                 expiration = expiration.wrapping_add(crate::random::below(jitter as u64) as i64);
             }
             let expiration = expiration.to_string();
-            let commands = &mut pipelines[c.pipeline];
-            reply_of.push((c.index, c.slot, c.pipeline, commands.len()));
             if c.hits.refund {
                 let amount = (c.hits.value as i64).to_string();
                 let args = vec![
@@ -353,9 +393,23 @@ impl RateLimitCache for RedisCache {
                 replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
             }
         }
+        // An anchored window's reset, from its state, and whether this request opened it
+        // without hits.
+        let mut resets: Vec<Vec<Option<i64>>> =
+            limits.iter().map(|list| vec![None; list.len()]).collect();
+        let mut opened_without_hits: Vec<Vec<bool>> =
+            limits.iter().map(|list| vec![false; list.len()]).collect();
         for (index, slot, pipeline, at) in reply_of {
             let reply = replies[pipeline][at].clone();
-            counts[index][slot] = Count::After(pipelines[pipeline][at].counter(reply)?);
+            let command = &pipelines[pipeline][at];
+            let Some(Window::Anchored(window)) = &limits[index][slot].window else {
+                counts[index][slot] = Count::After(command.counter(reply)?);
+                continue;
+            };
+            let (state, opened) = command.anchored(reply)?;
+            counts[index][slot] = Count::After(state.map_or(0, |w| w.count));
+            resets[index][slot] = Some(window.reset(state, now));
+            opened_without_hits[index][slot] = opened && hits[index].value == 0;
         }
         for c in &checks {
             if c.over_in_local_cache {
@@ -363,6 +417,7 @@ impl RateLimitCache for RedisCache {
             } else if let (false, Count::After(after), Some(cache)) =
                 (c.hits.refund, counts[c.index][c.slot], &self.local_cache)
                 && limiter::exceeds(c.limit, after)
+                && !matches!(c.limit.window, Some(Window::Anchored(_)))
             {
                 // Cached for a whole window, shadow rules included, as upstream.
                 let calendar = self.settings.use_calendar_month;
@@ -373,22 +428,66 @@ impl RateLimitCache for RedisCache {
             }
         }
 
-        let mut statuses: Vec<Vec<DescriptorStatus>> = limits
+        let mut statuses: Vec<Vec<LimitOutcome>> = limits
             .iter()
             .map(|list| Vec::with_capacity(list.len()))
             .collect();
         for c in &checks {
-            statuses[c.index].push(limiter::limit_status(
-                (c.limit, &c.stats, &c.key),
-                &request.descriptors[c.index],
-                self.settings.near_limit_ratio,
-                c.hits,
-                counts[c.index][c.slot],
-                now,
-                self.settings.use_calendar_month,
-            )?);
+            let reset = match resets[c.index][c.slot] {
+                Some(reset) => reset,
+                None => {
+                    let calendar = self.settings.use_calendar_month;
+                    limiter::reset(c.limit, &request.descriptors[c.index], now, calendar)?
+                }
+            };
+            let count = counts[c.index][c.slot];
+            let ratio = self.settings.near_limit_ratio;
+            let status =
+                limiter::limit_status((c.limit, &c.stats, &c.key), ratio, c.hits, count, reset);
+            statuses[c.index].push(LimitOutcome {
+                status,
+                opened_without_hits: opened_without_hits[c.index][c.slot],
+            });
         }
         Ok(statuses)
+    }
+}
+
+/// The script call counting `hits` in an anchored window's `key` at `now`.
+fn anchored_command(window: &AnchoredWindow, key: &str, hits: Hits, now: i64) -> Command {
+    let flag = |on: bool| if on { "1" } else { "0" }.to_string();
+    let on_check = window.open_on == OpenOn::Check;
+    let args = vec![
+        ANCHORED_SCRIPT.to_string(),
+        "1".to_string(),
+        key.to_string(),
+        now.to_string(),
+        window.duration.to_string(),
+        window.rounding.unwrap_or(0).to_string(),
+        hits.value.min(MAX_ANCHORED_COUNT).to_string(),
+        flag(on_check),
+        flag(hits.refund),
+        ANCHORED_MARGIN_SECONDS.to_string(),
+        MAX_ANCHORED_COUNT.to_string(),
+    ];
+    Command { name: "EVAL", args }
+}
+
+impl Command {
+    /// The anchored script's reply: the open window, if any, and whether it just opened.
+    fn anchored(&self, reply: Value) -> Result<(Option<Anchored>, bool), CacheError> {
+        let malformed = || self.failed("an anchored window's reply is not 3 integers");
+        let Value::Array(values) = reply else {
+            return Err(malformed());
+        };
+        let numbers: Vec<i64> = values.iter().filter_map(Value::as_i64).collect();
+        let [anchor, count, opened] = numbers[..] else {
+            return Err(malformed());
+        };
+        // A negative count is no count the script writes.
+        let count = u64::try_from(count).map_err(|_| malformed())?;
+        let window = (anchor >= 0).then_some(Anchored { anchor, count });
+        Ok((window, opened == 1))
     }
 }
 

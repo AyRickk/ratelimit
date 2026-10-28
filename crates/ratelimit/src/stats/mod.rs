@@ -348,6 +348,13 @@ impl Stats {
         self.service_counter(&format!("rate_limit.{domain}.domain_not_found"))
     }
 
+    /// A counter of a limit's beyond upstream's, made only when counted, so that limits which
+    /// never count it do not show it.
+    pub fn rate_limit_counter(&self, key: &str, name: &str) -> Counter {
+        let prefix = format!("rate_limit.{}", sanitize_stat_name(key));
+        self.service_counter(&format!("{prefix}.{name}"))
+    }
+
     /// The counters of the limit whose stats key is `key` (`NewStats`).
     pub fn rate_limit(&self, key: &str) -> RateLimitStats {
         let prefix = format!("rate_limit.{}", sanitize_stat_name(key));

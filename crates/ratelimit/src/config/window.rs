@@ -1,8 +1,63 @@
-//! The `fixed` window of a `rate_limits:` entry (docs/design.md D8, ADR 0002): any duration,
-//! its windows starting at the epoch, at a constant offset, or at a phase hashed from the
-//! descriptor.
+//! The windows of `rate_limits:` entries: `fixed` (docs/design.md D8, ADR 0002), of any
+//! duration, starting at the epoch, at a constant offset, or at a phase hashed from the
+//! descriptor; `anchored` (D9), opened by a request and lasting its duration from then.
 
 use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::rate_limit::Unit;
+
+/// A list limit's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// `type: fixed`.
+    Fixed(FixedWindow),
+    /// `type: anchored`.
+    Anchored(AnchoredWindow),
+}
+
+impl Window {
+    /// Its length, in seconds.
+    pub fn duration(&self) -> i64 {
+        match self {
+            Window::Fixed(w) => w.duration,
+            Window::Anchored(w) => w.duration,
+        }
+    }
+
+    /// The window's part of the storage key (ADR 0001).
+    pub fn shape(&self) -> String {
+        match self {
+            Window::Fixed(w) => w.shape(),
+            Window::Anchored(w) => w.shape(),
+        }
+    }
+
+    /// The window as `/rlconfig` shows it.
+    pub fn describe(&self) -> String {
+        match self {
+            Window::Fixed(w) => w.describe(),
+            Window::Anchored(w) => w.describe(),
+        }
+    }
+
+    /// The unit the window is reported in, the largest whose length divides the duration,
+    /// and how many of them it lasts (D13).
+    pub fn unit(&self) -> (Unit, u32) {
+        let duration = self.duration();
+        let units = [
+            (Unit::Year, 365 * 86_400),
+            (Unit::Month, 30 * 86_400),
+            (Unit::Week, 7 * 86_400),
+            (Unit::Day, 86_400),
+            (Unit::Hour, 3_600),
+            (Unit::Minute, 60),
+            (Unit::Second, 1),
+        ];
+        let (unit, length) = units
+            .into_iter()
+            .find(|(_, length)| duration % length == 0)
+            .expect("a whole number of seconds");
+        (unit, (duration / length) as u32)
+    }
+}
 
 /// A `fixed` window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,24 +123,146 @@ impl FixedWindow {
             }
         }
     }
+}
 
-    /// The unit the window is reported in, the largest whose length divides the duration,
-    /// and how many of them it lasts (D13).
-    pub fn unit(&self) -> (Unit, u32) {
-        let units = [
-            (Unit::Year, 365 * 86_400),
-            (Unit::Month, 30 * 86_400),
-            (Unit::Week, 7 * 86_400),
-            (Unit::Day, 86_400),
-            (Unit::Hour, 3_600),
-            (Unit::Minute, 60),
-            (Unit::Second, 1),
-        ];
-        let (unit, length) = units
-            .into_iter()
-            .find(|(_, length)| self.duration % length == 0)
-            .expect("a whole number of seconds");
-        (unit, (self.duration / length) as u32)
+/// An `anchored` window (D9): opened by a request while none is, it lasts its duration from
+/// its anchor, never moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredWindow {
+    /// Its length, in seconds.
+    pub duration: i64,
+    /// `start_rounding`: the anchor is rounded down to a multiple of it (UTC).
+    pub rounding: Option<i64>,
+    /// `open_on`: what opens it.
+    pub open_on: OpenOn,
+}
+
+/// What opens an anchored window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOn {
+    /// `check`: any request presented, whatever its hits (0 included) and verdict.
+    Check,
+    /// `first_hit`: a request whose hits are counted.
+    FirstHit,
+}
+
+/// The most hits an anchored window counts: 2^53, the largest integer the Redis script's
+/// numbers (doubles) hold exactly. Hits and counts beyond saturate there.
+pub const MAX_ANCHORED_COUNT: u64 = 1 << 53;
+
+/// An anchored window's state: its anchor and the hits counted since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchored {
+    /// When it opened, rounded, in Unix seconds.
+    pub anchor: i64,
+    /// The hits counted since, refunds taken back.
+    pub count: u64,
+}
+
+/// What a request does to an anchored window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredOp {
+    /// The request's time, in Unix seconds.
+    pub now: i64,
+    /// Its hits for the limit.
+    pub hits: u64,
+    /// Whether it takes them back (`is_negative_hits`).
+    pub refund: bool,
+}
+
+/// What [`AnchoredWindow::step`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredResult {
+    /// What is stored after the request: the last window opened, closed or not (a clock
+    /// going back can find it open again).
+    pub state: Option<Anchored>,
+    /// The open window after the request, if any.
+    pub window: Option<Anchored>,
+    /// Whether the request opened it.
+    pub opened: bool,
+}
+
+impl AnchoredWindow {
+    /// The window's part of the storage key (ADR 0001): `an<duration>`, then `r<rounding>`,
+    /// then `f` when the first hit opens it.
+    pub fn shape(&self) -> String {
+        let rounding = self.rounding.map_or(String::new(), |r| format!("r{r}"));
+        let first_hit = match self.open_on {
+            OpenOn::Check => "",
+            OpenOn::FirstHit => "f",
+        };
+        format!("an{}{rounding}{first_hit}", self.duration)
+    }
+
+    /// The window as `/rlconfig` shows it.
+    pub fn describe(&self) -> String {
+        let rounding = self
+            .rounding
+            .map_or(String::new(), |r| format!(" start_rounding={r}s"));
+        let open_on = match self.open_on {
+            OpenOn::Check => "check",
+            OpenOn::FirstHit => "first_hit",
+        };
+        format!("anchored {}s{rounding} open_on={open_on}", self.duration)
+    }
+
+    /// The anchor a window opened at `now` gets.
+    pub fn anchor(&self, now: i64) -> i64 {
+        match self.rounding {
+            Some(rounding) => now - now.rem_euclid(rounding),
+            None => now,
+        }
+    }
+
+    /// The seconds until the window ends: the open one's, else one opened now's (D12); a
+    /// clock behind the anchor counts as no time elapsed (D27).
+    pub fn reset(&self, window: Option<Anchored>, now: i64) -> i64 {
+        let anchor = window.map_or_else(|| self.anchor(now), |w| w.anchor);
+        self.duration - (now - anchor).max(0)
+    }
+
+    /// The state after `op` (D9, D21): a window is open while `now − anchor < duration`, a
+    /// clock before the anchor counting as no time elapsed; a request opens one while none
+    /// is (with `first_hit`, only if it has hits); a refund never opens or closes one, and
+    /// floors the count at 0. The Redis script ([`crate::redis`]) does the same.
+    pub fn step(&self, state: Option<Anchored>, op: AnchoredOp) -> AnchoredResult {
+        let open = state.filter(|w| op.now - w.anchor < self.duration);
+        let hits = op.hits.min(MAX_ANCHORED_COUNT);
+        let changed = |window: Anchored, opened| AnchoredResult {
+            state: Some(window),
+            window: Some(window),
+            opened,
+        };
+        match open {
+            Some(w) if op.refund => changed(
+                Anchored {
+                    count: w.count.saturating_sub(hits),
+                    ..w
+                },
+                false,
+            ),
+            Some(w) => changed(
+                Anchored {
+                    count: (w.count + hits).min(MAX_ANCHORED_COUNT),
+                    ..w
+                },
+                false,
+            ),
+            None if op.refund || (self.open_on == OpenOn::FirstHit && hits == 0) => {
+                AnchoredResult {
+                    state,
+                    window: None,
+                    opened: false,
+                }
+            }
+            None => changed(
+                Anchored {
+                    anchor: self.anchor(op.now),
+                    count: hits,
+                },
+                true,
+            ),
+        }
     }
 }
 

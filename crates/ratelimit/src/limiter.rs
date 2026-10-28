@@ -3,6 +3,7 @@
 //! and the time helpers of `src/utils`.
 
 use crate::config::RateLimit;
+use crate::config::window::Window;
 use crate::service::CacheError;
 use crate::stats::RateLimitStats;
 use ratelimit_proto::envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
@@ -153,20 +154,26 @@ pub fn cache_key(
         key += &escape(v);
         key += "_";
     }
-    let start = window.start(now, window.phase(key_entries(descriptor, limit)));
-    key += &format!("}}_{}_{start}_{}", window.shape(), limit.name);
+    key += &format!("}}_{}_", window.shape());
+    // A fixed window's key changes with the window; an anchored one's holds its anchor.
+    if let Window::Fixed(fixed) = window {
+        let start = fixed.start(now, fixed.phase(key_entries(descriptor, limit)));
+        key += &format!("{start}_");
+    }
+    key += &limit.name;
     Ok(key)
 }
 
 /// A key's TTL: [`expiration_seconds`], or a list limit's window.
 pub(crate) fn expiration(limit: &RateLimit, now: i64, calendar: bool) -> Result<i64, CacheError> {
     match &limit.window {
-        Some(window) => Ok(window.duration),
+        Some(window) => Ok(window.duration()),
         None => expiration_seconds(limit.limit.unit(), now, calendar),
     }
 }
 
-/// The seconds until `limit`'s window containing `now` ends, for `descriptor`.
+/// The seconds until `limit`'s window containing `now` ends, for `descriptor`; for an
+/// anchored window, which only its state knows, a window opened now's.
 pub(crate) fn reset(
     limit: &RateLimit,
     descriptor: &RateLimitDescriptor,
@@ -174,7 +181,8 @@ pub(crate) fn reset(
     calendar: bool,
 ) -> Result<i64, CacheError> {
     match &limit.window {
-        Some(window) => Ok(window.reset(now, window.phase(key_entries(descriptor, limit)))),
+        Some(Window::Fixed(w)) => Ok(w.reset(now, w.phase(key_entries(descriptor, limit)))),
+        Some(Window::Anchored(w)) => Ok(w.reset(None, now)),
         None => reset_seconds(limit.limit.unit(), now, calendar),
     }
 }
@@ -192,7 +200,7 @@ pub(crate) fn slots(limits: &[Vec<RateLimit>]) -> impl Iterator<Item = (usize, u
 /// or a list with a window shorter than a minute (D15).
 pub(crate) fn per_second(limits: &[RateLimit]) -> bool {
     limits.iter().any(|limit| match &limit.window {
-        Some(window) => window.duration < 60,
+        Some(window) => window.duration() < 60,
         None => limit.limit.unit() == Unit::Second,
     })
 }
@@ -219,24 +227,17 @@ pub(crate) fn hits(request: &RateLimitRequest) -> Vec<Hits> {
         .collect()
 }
 
-fn status(
-    code: Code,
-    limit: &RateLimit,
-    descriptor: &RateLimitDescriptor,
-    limit_remaining: u32,
-    now: i64,
-    calendar: bool,
-) -> Result<DescriptorStatus, CacheError> {
-    Ok(DescriptorStatus {
+fn status(code: Code, limit: &RateLimit, limit_remaining: u32, reset: i64) -> DescriptorStatus {
+    DescriptorStatus {
         code: code as i32,
         current_limit: Some(limit.limit.clone()),
         limit_remaining,
         duration_until_reset: Some(prost_types::Duration {
-            seconds: reset(limit, descriptor, now, calendar)?,
+            seconds: reset,
             nanos: 0,
         }),
         quota: None,
-    })
+    }
 }
 
 /// Whether a counter of `count` is over `limit`.
@@ -310,23 +311,22 @@ fn count_outcome(
     }
 }
 
-/// The status of `limit` for `descriptor`, its outcome counted in the limit's `stats`. A
-/// refund is always OK, with what remains. Otherwise it is over the limit when the counter
-/// exceeds it (or the local cache says so); the service then applies shadow mode.
+/// The status of `limit`, its outcome counted in the limit's `stats`, `reset` seconds from
+/// its window's end. A refund is always OK, with what remains. Otherwise it is over the limit
+/// when the counter exceeds it (or the local cache says so); the service then applies shadow
+/// mode.
 pub(crate) fn limit_status(
     (limit, stats, key): (&RateLimit, &RateLimitStats, &str),
-    descriptor: &RateLimitDescriptor,
     near_limit_ratio: f32,
     hits: Hits,
     count: Count,
-    now: i64,
-    calendar: bool,
-) -> Result<DescriptorStatus, CacheError> {
+    reset: i64,
+) -> DescriptorStatus {
     if !hits.refund {
         count_outcome(stats, limit, hits.value, count, near_limit_ratio);
     }
     let threshold = u64::from(limit.limit.requests_per_unit);
-    let answer = |code, remaining| status(code, limit, descriptor, remaining, now, calendar);
+    let answer = |code, remaining| status(code, limit, remaining, reset);
     match count {
         Count::After(after) if hits.refund => {
             return answer(Code::Ok, threshold.saturating_sub(after) as u32);

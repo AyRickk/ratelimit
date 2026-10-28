@@ -13754,3 +13754,268 @@ descriptors:
         h.at(1_000_000_000 + 60);
     }
 }
+
+const SESSION: &str = "
+domain: d
+descriptors:
+  - key: user
+    rate_limits:
+      - name: five_hour
+        requests_per_unit: 3
+        window: {type: anchored, duration: 5h, start_rounding: 1h}
+      - name: weekly
+        requests_per_unit: 50
+        window: {type: fixed, duration: 7d, offset: 4d}
+  - key: first
+    rate_limits:
+      - name: session
+        requests_per_unit: 3
+        window: {type: anchored, duration: 1h, open_on: first_hit}
+  - key: org
+    rate_limit: {unit: hour, requests_per_unit: 0}
+  - key: solo
+    rate_limits:
+      - name: five_hour
+        requests_per_unit: 3
+        window: {type: anchored, duration: 5h, start_rounding: 1h}
+";
+
+/// A hash's fields and values (`HGETALL`).
+async fn hash_fields(redis: &Redis, key: &str) -> BTreeMap<String, String> {
+    let flat: Vec<String> = redis
+        .client
+        .custom(
+            CustomCommand::new_static("HGETALL", ClusterHash::FirstKey, false),
+            vec![key],
+        )
+        .await
+        .unwrap();
+    flat.chunks(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect()
+}
+
+/// `request` with each descriptor's `hits_addend` set to `n`.
+fn hits(descriptors: &[&[(&str, &str)]], n: u64) -> RateLimitRequest {
+    let mut request = request("d", descriptors);
+    for descriptor in &mut request.descriptors {
+        descriptor.hits_addend = Some(n);
+    }
+    request
+}
+
+/// An anchored window (D9) opens with the first request, at the rounded hour, lasts its
+/// duration from there whatever comes, and the next request after it opens the next; its key
+/// holds the anchor and the count, until the window's end and a margin.
+#[tokio::test]
+async fn anchored_windows_open_on_a_request_and_last_their_duration() {
+    if !tools_available() {
+        return;
+    }
+    let settings = Settings {
+        service: ServiceSettings {
+            response_headers: Some(LimitHeaders::default()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Extended::start(SESSION, settings).await;
+    let alice: &[&[(&str, &str)]] = &[&[("user", "alice")]];
+    // 01:46:40 UTC: the window starts at 01:00 and ends at 06:00, in 15 200 s.
+    h.at(1_000_000_000);
+    assert_eq!(
+        h.statuses(hits(alice, 0)).await,
+        owned([("Ok", "five_hour", 3, 15_200)])
+    );
+    h.at(1_000_010_000);
+    assert_eq!(
+        h.statuses(hits(alice, 2)).await,
+        owned([("Ok", "five_hour", 1, 5_200)])
+    );
+    let response = h.call(hits(alice, 2)).await;
+    let headers: Vec<(String, String)> = response
+        .response_headers_to_add
+        .iter()
+        .map(|h| (h.key.clone(), h.value.clone()))
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            ("RateLimit-Limit".to_string(), "3".to_string()),
+            ("RateLimit-Remaining".to_string(), "0".to_string()),
+            ("RateLimit-Reset".to_string(), "5200".to_string()),
+        ]
+    );
+    let key = "{d_user_alice_}_an18000r3600_five_hour";
+    let fields = hash_fields(&h.redis, key).await;
+    assert_eq!(
+        fields,
+        BTreeMap::from([("a".into(), "999997200".into()), ("c".into(), "4".into())])
+    );
+    let ttl: i64 = h.redis.client.ttl(key).await.unwrap();
+    // Set when the window opened: its end, 15 200 s later, and the margin.
+    assert!((15_200 + 60 - 5..=15_200 + 60).contains(&ttl), "{ttl}");
+    // 06:00: closed; this request opens the next window, at 06:00, and counts in it.
+    h.at(999_997_200 + 18_000);
+    assert_eq!(
+        h.statuses(hits(alice, 1)).await,
+        owned([("Ok", "five_hour", 2, 18_000)])
+    );
+    let fields = hash_fields(&h.redis, key).await;
+    assert_eq!(fields["a"], "1000015200");
+    // Hits past 2^53 saturate there, still over the limit, never wrapping below it.
+    for _ in 0..2 {
+        assert_eq!(
+            h.statuses(hits(alice, u64::MAX)).await,
+            owned([("OverLimit", "five_hour", 0, 18_000)])
+        );
+    }
+    assert_eq!(
+        hash_fields(&h.redis, key).await["c"],
+        (1u64 << 53).to_string()
+    );
+}
+
+/// `open_on: first_hit`: a 0-hit check leaves the window closed (and answers for the full
+/// budget and duration); the first counted hit opens it.
+#[tokio::test]
+async fn first_hit_windows_wait_for_counted_hits() {
+    if !tools_available() {
+        return;
+    }
+    let h = Extended::start(SESSION, Settings::default()).await;
+    let first: &[&[(&str, &str)]] = &[&[("first", "x")]];
+    h.at(1_000_000_000);
+    assert_eq!(
+        h.statuses(hits(first, 0)).await,
+        owned([("Ok", "session", 3, 3_600)])
+    );
+    assert!(h.keys().await.is_empty(), "{:?}", h.keys().await);
+    h.at(1_000_000_100);
+    assert_eq!(
+        h.statuses(hits(first, 1)).await,
+        owned([("Ok", "session", 2, 3_600)])
+    );
+    h.at(1_000_000_200);
+    assert_eq!(
+        h.statuses(hits(first, 0)).await,
+        owned([("Ok", "session", 2, 3_500)])
+    );
+}
+
+/// A window a denied request opens without hits stays open with its whole budget, for hits
+/// that will not come: counted in `opened_without_hits` (D9). One opened by a request that
+/// passes is not: its hits follow.
+#[tokio::test]
+async fn windows_opened_without_hits_are_counted() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
+    let h = Extended::start(SESSION, Settings::default()).await;
+    h.at(1_000_000_000);
+    // A 0-hit check of `alice` and `org`, which allows nothing: it passes (0 is not over 0).
+    let response = h
+        .call(hits(&[&[("user", "alice")], &[("org", "o")]], 0))
+        .await;
+    assert_eq!(response.overall_code(), Code::Ok);
+    // `bob`'s 0-hit check with a hit on `org`: denied.
+    let mut denied = hits(&[&[("user", "bob")], &[("org", "o")]], 0);
+    denied.descriptors[1].hits_addend = Some(1);
+    assert_eq!(h.call(denied.clone()).await.overall_code(), Code::OverLimit);
+    // Again: `bob`'s window is already open.
+    assert_eq!(h.call(denied).await.overall_code(), Code::OverLimit);
+    assert_eq!(
+        h.stats()
+            .get("ratelimit.service.rate_limit.d.user~five_hour.opened_without_hits"),
+        Some(&1)
+    );
+    // Upstream's limits never show it.
+    assert!(
+        !h.subject
+            .stats
+            .snapshot()
+            .keys()
+            .any(|k| k.contains("org") && k.contains("opened"))
+    );
+}
+
+/// D32.4: the Redis script decides every request as [`AnchoredWindow::step`] does, over a
+/// random sequence of checks, hits and refunds, both windows' kinds.
+#[tokio::test]
+async fn the_anchored_script_steps_like_the_rust_window() {
+    if !tools_available() {
+        return;
+    }
+    use ratelimit::config::window::{Anchored, AnchoredOp, AnchoredWindow, OpenOn};
+    let h = Extended::start(SESSION, Settings::default()).await;
+    let windows = [
+        (
+            "solo",
+            "five_hour",
+            AnchoredWindow {
+                duration: 18_000,
+                rounding: Some(3_600),
+                open_on: OpenOn::Check,
+            },
+        ),
+        (
+            "first",
+            "session",
+            AnchoredWindow {
+                duration: 3_600,
+                rounding: None,
+                open_on: OpenOn::FirstHit,
+            },
+        ),
+    ];
+    // A fixed-seed LCG: the same sequence each run.
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    for (key, name, window) in windows {
+        let mut state: Option<Anchored> = None;
+        let mut now: i64 = 1_000_000_000;
+        for step in 0..400 {
+            // Mostly small steps, sometimes past the window, sometimes back in time.
+            now += match next(10) {
+                0 => window.duration + next(7_200) as i64,
+                1 => -(next(600) as i64),
+                _ => next(900) as i64,
+            };
+            let op = AnchoredOp {
+                now,
+                hits: match next(4) {
+                    0 => 0,
+                    _ => next(5),
+                },
+                refund: next(6) == 0,
+            };
+            let expected = window.step(state, op);
+            state = expected.state;
+            h.at(now);
+            let mut request = hits(&[&[(key, "k")]], op.hits);
+            request.descriptors[0].is_negative_hits = op.refund;
+            let status = h.call(request).await.statuses[0].clone();
+            let limit = 3u64;
+            let count = expected.window.map_or(0, |w| w.count);
+            let remaining = match op.refund {
+                true => limit.saturating_sub(count),
+                false if count > limit => 0,
+                false => limit - count,
+            };
+            assert_eq!(
+                (
+                    status.limit_remaining as u64,
+                    status.duration_until_reset.unwrap().seconds
+                ),
+                (remaining, window.reset(expected.window, now)),
+                "{name}, step {step}: {op:?} after {state:?}"
+            );
+        }
+    }
+}

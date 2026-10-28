@@ -14,7 +14,6 @@ use crate::service::RateLimitService;
 use crate::settings::{Lookup, Settings};
 use crate::stats::{self, Stats};
 use crate::xds::XdsProvider;
-use ratelimit_proto::envoy::service::ratelimit::v3::rate_limit_response::DescriptorStatus;
 use std::sync::{Arc, Mutex};
 
 /// `configureLogger`: the level (a fatal error, written before the format is set), then
@@ -624,7 +623,7 @@ impl crate::service::RateLimitCache for Backend {
         &self,
         request: &ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest,
         limits: &[Vec<crate::config::RateLimit>],
-    ) -> Result<Vec<Vec<DescriptorStatus>>, crate::service::CacheError> {
+    ) -> Result<Vec<Vec<crate::service::LimitOutcome>>, crate::service::CacheError> {
         match self {
             Backend::Redis(cache) => cache.do_limit(request, limits).await,
             Backend::Memcache(cache) => cache.do_limit(request, limits).await,
