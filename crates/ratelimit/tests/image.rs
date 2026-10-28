@@ -324,3 +324,31 @@ async fn the_image_serves_like_upstreams() {
         assert_eq!(ours, upstream, "IPv6 enabled: {ipv6}");
     }
 }
+
+/// LICENSE, NOTICE and the crates' licenses (cargo-about) in `/usr/share/doc/ratelimit`
+/// (docs/design.md D34).
+#[test]
+fn the_image_ships_its_licenses() {
+    let Ok(image) = std::env::var("RATELIMIT_IMAGE") else {
+        return;
+    };
+    let id = container(&["create", &image]);
+    let _created = Created::Container(id.clone());
+    let dir = std::env::temp_dir().join(format!("ratelimit-licenses-{}", std::process::id()));
+    let _dir = Created::Directory(dir.clone());
+    container(&[
+        "cp",
+        &format!("{id}:/usr/share/doc/ratelimit"),
+        &dir.to_string_lossy(),
+    ]);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in ["LICENSE", "NOTICE"] {
+        let expected = std::fs::read_to_string(root.join(name)).unwrap();
+        assert_eq!(read(name), expected, "{name}");
+    }
+    let crates = read("THIRD-PARTY-LICENSES.txt");
+    for used in ["- tokio ", "- tonic ", "- fred ", "- rustls "] {
+        assert!(crates.contains(used), "{used} missing");
+    }
+}
