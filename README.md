@@ -8,7 +8,7 @@
 
 A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit), compatible with it at commit [`f4e7669`](https://github.com/envoyproxy/ratelimit/commit/f4e7669), and extended with several windows per descriptor for LLM quotas.
 
-To replace envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway, you only change the image. The environment variables, the YAML configuration, the gRPC and HTTP API, the metrics, the log lines and the image's layout stay the same.
+To replace envoy ratelimit behind Envoy, Envoy Gateway or agentgateway, you only change the image. The environment variables, the YAML configuration, the gRPC and HTTP API, the metrics, the log lines and the image's layout stay the same.
 
 ## Why
 
@@ -97,14 +97,11 @@ The extensions are listed in [`docs/parity.md`](docs/parity.md) §8:
 
 ## Documentation
 
-- [`docs/configuration.md`](docs/configuration.md): configuring `rate_limits:` lists and their `fixed` and `anchored` windows, and running the service.
-- [`docs/quota-lookup.md`](docs/quota-lookup.md): the `POST /quota` API.
-- [`docs/agentgateway.md`](docs/agentgateway.md): LLM token quotas behind agentgateway.
-- [`docs/design.md`](docs/design.md): the goal and every design decision.
-- [`docs/parity.md`](docs/parity.md): what is proven against upstream, the deliberate divergences, and the extensions.
-- [`docs/adr/`](docs/adr): the decisions that are hard to reverse: storage keys, window origins, the quota lookup.
-- [`GLOSSARY.md`](GLOSSARY.md): the domain's words: decision, check, amendment, anchored window, …
-- [`CHANGELOG.md`](CHANGELOG.md): the changes in each release.
+The full documentation is in [`docs/`](docs/README.md):
+
+- **Reference:** [configuration](docs/configuration.md), [environment variables](docs/environment.md), [API](docs/api.md), [quota lookup](docs/quota-lookup.md), [backends](docs/backends.md), [observability](docs/observability.md), [deployment](docs/deployment.md).
+- **Examples:** [Envoy](docs/examples/envoy.md), [agentgateway LLM quotas](docs/examples/agentgateway.md).
+- **Design:** [design decisions](docs/design.md), [parity with upstream](docs/parity.md), [ADRs](docs/adr), [glossary](GLOSSARY.md), [changelog](CHANGELOG.md).
 
 ## Releases and verification
 

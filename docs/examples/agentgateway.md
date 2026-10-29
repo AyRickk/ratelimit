@@ -1,6 +1,6 @@
-# LLM token quotas behind agentgateway
+# Example: LLM token quotas behind agentgateway
 
-This guide puts the service behind [agentgateway](https://github.com/agentgateway/agentgateway) to give each user Claude-style quotas on a self-hosted model:
+This example puts the service behind [agentgateway](https://github.com/agentgateway/agentgateway) to give each user Claude-style quotas on a self-hosted model:
 
 - a five-hour session that opens at the user's first message;
 - a weekly budget, reset on a day of its own per user;
@@ -30,7 +30,7 @@ sequenceDiagram
 
 agentgateway sends two decisions per LLM request on a `tokens` descriptor:
 
-1. **A check, before the model is called.** It is enforced: an `OVER_LIMIT` answers the user with `429`, `x-ratelimit-*` headers and `retry-after`. Its hits are the estimated input tokens, which is 0 unless agentgateway's tokenization is on, or 0 when a `cost` expression is set.
+1. **A check, before the model is called.** It is enforced: an `OVER_LIMIT` answers the user with `429`, `x-ratelimit-*` headers and `retry-after`. It carries 0 hits, unless agentgateway's tokenization is on and no `cost` is set: then it carries the estimated input tokens.
 2. **An amendment, after the response.** It carries the tokens actually used, and agentgateway does not read its result. It is sent on errors and dropped streams too.
 
 So the limits must count every hit, denied ones included, which is `overflow: envoy`, the default. The session must open on the 0-hit check, which is `open_on: check`, also the default.
@@ -51,7 +51,7 @@ descriptors:
         window: {type: fixed, duration: 7d, offset: hashed}
 ```
 
-Each value of `user` gets its own session and its own weekly window ([configuration](configuration.md#windows)). Run the service with Redis, since `anchored` windows need it. Set `RUNTIME_WATCH_ROOT=false` so that edits to the file, or a Kubernetes ConfigMap update, are reloaded:
+Each value of `user` gets its own session and its own weekly window ([configuration](../configuration.md#windows)). Run the service with Redis, since `anchored` windows need it. Set `RUNTIME_WATCH_ROOT=false` so that edits to the file are reloaded; with a Kubernetes ConfigMap, also set `RUNTIME_IGNOREDOTFILES=true` ([deployment](../deployment.md#kubernetes)):
 
 ```sh
 RUNTIME_SUBDIRECTORY=ratelimit RUNTIME_WATCH_ROOT=false USE_STATSD=false \
@@ -67,7 +67,7 @@ llm:
   port: 4000
   policies:
     jwtAuth:
-      mode: strict                          # the default, optional, lets requests without a token through
+      mode: strict                          # the default mode, optional, would let requests without a token through
       issuer: https://issuer.example
       audiences: [llm]
       jwks:
@@ -115,7 +115,7 @@ binds:
       - host: ratelimit:8080                # HTTP
 ```
 
-- **The `/v1/quota` route's descriptors** must match the ones `remoteRateLimit` sends: the same domain, the same keys, and the values from the same claims. Otherwise the lookup reports on other limits ([why](quota-lookup.md#request)).
+- **The `/v1/quota` route's descriptors** must match the ones `remoteRateLimit` sends: the same domain, the same keys, and the values from the same claims. Otherwise the lookup reports on other limits ([why](../quota-lookup.md#request)).
 - **`failureMode`** defaults to `failClosed`, so requests fail while the service is unreachable. Set `failureMode: failOpen` to let them through instead.
 - **A descriptor whose CEL fails is skipped.** If, for example, the token has no `sub`, that request goes unlimited.
 - **Negative amendments are not sent.** When agentgateway's tokenization estimates more input tokens than were used, the difference stays counted.

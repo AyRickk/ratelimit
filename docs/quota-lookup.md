@@ -23,7 +23,7 @@ curl -s localhost:8080/quota -d '{
 - **Same descriptors:** send the ones your real requests send. `replaces` works across the request's descriptors, so another set can show limits the real requests do not have, or hide ones they do.
 - **Ignored fields:** `hits_addend` and `is_negative_hits`.
 - **A descriptor's `limit`:** a client-sent limit replaces the configured ones, as in a decision.
-- **Authentication:** none. The route is for internal callers, so expose it to users through your gateway, behind its authentication, with the descriptors built from the caller's identity ([agentgateway guide](agentgateway.md)).
+- **Authentication:** none. The route is for internal callers, so expose it to users through your gateway, behind its authentication, with the descriptors built from the caller's identity ([agentgateway guide](examples/agentgateway.md)).
 
 ## Response
 
