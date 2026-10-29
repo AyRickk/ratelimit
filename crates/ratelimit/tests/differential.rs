@@ -10771,6 +10771,19 @@ impl RedisCluster {
     }
 }
 
+/// Waits for the next hour when less than `margin` is left of this one: a test whose counters
+/// of an hour must stay in one window, on both binaries.
+async fn clear_of_an_hour_boundary(margin: std::time::Duration) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let left = std::time::Duration::from_secs(3600 - now.as_secs() % 3600)
+        - std::time::Duration::from_nanos(now.subsec_nanos().into());
+    if left < margin {
+        tokio::time::sleep(left + std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Waits for the start of the next second of the system's clock.
 async fn at_a_new_second() {
     let now = std::time::SystemTime::now()
@@ -10913,6 +10926,8 @@ async fn cluster_runs(
     variables: &[(&'static str, String)],
     masked: &[(String, &str)],
 ) {
+    // Both binaries' counters of an hour, their pools filling: a minute or two.
+    clear_of_an_hour_boundary(std::time::Duration::from_secs(180)).await;
     let upstream = cluster_run(&upstream_binary(), cluster, variables, masked).await;
     let ours = cluster_run(
         std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
@@ -11304,6 +11319,8 @@ fn a_redis_sentinel_serves_like_upstream() {
 }
 
 async fn sentinel_serves_like_upstream() {
+    // Both binaries' counters of an hour, a failover each: a few minutes at most.
+    clear_of_an_hour_boundary(std::time::Duration::from_secs(300)).await;
     let runtime = temp_dir("sentinel-runtime");
     write_tree(
         &runtime,
