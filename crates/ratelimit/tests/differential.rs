@@ -5118,6 +5118,85 @@ async fn sigterm_turns_health_off_like_upstream() {
     assert_eq!(seen[1], seen[0]);
 }
 
+/// While Redis is down, every decision fails at once with upstream's gRPC status and radix's
+/// error, so that Envoy and agentgateway apply their failure mode. Upstream fails one decision
+/// per pooled connection, then waits for Redis (radix's `WAIT` pool): a deliberate divergence
+/// (docs/parity.md §7). Once Redis is back, decisions succeed again.
+#[tokio::test]
+async fn decisions_fail_at_once_while_redis_is_down() {
+    if !tools_available() {
+        return;
+    }
+    let runtime = temp_dir("redis-down");
+    write_tree(
+        &runtime,
+        &[
+            ("v1/ratelimit/config/llm.yaml", LLM_CONFIG),
+            ("current", b"->v1"),
+        ],
+    );
+    let (services, redis) = both_services(|redis| binary_environment(&runtime, redis)).await;
+    let decide = |service: &Service| {
+        let grpc = service.grpc.clone();
+        async move {
+            let mut client = RateLimitServiceClient::connect(grpc).await.unwrap();
+            let call = client.should_rate_limit(request("llm", &[&[("user", "alice")]]));
+            match tokio::time::timeout(std::time::Duration::from_secs(5), call).await {
+                Ok(Ok(response)) => format!("{:?}", response.into_inner().overall_code),
+                Ok(Err(status)) => format!("{:?}: {}", status.code(), status.message()),
+                Err(_) => "no answer within 5 s".to_string(),
+            }
+        }
+    };
+    for service in &services {
+        assert_eq!(decide(service).await, "1", "{}", service.grpc);
+    }
+    for redis in &redis {
+        let _: Result<(), _> = redis
+            .client
+            .custom(
+                CustomCommand::new_static("SHUTDOWN", ClusterHash::Random, false),
+                vec!["NOSAVE"],
+            )
+            .await;
+    }
+    // radix's message for the connection Redis closed: `EOF`, or the socket's own error.
+    let failed = "Unknown: response returned from Conn: ";
+    // Upstream fails a decision per pooled connection left (REDIS_POOL_SIZE, 10; its pings
+    // drop some meanwhile), then waits for Redis.
+    let mut upstream_failures = 0;
+    for attempt in 0..12 {
+        let ours = decide(&services[1]).await;
+        assert_eq!(ours, format!("{failed}EOF"), "decision {attempt}");
+        let upstream = decide(&services[0]).await;
+        if upstream == "no answer within 5 s" {
+            break;
+        }
+        assert!(upstream.starts_with(failed), "{attempt}: {upstream}");
+        upstream_failures += 1;
+    }
+    assert!(
+        (1..=10).contains(&upstream_failures),
+        "upstream failed {upstream_failures} decisions before waiting"
+    );
+    let mut restarted = Vec::new();
+    for redis in &redis {
+        let port = redis.address.rsplit_once(':').unwrap().1.parse().unwrap();
+        restarted.push(Redis::start_on(port).await.expect("Redis restarted"));
+    }
+    for service in &services {
+        let mut answer = String::new();
+        for _ in 0..150 {
+            answer = decide(service).await;
+            if answer == "1" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(answer, "1", "{} once Redis is back", service.grpc);
+    }
+}
+
 /// With REDIS_HEALTH_CHECK_ACTIVE_CONNECTION, losing Redis makes the service unhealthy;
 /// without it, health does not follow Redis.
 #[tokio::test]
@@ -9386,7 +9465,6 @@ async fn grpc_over_tls_is_served_like_upstream() {
         std::fs::read_to_string(&other.client_key).unwrap(),
     );
     let ca = pki.ca.to_string_lossy().into_owned();
-    let redis = Redis::start().await;
     // The client CA, the client SAN, and whether ALPN is enforced (grpc-go's default).
     let clients: [(&str, Option<&str>, &str); 7] = [
         ("", None, ""),
@@ -9406,6 +9484,8 @@ async fn grpc_over_tls_is_served_like_upstream() {
         ] {
             let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
             let statsd = StatsdServer::start().await;
+            // A Redis of its own: the decision below is the first hit, whatever the minute.
+            let redis = Redis::start().await;
             let mut environment = binary_environment(&runtime, &redis);
             environment.retain(|(k, _)| *k != "LOG_LEVEL" && *k != "DISABLE_STATS");
             environment.extend([
@@ -9471,6 +9551,7 @@ async fn grpc_over_tls_is_served_like_upstream() {
                 (format!(":{grpc}'"), ":GRPC'"),
                 (format!(":{http}'"), ":HTTP'"),
                 (format!(":{debug}"), ":DEBUG"),
+                (redis.address.clone(), "REDIS"),
             ];
             let lines: Vec<String> = logrus_lines(&stderr, &replace)
                 .into_iter()
@@ -10803,7 +10884,8 @@ async fn cluster_run(
         ),
     ];
     let mut pools = BTreeMap::new();
-    for _ in 0..30 {
+    // Up to 30 s: a loaded machine can take several topology refreshes.
+    for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         pools = stat_values(&statsd.lines.lock().unwrap(), |name| {
             name.contains("_pool.")
