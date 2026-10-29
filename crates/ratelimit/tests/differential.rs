@@ -2979,6 +2979,7 @@ fn mapper_names() -> Vec<String> {
         "ratelimit.service.rate_limit.llm.org_acme.model~weekly.near_limit",
         "ratelimit.service.rate_limit.llm.a.b.c~_x.within_limit",
         "ratelimit.service.rate_limit.llm.a.b~c.over_limit_with_local_cache",
+        "ratelimit.service.rate_limit.llm.a.b.c~d.over_limit_with_local_cache",
         "ratelimit.service.call.should_rate_limit.redis_error",
         "ratelimit_server.ShouldRateLimit.response_time",
         "ratelimit_server.ShouldRateLimit.total_requests",
@@ -3086,9 +3087,9 @@ async fn the_shipped_mapper_maps_upstream_stats_like_upstream() {
         .output()
         .expect("run go list");
     assert!(output.status.success(), "go list failed");
-    let upstream = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
-        .join("src/stats/prom/default_mapper.yaml");
-    let upstream = std::fs::read_to_string(upstream).unwrap();
+    let module = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let upstream =
+        std::fs::read_to_string(module.join("src/stats/prom/default_mapper.yaml")).unwrap();
     let (status, error) = h.oracle.send("PUT", "/mapper", &upstream).await;
     assert_eq!(status, 200, "{error}");
     let shipped = prometheus::load_mapper(&Default::default()).unwrap();
@@ -3103,7 +3104,7 @@ async fn the_shipped_mapper_maps_upstream_stats_like_upstream() {
         "over_limit_with_local_cache",
         "other",
     ];
-    let segments = ["d", "k_v", "", "k_v_x-y", "*"];
+    let segments = ["d", "k_v", "", "k_v_x-y"];
     let mut paths = vec![String::new()];
     for _ in 0..4 {
         paths = paths

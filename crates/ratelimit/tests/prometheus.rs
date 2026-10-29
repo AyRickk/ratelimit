@@ -194,4 +194,18 @@ fn the_default_mapper_labels_list_limits() {
             assert_eq!(mapping.labels, expected, "{name}");
         }
     }
+    // Deeper, as upstream's deeper rules do, the local cache's denials count as `over_limit`.
+    let cached =
+        "ratelimit.service.rate_limit.llm.org_acme.model~weekly.over_limit_with_local_cache";
+    let mapping = mapper.get_mapping(cached, MetricType::Counter).unwrap();
+    assert_eq!(mapping.name, "ratelimit_service_rate_limit_over_limit");
+    assert_eq!(
+        mapping.labels,
+        labels(&[
+            ("domain", "llm"),
+            ("key1", "org_acme"),
+            ("key2", "model"),
+            ("limit", "weekly"),
+        ])
+    );
 }
