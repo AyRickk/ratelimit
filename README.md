@@ -46,7 +46,7 @@ docker network create rl
 docker run -d --name redis --network rl redis:8
 docker run -d --name ratelimit --network rl -p 8080:8080 -p 8081:8081 \
   -v "$PWD/runtime:/srv/runtime_data/current:ro" \
-  -e RUNTIME_SUBDIRECTORY=ratelimit -e USE_STATSD=false \
+  -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false -e USE_STATSD=false \
   -e REDIS_SOCKET_TYPE=tcp -e REDIS_URL=redis:6379 \
   ghcr.io/ayrickk/ratelimit:0.1.0
 ```
@@ -97,6 +97,9 @@ The extensions are listed in [`docs/parity.md`](docs/parity.md) §8:
 
 ## Documentation
 
+- [`docs/configuration.md`](docs/configuration.md): configuring `rate_limits:` lists and their `fixed` and `anchored` windows, and running the service.
+- [`docs/quota-lookup.md`](docs/quota-lookup.md): the `POST /quota` API.
+- [`docs/agentgateway.md`](docs/agentgateway.md): LLM token quotas behind agentgateway.
 - [`docs/design.md`](docs/design.md): the goal and every design decision.
 - [`docs/parity.md`](docs/parity.md): what is proven against upstream, the deliberate divergences, and the extensions.
 - [`docs/adr/`](docs/adr): the decisions that are hard to reverse: storage keys, window origins, the quota lookup.
