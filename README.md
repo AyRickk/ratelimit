@@ -5,8 +5,20 @@ A Rust rewrite of [envoyproxy/ratelimit](https://github.com/envoyproxy/ratelimit
 ## Status
 
 - **Compatibility:** every behaviour listed in [`docs/parity.md`](docs/parity.md) is proven by a test that runs upstream's binary and this one side by side and compares their answers, Redis or Memcached keys, stats and logs. The few places where this service differs on purpose (an upstream panic becomes an error, a stricter TLS client check, …) are listed in its §7.
-- **Extensions (not built yet):** several limits per descriptor (`rate_limits:`), windows of any duration (`fixed` with an `offset`), plus the `anchored`, `sliding` and `token_bucket` window types and the `overflow: envoy | strict` counting modes. They are designed in [`docs/design.md`](docs/design.md) and its ADRs, and are opt-in: a configuration upstream accepts keeps working the same.
-- **Releases:** none yet. The first one is `v0.1.0`, once the extensions are in. It will be published as `ghcr.io/ayrickk/ratelimit` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign.
+- **Extensions:** opt-in, so a configuration upstream accepts keeps working the same. They are designed in [`docs/design.md`](docs/design.md) and its ADRs, and listed in [`docs/parity.md`](docs/parity.md) §8:
+  - several named limits per descriptor (`rate_limits:`);
+  - `fixed` windows of any duration, with an `offset` (constant or hashed from the descriptor);
+  - `anchored` windows, opened by a request and lasting their duration (an LLM's five-hour session);
+  - a quota lookup, `POST /quota`, which shows every limit's usage and reset without counting ([ADR 0003](docs/adr/0003-quota-lookup.md)).
+
+  Not built yet: the `sliding` and `token_bucket` windows and `overflow: strict`, refused at load.
+- **Releases:** images are published as `ghcr.io/ayrickk/ratelimit:<version>` for linux/amd64 and linux/arm64, with an SBOM and provenance, signed with cosign (keyless):
+
+  ```sh
+  cosign verify ghcr.io/ayrickk/ratelimit:0.1.0 \
+    --certificate-identity https://github.com/AyRickk/ratelimit/.github/workflows/release.yml@refs/tags/v0.1.0 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
 
 ## Supported
 
