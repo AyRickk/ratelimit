@@ -9465,7 +9465,6 @@ async fn grpc_over_tls_is_served_like_upstream() {
         std::fs::read_to_string(&other.client_key).unwrap(),
     );
     let ca = pki.ca.to_string_lossy().into_owned();
-    let redis = Redis::start().await;
     // The client CA, the client SAN, and whether ALPN is enforced (grpc-go's default).
     let clients: [(&str, Option<&str>, &str); 7] = [
         ("", None, ""),
@@ -9485,6 +9484,8 @@ async fn grpc_over_tls_is_served_like_upstream() {
         ] {
             let (grpc, http, debug) = (reserved_port(), reserved_port(), reserved_port());
             let statsd = StatsdServer::start().await;
+            // A Redis of its own: the decision below is the first hit, whatever the minute.
+            let redis = Redis::start().await;
             let mut environment = binary_environment(&runtime, &redis);
             environment.retain(|(k, _)| *k != "LOG_LEVEL" && *k != "DISABLE_STATS");
             environment.extend([
@@ -9550,6 +9551,7 @@ async fn grpc_over_tls_is_served_like_upstream() {
                 (format!(":{grpc}'"), ":GRPC'"),
                 (format!(":{http}'"), ":HTTP'"),
                 (format!(":{debug}"), ":DEBUG"),
+                (redis.address.clone(), "REDIS"),
             ];
             let lines: Vec<String> = logrus_lines(&stderr, &replace)
                 .into_iter()
@@ -10882,7 +10884,8 @@ async fn cluster_run(
         ),
     ];
     let mut pools = BTreeMap::new();
-    for _ in 0..30 {
+    // Up to 30 s: a loaded machine can take several topology refreshes.
+    for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         pools = stat_values(&statsd.lines.lock().unwrap(), |name| {
             name.contains("_pool.")
