@@ -12,7 +12,7 @@ To replace envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway, y
 
 ## Why
 
-- **Proven compatible.** Every behaviour in [`docs/parity.md`](docs/parity.md) is checked by a test that runs upstream's binary and this one side by side. It compares their answers, Redis and Memcached keys, stats and logs, on Redis and on Valkey.
+- **Proven compatible.** Every upstream behaviour in [`docs/parity.md`](docs/parity.md) §1–6 has a test, most of them differential: upstream's binary and this one run side by side, and their answers, Redis and Memcached keys, stats and logs are compared, on Redis and on Valkey.
 - **Quotas the way LLM providers count them.** Several named limits per descriptor: a five-hour session that the first request opens, plus a weekly window, each with its own name in headers and metrics.
 - **A quota lookup.** `POST /quota` shows every limit's usage and reset, without counting anything, so users can see "Session 40 % · resets in 2 h 05".
 - **A small, hardened image.** It is distroless, runs as any UID on a read-only file system, and is signed with cosign, with an SBOM and provenance.
@@ -21,7 +21,7 @@ To replace envoy ratelimit behind Envoy, Envoy Gateway, Istio or agentgateway, y
 
 - It is young (v0.1.0) and has a single maintainer. The upstream project has years of production use.
 - `sliding` and `token_bucket` windows and `overflow: strict` are designed but not built yet, and are refused at load.
-- Where this service differs on purpose (an upstream panic becomes an error at startup, a stricter TLS check, …), the difference is listed in [`docs/parity.md`](docs/parity.md) §7.
+- Where this service differs on purpose (where upstream panics, an error at startup or on the request; a stricter TLS check; …), the difference is listed in [`docs/parity.md`](docs/parity.md) §7.
 
 ## Quick start
 
@@ -66,9 +66,10 @@ And the quota lookup, which counts nothing:
 curl -s localhost:8080/quota -d '{"domain":"llm","descriptors":[{"entries":[{"key":"user","value":"alice"}]}]}'
 ```
 ```json
-{"now":"2026-10-29T19:01:29Z","descriptors":[{"limits":[
-  {"name":"session","window":{"type":"anchored","duration_s":18000},"limit":4000000,"used":1200,"remaining":3998800,"used_pct":0.0,"open":true,"resets_at":"2026-10-30T00:01:29Z","resets_in_s":18000,"shadow_mode":false,"quota_mode":false},
-  {"name":"weekly","window":{"type":"fixed","duration_s":604800},"limit":40000000,"used":1200,"remaining":39998800,"used_pct":0.0,"resets_at":"2026-11-02T23:00:00Z","resets_in_s":359911,"shadow_mode":false,"quota_mode":false}]}]}
+{"descriptors":[{"limits":[
+  {"limit":4000000,"name":"session","open":true,"quota_mode":false,"remaining":3998800,"resets_at":"2026-10-30T00:01:29Z","resets_in_s":18000,"shadow_mode":false,"used":1200,"used_pct":0.0,"window":{"duration_s":18000,"type":"anchored"}},
+  {"limit":40000000,"name":"weekly","quota_mode":false,"remaining":39998800,"resets_at":"2026-11-02T23:00:00Z","resets_in_s":359911,"shadow_mode":false,"used":1200,"used_pct":0.0,"window":{"duration_s":604800,"type":"fixed"}}]}],
+ "now":"2026-10-29T19:01:29Z"}
 ```
 
 ## Migrating from envoyproxy/ratelimit

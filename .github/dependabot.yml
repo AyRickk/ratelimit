@@ -20,3 +20,7 @@ updates:
     directory: /
     schedule: {interval: weekly}
     cooldown: {default-days: 7}
+    ignore:
+      # Rust moves with rust-version and CI's toolchain, on purpose; digests still update.
+      - dependency-name: docker.io/library/rust
+        update-types: [version-update:semver-minor, version-update:semver-major]

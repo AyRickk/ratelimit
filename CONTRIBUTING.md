@@ -26,10 +26,10 @@ The differential tests build upstream's service at the commit pinned in [`tools/
 
 1. **Tests first.** Write a test that fails without your change: a differential scenario for upstream behaviour, or a test through the public interface for an extension. Tests use the domain's words ([`GLOSSARY.md`](GLOSSARY.md)).
 2. **Docs.** Mark the rows of `docs/parity.md` your change proves (✅ with the test names), or add a §7 row for a deliberate divergence.
-3. **Commits and PR titles** follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat(redis): …`, `fix: …`, `docs: …`). `main` has a linear history: PRs are squash-merged, so the title becomes the commit subject.
+3. **Commits and PR titles** follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat(redis): …`, `fix: …`, `docs: …`). `main` has a linear history: PRs are squash-merged (the title becomes the commit subject) or rebase-merged (each commit must then follow the convention).
 4. **The PR** fills the template: what changes, the evidence (the test that failed and now passes), and whether the change is easy to revert.
 
-All CI checks must pass: `check`, `rust (redis)` and `rust (valkey)`. Everything in the repository is written in English.
+The required checks must pass: `check`, `rust (redis)` and `rust (valkey)`. Everything in the repository is written in English.
 
 ## License
 

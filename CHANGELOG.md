@@ -10,7 +10,7 @@ The first release.
 
 ### Added
 
-- **Upstream parity:** a drop-in replacement for envoyproxy/ratelimit at commit `f4e7669`. Every behaviour is proven against upstream by differential tests, on Redis and Valkey; the details are in `docs/parity.md` §1–6.
+- **Upstream parity:** a drop-in replacement for envoyproxy/ratelimit at commit `f4e7669`. Every upstream behaviour has a test, most of them differential (upstream's binary and this one side by side, on Redis and Valkey); the details are in `docs/parity.md` §1–6.
   - **Configuration:** the same environment variables and YAML configuration, from files with hot reload or from xDS.
   - **API:** the gRPC and HTTP API, the `LIMIT_*` headers and dynamic metadata.
   - **Backends:** Redis (single, sentinel, cluster, TLS, AWS IAM, per-second pool) and Memcached.
@@ -25,7 +25,7 @@ The first release.
 
 ### Deliberate divergences
 
-- **Startup errors:** where upstream panics, this service reports an error at startup, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
+- **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
 
 [Unreleased]: https://github.com/AyRickk/ratelimit/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/AyRickk/ratelimit/releases/tag/v0.1.0
