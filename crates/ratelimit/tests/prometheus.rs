@@ -137,3 +137,61 @@ fn the_default_mapper_maps_quota_lookup_stats() {
         .unwrap();
     assert_eq!(time.scale, None);
 }
+
+/// The shipped mapper splits a list limit's `~name` into a `limit` label (D29), at one key
+/// and deeper, for every counter a list limit emits, `opened_without_hits` included.
+#[test]
+fn the_default_mapper_labels_list_limits() {
+    use ratelimit::stats::prometheus::MetricType;
+    let mapper = prometheus::load_mapper(&PrometheusSettings::default()).unwrap();
+    let labels = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    for stat in [
+        "near_limit",
+        "over_limit",
+        "total_hits",
+        "within_limit",
+        "shadow_mode",
+        "opened_without_hits",
+    ] {
+        let cases = [
+            (
+                format!("ratelimit.service.rate_limit.llm.user~five_hour.{stat}"),
+                labels(&[("domain", "llm"), ("key1", "user"), ("limit", "five_hour")]),
+            ),
+            (
+                format!("ratelimit.service.rate_limit.llm.user_a~b~week-1.{stat}"),
+                labels(&[("domain", "llm"), ("key1", "user_a~b"), ("limit", "week-1")]),
+            ),
+            (
+                format!("ratelimit.service.rate_limit.llm.org_acme.model~weekly.{stat}"),
+                labels(&[
+                    ("domain", "llm"),
+                    ("key1", "org_acme"),
+                    ("key2", "model"),
+                    ("limit", "weekly"),
+                ]),
+            ),
+            (
+                format!("ratelimit.service.rate_limit.llm.org.team.user~daily.{stat}"),
+                labels(&[
+                    ("domain", "llm"),
+                    ("key1", "org"),
+                    ("key2", "team"),
+                    ("limit", "daily"),
+                ]),
+            ),
+        ];
+        for (name, expected) in cases {
+            let mapping = mapper
+                .get_mapping(&name, MetricType::Counter)
+                .unwrap_or_else(|| panic!("{name} unmapped"));
+            assert_eq!(mapping.name, format!("ratelimit_service_rate_limit_{stat}"));
+            assert_eq!(mapping.labels, expected, "{name}");
+        }
+    }
+}

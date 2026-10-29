@@ -1,30 +1,56 @@
 # Requires statsd exporter >= v0.6.0 since it uses the "drop" action.
 mappings:
-  - match: "ratelimit.service.rate_limit.*.*.near_limit"
+  # A list limit's `~name` (D29) in a `limit` label: not upstream's. Upstream's globs would
+  # take a one-key list limit first, so they are rewritten as the regexes they are equivalent
+  # to, after these.
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits)$"
+    match_type: regex
+    name: "ratelimit_service_rate_limit_$4"
+    timer_type: "histogram"
+    labels:
+      domain: "$1"
+      key1: "$2"
+      limit: "$3"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.([^.]*)(\\.[^.]*)*~([0-9A-Za-z][0-9A-Za-z_-]*)\\.(near_limit|over_limit|total_hits|within_limit|shadow_mode|opened_without_hits)$"
+    match_type: regex
+    name: "ratelimit_service_rate_limit_$6"
+    timer_type: "histogram"
+    labels:
+      domain: "$1"
+      key1: "$2"
+      key2: "$3"
+      limit: "$5"
+
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.near_limit$"
+    match_type: regex
     name: "ratelimit_service_rate_limit_near_limit"
     timer_type: "histogram"
     labels:
       domain: "$1"
       key1: "$2"
-  - match: "ratelimit.service.rate_limit.*.*.over_limit"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.over_limit$"
+    match_type: regex
     name: "ratelimit_service_rate_limit_over_limit"
     timer_type: "histogram"
     labels:
       domain: "$1"
       key1: "$2"
-  - match: "ratelimit.service.rate_limit.*.*.total_hits"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.total_hits$"
+    match_type: regex
     name: "ratelimit_service_rate_limit_total_hits"
     timer_type: "histogram"
     labels:
       domain: "$1"
       key1: "$2"
-  - match: "ratelimit.service.rate_limit.*.*.within_limit"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.within_limit$"
+    match_type: regex
     name: "ratelimit_service_rate_limit_within_limit"
     timer_type: "histogram"
     labels:
       domain: "$1"
       key1: "$2"
-  - match: "ratelimit.service.rate_limit.*.*.shadow_mode"
+  - match: "^ratelimit\\.service\\.rate_limit\\.([^.]*)\\.([^.]*)\\.shadow_mode$"
+    match_type: regex
     name: "ratelimit_service_rate_limit_shadow_mode"
     timer_type: "histogram"
     labels:

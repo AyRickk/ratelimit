@@ -2974,6 +2974,11 @@ fn mapper_names() -> Vec<String> {
         "ratelimit.service.rate_limit.llm.org_acme.model_gpt.over_limit_with_local_cache",
         "ratelimit.service.rate_limit.a.b.c.d.within_limit",
         "ratelimit.service.rate_limit.x.shadow_mode",
+        "ratelimit.service.rate_limit.llm.user~five_hour.opened_without_hits",
+        "ratelimit.service.rate_limit.llm.user_a~b~week-1.total_hits",
+        "ratelimit.service.rate_limit.llm.org_acme.model~weekly.near_limit",
+        "ratelimit.service.rate_limit.llm.a.b.c~_x.within_limit",
+        "ratelimit.service.rate_limit.llm.a.b~c.over_limit_with_local_cache",
         "ratelimit.service.call.should_rate_limit.redis_error",
         "ratelimit_server.ShouldRateLimit.response_time",
         "ratelimit_server.ShouldRateLimit.total_requests",
@@ -3058,6 +3063,95 @@ async fn the_prometheus_mapper_maps_like_statsd_exporter() {
                 t.as_str()
             );
         }
+    }
+}
+
+/// The shipped mapper rewrites upstream's globs as regexes, after its list rules (D29): every
+/// stat a list limit does not emit maps as upstream's own default mapper maps it.
+#[tokio::test]
+async fn the_shipped_mapper_maps_upstream_stats_like_upstream() {
+    if !tools_available() {
+        return;
+    }
+    let h = Harness::start(TOKENS).await;
+    let output = std::process::Command::new("go")
+        .args([
+            "list",
+            "-m",
+            "-f",
+            "{{.Dir}}",
+            "github.com/envoyproxy/ratelimit",
+        ])
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/oracle"))
+        .output()
+        .expect("run go list");
+    assert!(output.status.success(), "go list failed");
+    let upstream = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+        .join("src/stats/prom/default_mapper.yaml");
+    let upstream = std::fs::read_to_string(upstream).unwrap();
+    let (status, error) = h.oracle.send("PUT", "/mapper", &upstream).await;
+    assert_eq!(status, 200, "{error}");
+    let shipped = prometheus::load_mapper(&Default::default()).unwrap();
+
+    let mut names = mapper_names();
+    let stats = [
+        "near_limit",
+        "over_limit",
+        "total_hits",
+        "within_limit",
+        "shadow_mode",
+        "over_limit_with_local_cache",
+        "other",
+    ];
+    let segments = ["d", "k_v", "", "k_v_x-y", "*"];
+    let mut paths = vec![String::new()];
+    for _ in 0..4 {
+        paths = paths
+            .iter()
+            .flat_map(|path| segments.iter().map(move |s| format!("{path}.{s}")))
+            .collect();
+        for path in &paths {
+            for stat in stats {
+                names.push(format!("ratelimit.service.rate_limit{path}.{stat}"));
+            }
+        }
+    }
+    // Upstream's glob FSM takes a field that is `*` for its wildcard without capturing it
+    // (`d.*` gives `key1=""`), which a regex does not do: a divergence (`docs/parity.md` §7).
+    names.retain(|name| {
+        let rate_limit = name.starts_with("ratelimit.service.rate_limit.");
+        !name.contains('~') && !(rate_limit && name.split('.').any(|field| field == "*"))
+    });
+    let types = [
+        prometheus::MetricType::Counter,
+        prometheus::MetricType::Gauge,
+        prometheus::MetricType::Observer,
+    ];
+    let mut body = String::new();
+    let mut expected_order = Vec::new();
+    for name in &names {
+        for t in types {
+            body += &format!("{} {name}\n", t.as_str());
+            expected_order.push((t, name));
+        }
+    }
+    let (status, response) = h.oracle.send("POST", "/map", &body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response.lines().count(), expected_order.len(), "{response}");
+    // Only how the rule was written differs.
+    let without_match_type = |mut value: serde_json::Value| {
+        value.as_object_mut().unwrap().remove("match_type");
+        floats(value)
+    };
+    for ((t, name), line) in expected_order.into_iter().zip(response.lines()) {
+        let expected: serde_json::Value = serde_json::from_str(line).unwrap();
+        let actual = mapped_json(shipped.get_mapping(name, t));
+        assert_eq!(
+            without_match_type(actual),
+            without_match_type(expected),
+            "{} {name}",
+            t.as_str()
+        );
     }
 }
 
