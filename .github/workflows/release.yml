@@ -1,8 +1,9 @@
 name: Release
 
 # A `v*` tag publishes the image for linux/amd64 and linux/arm64 to ghcr.io, with an SBOM and
-# provenance, signed with cosign (keyless, GitHub's OIDC identity). A pull request touching
-# the image builds the same, attestations included, without publishing.
+# provenance, signed with cosign (keyless, GitHub's OIDC identity), then a GitHub release with
+# the tag's CHANGELOG.md section. A pull request touching the image builds the same,
+# attestations included, without publishing.
 on:
   push:
     tags: ["v*"]
@@ -78,3 +79,26 @@ jobs:
             "/tmp/image/blobs/sha256/$index"
           jq -e '[.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")]
             | length == 2' "/tmp/image/blobs/sha256/$index"
+
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Publish the release with its changelog section
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The lines under "## [<version>]", up to the next "## [" heading.
+          awk -v v="${TAG#v}" '
+            /^## \[/ { section = index($0, "## [" v "]") == 1; next }
+            /^\[[^]]*\]: / { section = 0 }
+            section
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::no CHANGELOG.md section for $TAG"; exit 1; }
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
