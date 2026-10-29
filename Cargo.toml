@@ -30,7 +30,7 @@ tonic = { version = "0.14", features = ["gzip", "tls-native-roots", "tls-ring"] 
 tower = { version = "0.5", features = ["util"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.4"
 http = "1"
 http-body = "1"
