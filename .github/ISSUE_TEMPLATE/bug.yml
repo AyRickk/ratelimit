@@ -1,0 +1,52 @@
+name: Bug report
+description: Something behaves differently from what the docs or upstream envoyproxy/ratelimit say.
+labels: [needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities go through [private reporting](https://github.com/AyRickk/ratelimit/security/advisories/new), not here.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The image tag or digest, or the commit you built.
+      placeholder: ghcr.io/ayrickk/ratelimit:0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options: [Redis, Redis cluster, Redis sentinel, Valkey, Memcached, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected
+      description: The request, the answer you got, and the answer you expected.
+    validations:
+      required: true
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does envoyproxy/ratelimit behave the same?
+      description: A difference from upstream that docs/parity.md §7 does not list is a bug.
+      options: ["Yes, upstream does the same", "No, upstream behaves differently", "Not checked", "Not applicable (an extension)"]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The YAML configuration, the environment variables (without secrets) and the requests.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log lines, without credentials.
+      render: text

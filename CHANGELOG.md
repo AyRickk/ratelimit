@@ -1,0 +1,31 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-10-29
+
+The first release.
+
+### Added
+
+- **Upstream parity:** a drop-in replacement for envoyproxy/ratelimit at commit `f4e7669`. Every upstream behaviour has a test, most of them differential (upstream's binary and this one side by side, on Redis and Valkey); the details are in `docs/parity.md` §1–6.
+  - **Configuration:** the same environment variables and YAML configuration, from files with hot reload or from xDS.
+  - **API:** the gRPC and HTTP API, the `LIMIT_*` headers and dynamic metadata.
+  - **Backends:** Redis (single, sentinel, cluster, TLS, AWS IAM, per-second pool) and Memcached.
+  - **Limiting:** the local cache, `quota_mode` and `share_threshold`.
+  - **Observability:** statsd, DogStatsD and Prometheus stats, and OTLP traces.
+  - **Image:** distroless for amd64 and arm64, signed with cosign, with an SBOM and provenance.
+- **`rate_limits:` lists:** several named limits per descriptor, each with its own window, stats key (`<descriptor>~<name>`) and per-unit headers.
+- **`fixed` windows** of any duration (`5h`, `7d`, …), with an `offset`, constant or hashed from the descriptor (ADR 0001, ADR 0002).
+- **`anchored` windows:** a window that a request opens (`open_on: check`) or its first counted hit opens (`first_hit`), and that lasts its duration. Redis only.
+- **The quota lookup:** `POST /quota` reports every limit's usage and reset without counting anything (ADR 0003).
+- **Prometheus labels:** the shipped Prometheus mapper puts a list limit's name in a `limit` label.
+
+### Deliberate divergences
+
+- **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
+
+[Unreleased]: https://github.com/AyRickk/ratelimit/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/AyRickk/ratelimit/releases/tag/v0.1.0

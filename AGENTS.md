@@ -31,7 +31,7 @@ The goal and every design decision are in `docs/design.md`; what is already prov
 1. Agree the slice with the maintainer: the next ⬜/🚧 rows of `docs/parity.md`, in the order of "Build order" in `docs/design.md`. Done when the maintainer confirms the scope.
 2. Agree the test seams (`tdd` skill). Done when the maintainer confirms them.
 3. Red → green, one behaviour per cycle. Behaviour upstream has is proven by a differential scenario against `tools/oracle` (envoyproxy/ratelimit at the commit pinned in `tools/oracle/go.mod`). Done when every in-scope behaviour has a test that goes red without its code; mutation-check the subtle ones.
-4. `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and the full suite with differential tests required, on Redis and on Valkey.
+4. `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`, and the full suite with differential tests required, on Redis and on Valkey.
 5. Commit on a branch, then run the `code-review` skill (Standards, and Spec against the upstream Go code). Fix the findings, or put them to the maintainer.
 6. Mark the `docs/parity.md` rows the slice proves, push, open the PR (`pr` skill), and wait for the required checks: `check`, `rust (redis)`, `rust (valkey)`. The maintainer merges.
 

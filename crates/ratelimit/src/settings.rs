@@ -294,6 +294,16 @@ macro_rules! settings {
                 })*
                 values
             }
+
+            /// Each variable, with its default as written, in upstream's order: what
+            /// `docs/environment.md` documents.
+            pub fn variables() -> Vec<(&'static str, &'static str)> {
+                let mut variables = Vec::new();
+                $(if <$kind as Kind>::SHOWN {
+                    variables.push(($key, $default));
+                })*
+                variables
+            }
         }
     };
 }

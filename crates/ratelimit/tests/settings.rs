@@ -129,3 +129,47 @@ fn the_sink_libraries_read_their_own_variables() {
         assert_eq!(sinks.dogstatsd.origin_detection, expected_origin);
     }
 }
+
+/// `docs/environment.md` documents every variable once, with its default: a row
+/// ``| `NAME` | `default` | … |``, or `(empty)` for an empty default.
+#[test]
+fn every_variable_is_documented_with_its_default() {
+    let doc = include_str!("../../../docs/environment.md");
+    let mut documented = std::collections::BTreeMap::new();
+    for line in doc.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() < 4 || !cells[1].starts_with('`') {
+            continue;
+        }
+        let name = cells[1].trim_matches('`');
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        let default = match cells[2] {
+            "(empty)" => "",
+            other => other.trim_matches('`'),
+        };
+        assert!(
+            documented.insert(name, default).is_none(),
+            "{name} is documented twice"
+        );
+    }
+    for (name, default) in Settings::variables() {
+        assert_eq!(
+            documented.remove(name),
+            Some(default),
+            "{name}: its row in docs/environment.md, with default `{default}`"
+        );
+    }
+    // Other rows are the AWS SDK's and OpenTelemetry's own variables, with no default here.
+    for (name, default) in documented {
+        assert!(
+            name.starts_with("AWS_") || name.starts_with("OTEL_") || name.starts_with("GRPC_"),
+            "{name} is documented but not a setting"
+        );
+        assert_eq!(default, "", "{name}");
+    }
+}

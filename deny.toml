@@ -1,0 +1,35 @@
+# cargo-deny's configuration: advisories (RustSec), licenses, duplicate or banned crates and
+# their sources, checked in CI. The licenses are the ones about.toml accepts (docs/design.md D34).
+[graph]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+all-features = true
+
+[advisories]
+ignore = [
+    # crypto-bigint 0.5's timing variability: only aws-config's `credentials-login` provider
+    # (the Go SDK's `aws login` credentials, for Redis IAM auth) signs with it, through p256 0.13, which
+    # aws-config 1.13.0, the latest, still requires.
+    { id = "RUSTSEC-2026-0387", reason = "no fixed aws-config; only the aws login provider signs with it" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# The workspace's own crates, not published.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

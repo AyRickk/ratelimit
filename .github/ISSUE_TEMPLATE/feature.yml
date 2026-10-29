@@ -1,0 +1,23 @@
+name: Feature request
+description: A behaviour this service should have.
+labels: [needs-triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and why the current behaviour does not allow it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The behaviour you propose
+      description: A configuration or request and the answer you would expect, if you have one in mind.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I looked at docs/design.md and docs/parity.md §8; the feature is not already designed or built.
+          required: true
