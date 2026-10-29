@@ -4,6 +4,7 @@
 
 mod aws;
 mod connection;
+mod live;
 pub mod tls;
 
 pub use connection::{Connected, RedisConnection, StartupBackoff, Tls, mask_credentials_in_url};
@@ -16,6 +17,7 @@ use crate::service::{CacheError, LimitOutcome, LimitReading, RateLimitCache};
 use crate::stats::{RateLimitStats, Stats};
 use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
+use live::LivePool;
 use ratelimit_proto::envoy::service::ratelimit::v3::RateLimitRequest;
 use std::sync::Arc;
 
@@ -65,9 +67,9 @@ const ANCHORED_MARGIN_SECONDS: i64 = 60;
 
 pub struct RedisCache {
     /// Connections, each request's pipeline on one of them (radix's pool).
-    pool: Pool,
+    pool: LivePool,
     /// `REDIS_PERSECOND`: the pool for limits in seconds, in a pipeline of their own.
-    per_second: Option<Pool>,
+    per_second: Option<LivePool>,
     clock: Arc<dyn Clock>,
     stats: Arc<Stats>,
     local_cache: Option<Arc<LocalCache>>,
@@ -95,7 +97,7 @@ impl RedisCache {
         local_cache: Option<Arc<LocalCache>>,
     ) -> Self {
         Self {
-            pool,
+            pool: LivePool::new(pool),
             per_second: None,
             clock,
             stats,
@@ -106,7 +108,7 @@ impl RedisCache {
 
     /// The cache sending limits in seconds to `pool` (`REDIS_PERSECOND`).
     pub fn with_per_second(mut self, pool: Pool) -> Self {
-        self.per_second = Some(pool);
+        self.per_second = Some(LivePool::new(pool));
         self
     }
 
@@ -119,7 +121,7 @@ impl RedisCache {
     }
 
     /// The pipelines' pools: the main one, then the per-second one if any.
-    fn pools(&self) -> [Option<&Pool>; 2] {
+    fn pools(&self) -> [Option<&LivePool>; 2] {
         [Some(&self.pool), self.per_second.as_ref()]
     }
 }
@@ -173,7 +175,14 @@ fn go_quote_ascii(s: &str) -> String {
 /// Sends `commands` in one pipeline and returns their replies, or upstream's error for the
 /// first command that failed.
 async fn send(client: &Client, commands: &[Command]) -> Result<Vec<Value>, CacheError> {
-    let pipeline = client.pipeline();
+    // A client that is not connected fails the pipeline at once, as radix's dead connection
+    // does, rather than holding it until Redis is back.
+    let fail_fast = Options {
+        fail_fast: true,
+        ..Default::default()
+    };
+    // `with_options(..).pipeline()` would build it on the bare client, through `Deref`.
+    let pipeline = fred::clients::Pipeline::from(client.with_options(&fail_fast));
     for command in commands {
         // EVAL is routed by its key, the third argument, in a cluster.
         let hash = if command.name == "EVAL" {
@@ -404,7 +413,7 @@ impl RateLimitCache for RedisCache {
         let mut replies: [Vec<_>; 2] = [Vec::new(), Vec::new()];
         for (pipeline, pool) in self.pools().into_iter().enumerate() {
             if let (Some(pool), false) = (pool, pipelines[pipeline].is_empty()) {
-                replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
+                replies[pipeline] = send(pool.next()?, &pipelines[pipeline]).await?;
             }
         }
         // An anchored window's reset, from its state, and whether this request opened it
@@ -505,7 +514,7 @@ impl RedisCache {
         let mut replies: [Vec<_>; 2] = [Vec::new(), Vec::new()];
         for (pipeline, pool) in self.pools().into_iter().enumerate() {
             if let (Some(pool), false) = (pool, pipelines[pipeline].is_empty()) {
-                replies[pipeline] = send(pool.next(), &pipelines[pipeline]).await?;
+                replies[pipeline] = send(pool.next()?, &pipelines[pipeline]).await?;
             }
         }
         let mut readings: Vec<Vec<LimitReading>> = limits
@@ -629,7 +638,7 @@ impl RedisCache {
                     args: vec![c.key.clone()],
                 })
                 .collect();
-            let replies = send(pool.next(), &commands).await?;
+            let replies = send(pool.next()?, &commands).await?;
             for ((c, command), reply) in reads.iter_mut().zip(&commands).zip(replies) {
                 let before = command.counter(reply)?;
                 c.going_over = limiter::exceeds(c.limit, before.wrapping_add(c.hits.value));
