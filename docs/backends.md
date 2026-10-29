@@ -179,6 +179,16 @@ REDIS_PERSECOND_SOCKET_TYPE=tcp
 REDIS_PERSECOND_URL=redis-persecond:6379
 ```
 
+### When Redis is down
+
+A connection that is down is skipped while another of the pool is up. When every connection is down, a decision fails at once, with gRPC status `Unknown` and `response returned from Conn: EOF`, rather than waiting for Redis. The caller then applies its failure mode right away: agentgateway's `failureMode`, Envoy's `failure_mode_deny`. `/json` answers `400`.
+
+Each connection reconnects on its own, after 125 ms, then doubling the wait up to 4 s.
+
+In `CLUSTER` mode, a decision on a node that is down still waits for it.
+
+Upstream fails at most one decision per pooled connection, then holds each decision until the caller's deadline. This difference is deliberate ([parity §7](parity.md#7-deliberate-divergences)).
+
 ### Failover
 
 | Variable | Default | Meaning |
