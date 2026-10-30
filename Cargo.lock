@@ -2425,7 +2425,7 @@ dependencies = [
  "aws-credential-types",
  "aws-smithy-http-client",
  "aws-types",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "crc32fast",
  "flate2",
