@@ -5172,7 +5172,8 @@ async fn decisions_fail_at_once_while_redis_is_down() {
         if upstream == "no answer within 5 s" {
             break;
         }
-        assert!(upstream.starts_with(failed), "{attempt}: {upstream}");
+        // radix also says `closed` for a connection of its pool that it closed.
+        assert!(upstream.starts_with("Unknown: "), "{attempt}: {upstream}");
         upstream_failures += 1;
     }
     assert!(
