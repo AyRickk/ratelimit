@@ -11403,20 +11403,27 @@ async fn sentinel_serves_like_upstream() {
         tokio::time::sleep(std::time::Duration::from_secs(7)).await;
         // The failover closed the new primary's connections: radix fails a command on each one
         // its PING has not found yet (docs/parity.md §7), so other counters warm the pools up.
-        let mut in_a_row = 0;
-        for _ in 0..20 {
-            let mut warm = Vec::new();
-            ask(&mut warm, "warm").await;
-            in_a_row = if warm[0].starts_with("Ok") {
-                in_a_row + 1
-            } else {
-                0
-            };
-            if in_a_row == 3 {
-                break;
+        // Twice, a ping cycle apart (5 s for the one-connection pool): three answers in a row
+        // can all go over one connection while another is still dead.
+        for round in 0..2 {
+            if round == 1 {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             }
+            let mut in_a_row = 0;
+            for _ in 0..20 {
+                let mut warm = Vec::new();
+                ask(&mut warm, "warm").await;
+                in_a_row = if warm[0].starts_with("Ok") {
+                    in_a_row + 1
+                } else {
+                    0
+                };
+                if in_a_row == 3 {
+                    break;
+                }
+            }
+            assert_eq!(in_a_row, 3, "no answer from the new primary");
         }
-        assert_eq!(in_a_row, 3, "no answer from the new primary");
         for _ in 0..3 {
             ask(&mut answers, "a").await;
         }
