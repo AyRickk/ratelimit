@@ -19,7 +19,7 @@ ghcr.io/ayrickk/ratelimit:<version>
 
 | | |
 |---|---|
-| **Tags** | Set by the release workflow: the version (`0.1.0`), its major and minor (`0.1`), and `sha-<commit>` |
+| **Tags** | Set by the release workflow: the version (`0.1.0`) and its major and minor (`0.1`), each also with a `v` like the git tag (`v0.1.0`, `v0.1`), and `sha-<commit>` |
 | **Platforms** | `linux/amd64`, `linux/arm64` |
 | **Binary** | `/bin/ratelimit`, the entrypoint. It takes no arguments: everything is set by environment variables. |
 | **Base** | `gcr.io/distroless/static-debian12:nonroot`, as upstream's: no shell, no package manager, no `curl`. |
