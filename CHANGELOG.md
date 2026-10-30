@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-29
+## [0.1.0] - 2026-10-30
 
 The first release.
 
@@ -25,6 +25,7 @@ The first release.
 
 ### Deliberate divergences
 
+- **Redis down:** a decision fails at once while every connection is down, so that callers without a deadline (agentgateway) apply their failure mode; upstream holds decisions until the caller's deadline.
 - **Errors instead of panics:** where upstream panics, this service returns an error, at startup or on the request, and TLS checks are stricter. The full list is in `docs/parity.md` §7.
 
 [Unreleased]: https://github.com/AyRickk/ratelimit/compare/v0.1.0...HEAD
