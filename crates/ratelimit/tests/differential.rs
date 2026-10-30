@@ -10771,6 +10771,19 @@ impl RedisCluster {
     }
 }
 
+/// Waits for the next hour when less than `margin` is left of this one: a test whose counters
+/// of an hour must stay in one window, on both binaries.
+async fn clear_of_an_hour_boundary(margin: std::time::Duration) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let left = std::time::Duration::from_secs(3600 - now.as_secs() % 3600)
+        - std::time::Duration::from_nanos(now.subsec_nanos().into());
+    if left < margin {
+        tokio::time::sleep(left + std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Waits for the start of the next second of the system's clock.
 async fn at_a_new_second() {
     let now = std::time::SystemTime::now()
@@ -10913,6 +10926,8 @@ async fn cluster_runs(
     variables: &[(&'static str, String)],
     masked: &[(String, &str)],
 ) {
+    // Both binaries' counters of an hour, their pools filling: a minute or two.
+    clear_of_an_hour_boundary(std::time::Duration::from_secs(180)).await;
     let upstream = cluster_run(&upstream_binary(), cluster, variables, masked).await;
     let ours = cluster_run(
         std::path::Path::new(env!("CARGO_BIN_EXE_ratelimit")),
@@ -11304,6 +11319,8 @@ fn a_redis_sentinel_serves_like_upstream() {
 }
 
 async fn sentinel_serves_like_upstream() {
+    // Both binaries' counters of an hour, a failover each: a few minutes at most.
+    clear_of_an_hour_boundary(std::time::Duration::from_secs(300)).await;
     let runtime = temp_dir("sentinel-runtime");
     write_tree(
         &runtime,
@@ -11386,20 +11403,27 @@ async fn sentinel_serves_like_upstream() {
         tokio::time::sleep(std::time::Duration::from_secs(7)).await;
         // The failover closed the new primary's connections: radix fails a command on each one
         // its PING has not found yet (docs/parity.md §7), so other counters warm the pools up.
-        let mut in_a_row = 0;
-        for _ in 0..20 {
-            let mut warm = Vec::new();
-            ask(&mut warm, "warm").await;
-            in_a_row = if warm[0].starts_with("Ok") {
-                in_a_row + 1
-            } else {
-                0
-            };
-            if in_a_row == 3 {
-                break;
+        // Twice, a ping cycle apart (5 s for the one-connection pool): three answers in a row
+        // can all go over one connection while another is still dead.
+        for round in 0..2 {
+            if round == 1 {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             }
+            let mut in_a_row = 0;
+            for _ in 0..20 {
+                let mut warm = Vec::new();
+                ask(&mut warm, "warm").await;
+                in_a_row = if warm[0].starts_with("Ok") {
+                    in_a_row + 1
+                } else {
+                    0
+                };
+                if in_a_row == 3 {
+                    break;
+                }
+            }
+            assert_eq!(in_a_row, 3, "no answer from the new primary");
         }
-        assert_eq!(in_a_row, 3, "no answer from the new primary");
         for _ in 0..3 {
             ask(&mut answers, "a").await;
         }
